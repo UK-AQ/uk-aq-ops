@@ -1,0 +1,1328 @@
+import fs from "node:fs/promises";
+import { createReadStream, createWriteStream } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
+import readline from "node:readline";
+import { Client as PgClient } from "pg";
+
+const DROPBOX_TOKEN_URL = "https://api.dropbox.com/oauth2/token";
+const DROPBOX_API_BASE_URL = "https://api.dropboxapi.com/2";
+const DROPBOX_UPLOAD_URL = "https://content.dropboxapi.com/2/files/upload";
+
+export const SERVICE_NAME = "uk_aq_supabase_db_dump_backup_service";
+export const DEFAULT_DATABASE_ORDER = Object.freeze(["ingestdb", "obs_aqidb"]);
+export const DEFAULT_DUMP_KINDS = Object.freeze(["roles", "schema", "data"]);
+export const CRON_JOBS_DUMP_KIND = "cron_jobs";
+export const DEFAULT_RETENTION_DAYS = 7;
+export const DEFAULT_BACKUP_DIR = "Supabase_Backup_db_dump";
+const PG_CRON_ENABLE_SQL = "create extension if not exists pg_cron;";
+const OBS_AQIDB_AUTHENTICATOR_PGRST_SCHEMAS = [
+  "public",
+  "graphql_public",
+  "uk_aq_public",
+  "uk_aq_ops",
+];
+const OBS_AQIDB_AUTHENTICATOR_PGRST_SQL = [
+  "do $$",
+  "begin",
+  "  execute 'alter role authenticator set pgrst.db_schemas = ''public,graphql_public,uk_aq_public,uk_aq_ops''';",
+  "exception",
+  "  when insufficient_privilege or undefined_object then",
+  "    raise notice 'Skipped ALTER ROLE authenticator SET pgrst.db_schemas (insufficient privilege or missing role).';",
+  "end",
+  "$$;",
+].join("\n");
+const MAX_LOG_MESSAGE_LENGTH = 1200;
+const DEFAULT_SPLIT_LARGE_INSERTS = true;
+const DEFAULT_INSERT_SPLIT_THRESHOLD_ROWS = 10_000;
+const DEFAULT_INSERT_CHUNK_ROWS = 5_000;
+const MIN_INSERT_CHUNK_ROWS = 100;
+const MAX_INSERT_CHUNK_ROWS = 100_000;
+const MAX_TABLES_SPLIT_LOG_ENTRIES = 50;
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+export function logStructured(severity, event, details = {}) {
+  const entry = {
+    severity,
+    event,
+    timestamp: nowIso(),
+    service: SERVICE_NAME,
+    ...details,
+  };
+  const line = JSON.stringify(entry);
+  if (severity === "ERROR") {
+    console.error(line);
+    return;
+  }
+  if (severity === "WARNING") {
+    console.warn(line);
+    return;
+  }
+  console.log(line);
+}
+
+export function parsePositiveInt(rawValue, fallback, min = 1, max = 10_000) {
+  const parsed = Number(rawValue);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+  const intValue = Math.trunc(parsed);
+  if (intValue < min) {
+    return min;
+  }
+  if (intValue > max) {
+    return max;
+  }
+  return intValue;
+}
+
+export function parseBooleanEnv(rawValue, fallback) {
+  if (rawValue === null || rawValue === undefined) {
+    return fallback;
+  }
+  const normalized = String(rawValue).trim().toLowerCase();
+  if (!normalized) {
+    return fallback;
+  }
+  if (["true", "1", "yes", "y", "on"].includes(normalized)) {
+    return true;
+  }
+  if (["false", "0", "no", "n", "off"].includes(normalized)) {
+    return false;
+  }
+  return fallback;
+}
+
+function requiredEnv(name) {
+  const value = String(process.env[name] || "").trim();
+  if (!value) {
+    throw new Error(`Missing required environment variable: ${name}`);
+  }
+  return value;
+}
+
+export function normalizeDropboxPath(rawValue) {
+  const value = String(rawValue || "").trim();
+  if (!value) {
+    return "";
+  }
+  const withLeadingSlash = value.startsWith("/") ? value : `/${value}`;
+  return withLeadingSlash.replace(/\/+$/, "");
+}
+
+export function joinDropboxPath(...parts) {
+  const joined = parts
+    .map((part) => String(part || "").trim())
+    .filter(Boolean)
+    .join("/");
+  return normalizeDropboxPath(joined);
+}
+
+export function buildBackupRoot(dropboxRoot, backupDir = DEFAULT_BACKUP_DIR) {
+  return joinDropboxPath(dropboxRoot, backupDir);
+}
+
+export function buildDatabaseBackupFolder(dropboxRoot, backupDir, databaseName, runDate) {
+  return joinDropboxPath(buildBackupRoot(dropboxRoot, backupDir), databaseName, runDate);
+}
+
+export function formatUtcDate(dateLike = new Date()) {
+  const date = dateLike instanceof Date ? dateLike : new Date(dateLike);
+  if (Number.isNaN(date.getTime())) {
+    throw new Error("Invalid date supplied.");
+  }
+  return date.toISOString().slice(0, 10);
+}
+
+export function shiftUtcDate(isoDate, dayDelta) {
+  const date = new Date(`${isoDate}T00:00:00.000Z`);
+  if (Number.isNaN(date.getTime())) {
+    throw new Error(`Invalid ISO date: ${isoDate}`);
+  }
+  date.setUTCDate(date.getUTCDate() + dayDelta);
+  return formatUtcDate(date);
+}
+
+export function resolveOldestKeptDate(runDate, retentionDays) {
+  return shiftUtcDate(runDate, -(retentionDays - 1));
+}
+
+export function planRetentionDeletes(entries, oldestKeptDate) {
+  const cutoff = String(oldestKeptDate || "").trim();
+  const deletes = [];
+  const keeps = [];
+
+  for (const entry of entries) {
+    const entryName = String(entry?.name || "").trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(entryName)) {
+      continue;
+    }
+    const normalized = {
+      name: entryName,
+      path_lower: entry?.path_lower || null,
+      path_display: entry?.path_display || null,
+    };
+    if (entryName < cutoff) {
+      deletes.push(normalized);
+      continue;
+    }
+    keeps.push(normalized);
+  }
+
+  deletes.sort((left, right) => left.name.localeCompare(right.name));
+  keeps.sort((left, right) => left.name.localeCompare(right.name));
+
+  return { deletes, keeps };
+}
+
+export function resolveRequestedDatabases(triggerMode, requestedDatabases = null) {
+  if (triggerMode === "scheduler") {
+    return [...DEFAULT_DATABASE_ORDER];
+  }
+
+  if (requestedDatabases === null || requestedDatabases === undefined) {
+    return [...DEFAULT_DATABASE_ORDER];
+  }
+
+  const values = Array.isArray(requestedDatabases)
+    ? requestedDatabases
+    : [requestedDatabases];
+
+  const normalized = [];
+  for (const value of values) {
+    const databaseName = String(value || "").trim().toLowerCase();
+    if (!databaseName) {
+      continue;
+    }
+    if (!DEFAULT_DATABASE_ORDER.includes(databaseName)) {
+      throw new Error(`Unsupported database selection: ${databaseName}`);
+    }
+    if (!normalized.includes(databaseName)) {
+      normalized.push(databaseName);
+    }
+  }
+
+  return normalized.length > 0 ? normalized : [...DEFAULT_DATABASE_ORDER];
+}
+
+export function buildDumpArgs({ dbUrl, outputFile, dumpKind }) {
+  const args = [
+    "db",
+    "dump",
+    "--dry-run",
+    "--db-url",
+    dbUrl,
+    "--file",
+    outputFile,
+  ];
+
+  if (dumpKind === "roles") {
+    args.push("--role-only");
+  } else if (dumpKind === "data") {
+    args.push("--data-only");
+  } else if (dumpKind !== "schema") {
+    throw new Error(`Unsupported dump kind: ${dumpKind}`);
+  }
+
+  return args;
+}
+
+export function extractDryRunScript(outputText) {
+  const marker = "#!/usr/bin/env bash";
+  const markerIndex = String(outputText || "").indexOf(marker);
+  if (markerIndex < 0) {
+    throw new Error("Unable to find the Supabase dry-run bash script.");
+  }
+  return String(outputText).slice(markerIndex).trim();
+}
+
+function removeExcludeSchemaTokenListEntry(tokenList, tokenToRemove) {
+  const separator = String(tokenList || "").includes("|") ? "|" : ",";
+  return String(tokenList || "")
+    .split(/[|,]/)
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .filter((entry) => entry !== tokenToRemove)
+    .join(separator);
+}
+
+function ensureSchemaTokenListEntry(tokenList, tokenToAdd) {
+  const raw = String(tokenList || "");
+  const separator = raw.includes("|") ? "|" : ",";
+  const normalized = raw
+    .split(/[|,]/)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  if (normalized.includes("*")) {
+    return raw;
+  }
+  if (!normalized.includes(tokenToAdd)) {
+    normalized.push(tokenToAdd);
+  }
+  return normalized.join(separator);
+}
+
+export function includeCronJobsInDryRunScript(scriptText) {
+  let updated = String(scriptText || "");
+
+  // Supabase CLI can classify cron as an internal schema. Remove that exclusion
+  // so cron.job rows are preserved in data dumps for restore into new databases.
+  updated = updated.replace(/(--exclude-schema\s+")([^"]+)(")/g, (_match, start, tokenList, end) => {
+    const normalized = removeExcludeSchemaTokenListEntry(tokenList, "cron");
+    return `${start}${normalized}${end}`;
+  });
+
+  // Some Supabase dry-run scripts also use explicit include-schema lists.
+  // Ensure cron is present there too, otherwise cron.job rows are still omitted.
+  updated = updated.replace(/(--schema\s+")([^"]+)(")/g, (_match, start, tokenList, end) => {
+    const normalized = ensureSchemaTokenListEntry(tokenList, "cron");
+    return `${start}${normalized}${end}`;
+  });
+
+  return updated;
+}
+
+export async function ensurePgCronExtensionAtTopOfSchemaFile(filePath) {
+  const existing = await fs.readFile(filePath, "utf8");
+  if (/(^|\n)\s*create extension if not exists "?pg_cron"?\s*;/i.test(existing)) {
+    return false;
+  }
+
+  const prefix = `${PG_CRON_ENABLE_SQL}\n\n`;
+  await fs.writeFile(filePath, `${prefix}${existing}`, "utf8");
+  return true;
+}
+
+export async function ensureObsAqidbAuthenticatorSchemasAtTopOfSchemaFile(filePath) {
+  const existing = await fs.readFile(filePath, "utf8");
+  const schemaListPattern = OBS_AQIDB_AUTHENTICATOR_PGRST_SCHEMAS.map((schema) =>
+    schema.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+  ).join("\\s*,\\s*");
+  const alreadyPresent = new RegExp(
+    `alter\\s+role\\s+authenticator\\s+set\\s+pgrst\\.db_schemas\\s*=\\s*'?${schemaListPattern}'?\\s*;`,
+    "i",
+  ).test(existing);
+  if (alreadyPresent) {
+    return false;
+  }
+
+  const prefix = `${OBS_AQIDB_AUTHENTICATOR_PGRST_SQL}\n\n`;
+  await fs.writeFile(filePath, `${prefix}${existing}`, "utf8");
+  return true;
+}
+
+function redactSensitiveText(rawValue) {
+  return String(rawValue || "")
+    .replace(/postgres(?:ql)?:\/\/[^\s'"]+/gi, "postgresql://[REDACTED]")
+    .replace(/PGPASSWORD="[^"]*"/g, 'PGPASSWORD="[REDACTED]"')
+    .replace(/Bearer\s+[A-Za-z0-9._-]+/g, "Bearer [REDACTED]")
+    .replace(/client_secret=[^&\s]+/g, "client_secret=[REDACTED]")
+    .replace(/refresh_token=[^&\s]+/g, "refresh_token=[REDACTED]");
+}
+
+function sanitizeErrorMessage(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  const redacted = redactSensitiveText(message).trim();
+  if (redacted.length <= MAX_LOG_MESSAGE_LENGTH) {
+    return redacted;
+  }
+  return `${redacted.slice(0, MAX_LOG_MESSAGE_LENGTH - 3)}...`;
+}
+
+function sqlTextLiteral(value) {
+  if (value === null || value === undefined) {
+    return "null";
+  }
+  return `'${String(value).replace(/'/g, "''")}'`;
+}
+
+function sqlIntegerLiteral(value) {
+  if (value === null || value === undefined) {
+    return "null";
+  }
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return "null";
+  }
+  return String(Math.trunc(parsed));
+}
+
+function sqlBooleanLiteral(value) {
+  return value ? "true" : "false";
+}
+
+export function buildCronJobsRestoreSql({
+  databaseName,
+  rows,
+  generatedAt = nowIso(),
+}) {
+  const lines = [
+    "-- uk_aq pg_cron jobs backup",
+    `-- source_database: ${databaseName}`,
+    `-- generated_at_utc: ${generatedAt}`,
+    "begin;",
+    "create extension if not exists pg_cron;",
+    "",
+    "-- Replace existing cron jobs with the source snapshot.",
+    "delete from cron.job;",
+  ];
+
+  if (!Array.isArray(rows) || rows.length === 0) {
+    lines.push("");
+    lines.push("-- No rows found in source cron.job.");
+    lines.push("select pg_catalog.setval('cron.jobid_seq', 1, false);");
+    lines.push("commit;");
+    lines.push("");
+    return lines.join("\n");
+  }
+
+  const normalizedRows = [...rows].sort((left, right) => {
+    const leftId = Number(left?.jobid ?? 0);
+    const rightId = Number(right?.jobid ?? 0);
+    return leftId - rightId;
+  });
+
+  lines.push("");
+  lines.push(
+    'insert into cron.job ("jobid", "schedule", "command", "nodename", "nodeport", "database", "username", "active", "jobname") values',
+  );
+  lines.push(
+    normalizedRows
+      .map((row) => {
+        return [
+          "  (",
+          sqlIntegerLiteral(row.jobid),
+          ", ",
+          sqlTextLiteral(row.schedule),
+          ", ",
+          sqlTextLiteral(row.command),
+          ", ",
+          sqlTextLiteral(row.nodename),
+          ", ",
+          sqlIntegerLiteral(row.nodeport),
+          ", ",
+          sqlTextLiteral(row.database),
+          ", ",
+          sqlTextLiteral(row.username),
+          ", ",
+          sqlBooleanLiteral(Boolean(row.active)),
+          ", ",
+          sqlTextLiteral(row.jobname),
+          ")",
+        ].join("");
+      })
+      .join(",\n"),
+  );
+  lines.push(";");
+  lines.push(
+    "select pg_catalog.setval('cron.jobid_seq', coalesce((select max(jobid) from cron.job), 1), true);",
+  );
+  lines.push("commit;");
+  lines.push("");
+  return lines.join("\n");
+}
+
+async function fetchCronJobsRows(dbUrl) {
+  const client = new PgClient({ connectionString: dbUrl });
+  await client.connect();
+  try {
+    const result = await client.query(
+      [
+        "select",
+        "  jobid,",
+        "  schedule,",
+        "  command,",
+        "  nodename,",
+        "  nodeport,",
+        "  database,",
+        "  username,",
+        "  active,",
+        "  jobname",
+        "from cron.job",
+        "order by jobid",
+      ].join("\n"),
+    );
+    return result.rows || [];
+  } finally {
+    await client.end();
+  }
+}
+
+export function resolveInsertSplitConfig(env = process.env) {
+  const enabled = parseBooleanEnv(
+    env.UK_AQ_DB_DUMP_SPLIT_LARGE_INSERTS,
+    DEFAULT_SPLIT_LARGE_INSERTS,
+  );
+  const thresholdRows = parsePositiveInt(
+    env.UK_AQ_DB_DUMP_INSERT_SPLIT_THRESHOLD_ROWS,
+    DEFAULT_INSERT_SPLIT_THRESHOLD_ROWS,
+    1,
+    1_000_000,
+  );
+  const chunkRows = parsePositiveInt(
+    env.UK_AQ_DB_DUMP_INSERT_CHUNK_ROWS,
+    DEFAULT_INSERT_CHUNK_ROWS,
+    MIN_INSERT_CHUNK_ROWS,
+    MAX_INSERT_CHUNK_ROWS,
+  );
+  return {
+    enabled,
+    threshold_rows: thresholdRows,
+    chunk_rows: chunkRows,
+  };
+}
+
+async function readResponseText(response, limit = MAX_LOG_MESSAGE_LENGTH) {
+  const raw = await response.text();
+  return raw.length <= limit ? raw : `${raw.slice(0, limit - 3)}...`;
+}
+
+async function spawnAndCapture(command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd: options.cwd || process.cwd(),
+      env: options.env || process.env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let stderr = "";
+    if (child.stdout) {
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (chunk) => {
+        stdout += chunk;
+      });
+    }
+    if (child.stderr) {
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (chunk) => {
+        stderr += chunk;
+      });
+    }
+
+    child.on("error", reject);
+    child.on("close", (code) => {
+      resolve({
+        code: Number(code ?? 0),
+        stdout,
+        stderr,
+      });
+    });
+  });
+}
+
+async function executeDumpScriptToFile({ bashBin, scriptText, scriptPath, outputFile }) {
+  await fs.writeFile(scriptPath, `${scriptText}\n`, { mode: 0o700 });
+  const outputHandle = await fs.open(outputFile, "w", 0o600);
+
+  try {
+    await new Promise((resolve, reject) => {
+      const child = spawn(bashBin, [scriptPath], {
+        cwd: path.dirname(scriptPath),
+        env: process.env,
+        stdio: ["ignore", outputHandle.fd, "pipe"],
+      });
+
+      let stderr = "";
+      if (child.stderr) {
+        child.stderr.setEncoding("utf8");
+        child.stderr.on("data", (chunk) => {
+          stderr += chunk;
+        });
+      }
+
+      child.on("error", reject);
+      child.on("close", (code) => {
+        if (Number(code ?? 0) !== 0) {
+          reject(
+            new Error(
+              `Dump script failed with exit ${code}: ${sanitizeErrorMessage(stderr)}`,
+            ),
+          );
+          return;
+        }
+        resolve();
+      });
+    });
+  } finally {
+    await outputHandle.close();
+    await fs.rm(scriptPath, { force: true });
+  }
+}
+
+async function gzipFile(gzipBin, filePath) {
+  const result = await spawnAndCapture(gzipBin, ["-f", filePath]);
+  if (result.code !== 0) {
+    throw new Error(
+      `gzip failed (${result.code}): ${sanitizeErrorMessage(result.stderr || result.stdout)}`,
+    );
+  }
+  return `${filePath}.gz`;
+}
+
+function formatTableNameFromInsertHeader(line) {
+  const match = line.match(/^INSERT INTO\s+"([^"]+)"\."([^"]+)"\s+/i);
+  if (!match) {
+    return null;
+  }
+  return `"${match[1]}"."${match[2]}"`;
+}
+
+function isExpectedMultiLineInsertHeader(line) {
+  return /^INSERT INTO\s+"[^"]+"\."[^"]+"\s+.*\sVALUES\s*$/i.test(line);
+}
+
+export function normalizeInsertRowDelimiter(rowLine, delimiter) {
+  const match = String(rowLine).match(/^(.*?)([;,])(\s*)$/);
+  if (!match) {
+    return null;
+  }
+  return `${match[1]}${delimiter}${match[3]}`;
+}
+
+function canRewriteInsertRows(rowLines) {
+  if (!Array.isArray(rowLines) || rowLines.length === 0) {
+    return false;
+  }
+  return rowLines.every((rowLine) => /[;,]\s*$/.test(String(rowLine)));
+}
+
+function summarizeTablesSplit(tableMap) {
+  const rows = Array.from(tableMap.values());
+  rows.sort((left, right) => {
+    if (right.input_rows !== left.input_rows) {
+      return right.input_rows - left.input_rows;
+    }
+    return left.table.localeCompare(right.table);
+  });
+  const tableEntries = rows.slice(0, MAX_TABLES_SPLIT_LOG_ENTRIES);
+  const truncatedCount = Math.max(0, rows.length - tableEntries.length);
+  return { tableEntries, truncatedCount };
+}
+
+export async function splitLargeDataInsertsInFile({
+  filePath,
+  thresholdRows,
+  chunkRows,
+  runId,
+  databaseName,
+  enabled,
+}) {
+  const beforeStats = await fs.stat(filePath);
+  const summary = {
+    enabled: Boolean(enabled),
+    threshold_rows: thresholdRows,
+    chunk_rows: chunkRows,
+    insert_statements_seen: 0,
+    insert_statements_split: 0,
+    input_rows_total: 0,
+    output_insert_statements: 0,
+    max_input_rows_per_insert: 0,
+    tables_split: [],
+    tables_split_truncated_count: 0,
+    before_bytes: beforeStats.size,
+    after_bytes: beforeStats.size,
+  };
+
+  logStructured("INFO", "supabase_db_dump_data_insert_split_started", {
+    run_id: runId,
+    database: databaseName,
+    raw_file_name: path.basename(filePath),
+    enabled: summary.enabled,
+    threshold_rows: summary.threshold_rows,
+    chunk_rows: summary.chunk_rows,
+  });
+
+  if (!summary.enabled) {
+    logStructured("INFO", "supabase_db_dump_data_insert_split_finished", {
+      run_id: runId,
+      database: databaseName,
+      raw_file_name: path.basename(filePath),
+      ...summary,
+    });
+    return summary;
+  }
+
+  const tempFilePath = `${filePath}.split.tmp`;
+  const readStream = createReadStream(filePath, { encoding: "utf8" });
+  const writeStream = createWriteStream(tempFilePath, { encoding: "utf8", mode: 0o600 });
+  const lineReader = readline.createInterface({
+    input: readStream,
+    crlfDelay: Infinity,
+  });
+  const tablesSplitMap = new Map();
+
+  const writeLine = (line) => {
+    writeStream.write(`${line}\n`);
+  };
+
+  let currentInsert = null;
+
+  const flushCurrentInsert = () => {
+    if (!currentInsert) {
+      return;
+    }
+    const {
+      headerLine,
+      rowLines,
+      originalLines,
+      expectedFormat,
+      tableName,
+    } = currentInsert;
+    const inputRowCount = rowLines.length;
+    summary.input_rows_total += inputRowCount;
+    summary.max_input_rows_per_insert = Math.max(summary.max_input_rows_per_insert, inputRowCount);
+
+    const shouldSplit =
+      expectedFormat
+      && inputRowCount > summary.threshold_rows
+      && canRewriteInsertRows(rowLines);
+
+    if (!shouldSplit) {
+      summary.output_insert_statements += 1;
+      for (const originalLine of originalLines) {
+        writeLine(originalLine);
+      }
+      currentInsert = null;
+      return;
+    }
+
+    const outputStatements = Math.ceil(inputRowCount / summary.chunk_rows);
+    summary.insert_statements_split += 1;
+    summary.output_insert_statements += outputStatements;
+    const existingTableStats = tablesSplitMap.get(tableName) || {
+      table: tableName,
+      input_rows: 0,
+      output_insert_statements: 0,
+    };
+    existingTableStats.input_rows += inputRowCount;
+    existingTableStats.output_insert_statements += outputStatements;
+    tablesSplitMap.set(tableName, existingTableStats);
+
+    for (let start = 0; start < rowLines.length; start += summary.chunk_rows) {
+      const chunk = rowLines.slice(start, start + summary.chunk_rows);
+      writeLine(headerLine);
+      for (let index = 0; index < chunk.length; index += 1) {
+        const rowLine = chunk[index];
+        const delimiter = index === chunk.length - 1 ? ";" : ",";
+        const normalized = normalizeInsertRowDelimiter(rowLine, delimiter);
+        writeLine(normalized ?? rowLine);
+      }
+      writeLine("");
+    }
+
+    currentInsert = null;
+  };
+
+  try {
+    for await (const line of lineReader) {
+      if (!currentInsert) {
+        if (/^INSERT INTO\s+/i.test(line)) {
+          summary.insert_statements_seen += 1;
+          if (/;\s*$/.test(line)) {
+            summary.output_insert_statements += 1;
+            writeLine(line);
+            continue;
+          }
+          currentInsert = {
+            headerLine: line,
+            expectedFormat: isExpectedMultiLineInsertHeader(line),
+            tableName: formatTableNameFromInsertHeader(line) || "unknown",
+            rowLines: [],
+            originalLines: [line],
+          };
+          continue;
+        }
+        writeLine(line);
+        continue;
+      }
+
+      currentInsert.originalLines.push(line);
+      currentInsert.rowLines.push(line);
+
+      if (/;\s*$/.test(line)) {
+        flushCurrentInsert();
+      }
+    }
+
+    flushCurrentInsert();
+    await new Promise((resolve, reject) => {
+      writeStream.end((error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve();
+      });
+    });
+    await fs.rename(tempFilePath, filePath);
+  } catch (error) {
+    writeStream.destroy();
+    await fs.rm(tempFilePath, { force: true });
+    throw error;
+  } finally {
+    lineReader.close();
+  }
+
+  const { tableEntries, truncatedCount } = summarizeTablesSplit(tablesSplitMap);
+  summary.tables_split = tableEntries;
+  summary.tables_split_truncated_count = truncatedCount;
+
+  const afterStats = await fs.stat(filePath);
+  summary.after_bytes = afterStats.size;
+
+  logStructured("INFO", "supabase_db_dump_data_insert_split_finished", {
+    run_id: runId,
+    database: databaseName,
+    raw_file_name: path.basename(filePath),
+    ...summary,
+  });
+
+  return summary;
+}
+
+class DropboxClient {
+  constructor(config) {
+    this.config = config;
+    this.accessToken = null;
+  }
+
+  async ensureAccessToken() {
+    if (this.accessToken) {
+      return this.accessToken;
+    }
+
+    const tokenBody = new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token: this.config.refreshToken,
+      client_id: this.config.appKey,
+      client_secret: this.config.appSecret,
+    });
+    const response = await fetch(DROPBOX_TOKEN_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: tokenBody.toString(),
+    });
+    if (!response.ok) {
+      const text = await readResponseText(response);
+      throw new Error(`Dropbox token request failed (${response.status}): ${text}`);
+    }
+
+    const payload = await response.json();
+    const accessToken = String(payload?.access_token || "").trim();
+    if (!accessToken) {
+      throw new Error("Dropbox token response missing access_token.");
+    }
+
+    this.accessToken = accessToken;
+    return accessToken;
+  }
+
+  async callJson(endpoint, body) {
+    const accessToken = await this.ensureAccessToken();
+    const response = await fetch(`${DROPBOX_API_BASE_URL}/${endpoint}`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (response.ok) {
+      return response.json();
+    }
+
+    const text = await readResponseText(response);
+    const error = new Error(`Dropbox API ${endpoint} failed (${response.status}): ${text}`);
+    error.dropbox_status = response.status;
+    error.dropbox_body = text;
+    throw error;
+  }
+
+  async uploadFile(localPath, dropboxPath) {
+    const accessToken = await this.ensureAccessToken();
+    const response = await fetch(DROPBOX_UPLOAD_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Dropbox-API-Arg": JSON.stringify({
+          path: dropboxPath,
+          mode: "overwrite",
+          autorename: false,
+          mute: true,
+          strict_conflict: false,
+        }),
+        "Content-Type": "application/octet-stream",
+      },
+      body: createReadStream(localPath),
+      duplex: "half",
+    });
+
+    if (!response.ok) {
+      const text = await readResponseText(response);
+      throw new Error(`Dropbox upload failed (${response.status}): ${text}`);
+    }
+
+    return response.json();
+  }
+
+  async listFolderEntries(dropboxPath) {
+    let response;
+    try {
+      response = await this.callJson("files/list_folder", {
+        path: dropboxPath,
+        recursive: false,
+        include_deleted: false,
+        include_mounted_folders: true,
+      });
+    } catch (error) {
+      if (
+        error?.dropbox_status === 409 &&
+        String(error?.dropbox_body || "").includes("not_found")
+      ) {
+        return [];
+      }
+      throw error;
+    }
+
+    const entries = [...(Array.isArray(response?.entries) ? response.entries : [])];
+    let cursor = response?.cursor || null;
+    let hasMore = Boolean(response?.has_more);
+
+    while (hasMore && cursor) {
+      const page = await this.callJson("files/list_folder/continue", { cursor });
+      entries.push(...(Array.isArray(page?.entries) ? page.entries : []));
+      cursor = page?.cursor || null;
+      hasMore = Boolean(page?.has_more);
+    }
+
+    return entries;
+  }
+
+  async deletePath(dropboxPath) {
+    try {
+      return await this.callJson("files/delete_v2", { path: dropboxPath });
+    } catch (error) {
+      if (
+        error?.dropbox_status === 409 &&
+        String(error?.dropbox_body || "").includes("not_found")
+      ) {
+        return null;
+      }
+      throw error;
+    }
+  }
+}
+
+function resolveConfig() {
+  const retentionDays = parsePositiveInt(
+    process.env.UK_AQ_SUPABASE_DB_DUMP_RETENTION_DAYS,
+    DEFAULT_RETENTION_DAYS,
+  );
+  const dropboxRoot = requiredEnv("UK_AQ_DROPBOX_ROOT");
+  const backupDir = String(process.env.UK_AQ_SUPABASE_DB_DUMP_BACKUP_DIR || DEFAULT_BACKUP_DIR).trim()
+    || DEFAULT_BACKUP_DIR;
+
+  return {
+    bashBin: String(process.env.BASH_BIN || "bash").trim() || "bash",
+    gzipBin: String(process.env.GZIP_BIN || "gzip").trim() || "gzip",
+    supabaseBin: String(process.env.SUPABASE_BIN || "supabase").trim() || "supabase",
+    retentionDays,
+    insertSplit: resolveInsertSplitConfig(process.env),
+    dropboxRoot,
+    backupDir,
+    dropboxBackupRoot: buildBackupRoot(dropboxRoot, backupDir),
+    databases: {
+      ingestdb: {
+        name: "ingestdb",
+        dbUrl: requiredEnv("UK_AQ_INGESTDB_DB_URL"),
+      },
+      obs_aqidb: {
+        name: "obs_aqidb",
+        dbUrl: requiredEnv("OBS_AQIDB_SUPABASE_DB_URL"),
+      },
+    },
+    dropbox: {
+      appKey: requiredEnv("DROPBOX_APP_KEY"),
+      appSecret: requiredEnv("DROPBOX_APP_SECRET"),
+      refreshToken: requiredEnv("DROPBOX_REFRESH_TOKEN"),
+    },
+  };
+}
+
+async function runSingleDump({
+  config,
+  runId,
+  databaseName,
+  dumpKind,
+  workingDir,
+  dbUrl,
+  dropboxClient,
+  runDate,
+}) {
+  const rawFilePath = path.join(workingDir, `${dumpKind}.sql`);
+  const scriptPath = path.join(workingDir, `${dumpKind}.sh`);
+  const dropboxFolder = buildDatabaseBackupFolder(
+    config.dropboxRoot,
+    config.backupDir,
+    databaseName,
+    runDate,
+  );
+  const dropboxPath = `${dropboxFolder}/${dumpKind}.sql.gz`;
+
+  logStructured("INFO", "supabase_db_dump_step_started", {
+    run_id: runId,
+    database: databaseName,
+    dump_kind: dumpKind,
+  });
+
+  const dryRunResult = await spawnAndCapture(
+    config.supabaseBin,
+    buildDumpArgs({ dbUrl, outputFile: rawFilePath, dumpKind }),
+  );
+  if (dryRunResult.code !== 0) {
+    throw new Error(
+      `supabase db dump dry-run failed for ${databaseName}/${dumpKind} (${dryRunResult.code}): ${sanitizeErrorMessage(dryRunResult.stderr || dryRunResult.stdout)}`,
+    );
+  }
+
+  const scriptText = includeCronJobsInDryRunScript(extractDryRunScript(dryRunResult.stdout));
+  await executeDumpScriptToFile({
+    bashBin: config.bashBin,
+    scriptText,
+    scriptPath,
+    outputFile: rawFilePath,
+  });
+
+  if (dumpKind === "schema") {
+    const addedPgCronEnable = await ensurePgCronExtensionAtTopOfSchemaFile(rawFilePath);
+    if (addedPgCronEnable) {
+      logStructured("INFO", "supabase_db_dump_schema_pg_cron_enable_prepended", {
+        run_id: runId,
+        database: databaseName,
+        dump_kind: dumpKind,
+        statement: PG_CRON_ENABLE_SQL,
+      });
+    }
+    if (databaseName === "obs_aqidb") {
+      const addedAuthenticatorSchemas =
+        await ensureObsAqidbAuthenticatorSchemasAtTopOfSchemaFile(rawFilePath);
+      if (addedAuthenticatorSchemas) {
+        logStructured("INFO", "supabase_db_dump_schema_authenticator_pgrst_schemas_prepended", {
+          run_id: runId,
+          database: databaseName,
+          dump_kind: dumpKind,
+          schemas: OBS_AQIDB_AUTHENTICATOR_PGRST_SCHEMAS,
+        });
+      }
+    }
+  }
+
+  let insertSplit = null;
+  if (dumpKind === "data") {
+    insertSplit = await splitLargeDataInsertsInFile({
+      filePath: rawFilePath,
+      thresholdRows: config.insertSplit.threshold_rows,
+      chunkRows: config.insertSplit.chunk_rows,
+      runId,
+      databaseName,
+      enabled: config.insertSplit.enabled,
+    });
+  }
+
+  const rawStats = await fs.stat(rawFilePath);
+  const gzFilePath = await gzipFile(config.gzipBin, rawFilePath);
+  const gzStats = await fs.stat(gzFilePath);
+
+  logStructured("INFO", "supabase_db_dump_step_finished", {
+    run_id: runId,
+    database: databaseName,
+    dump_kind: dumpKind,
+    raw_bytes: rawStats.size,
+    gzip_bytes: gzStats.size,
+  });
+
+  await dropboxClient.uploadFile(gzFilePath, dropboxPath);
+
+  logStructured("INFO", "supabase_db_dump_dropbox_upload_finished", {
+    run_id: runId,
+    database: databaseName,
+    dump_kind: dumpKind,
+    gzip_bytes: gzStats.size,
+    dropbox_path: dropboxPath,
+  });
+
+  return {
+    dump_kind: dumpKind,
+    file_name: `${dumpKind}.sql.gz`,
+    raw_bytes: rawStats.size,
+    gzip_bytes: gzStats.size,
+    dropbox_path: dropboxPath,
+    insert_split: insertSplit,
+  };
+}
+
+async function runCronJobsDump({
+  config,
+  runId,
+  databaseName,
+  workingDir,
+  dbUrl,
+  dropboxClient,
+  runDate,
+}) {
+  const rawFilePath = path.join(workingDir, `${CRON_JOBS_DUMP_KIND}.sql`);
+  const dropboxFolder = buildDatabaseBackupFolder(
+    config.dropboxRoot,
+    config.backupDir,
+    databaseName,
+    runDate,
+  );
+  const dropboxPath = `${dropboxFolder}/${CRON_JOBS_DUMP_KIND}.sql.gz`;
+
+  logStructured("INFO", "supabase_db_dump_cron_jobs_step_started", {
+    run_id: runId,
+    database: databaseName,
+    dump_kind: CRON_JOBS_DUMP_KIND,
+  });
+
+  const cronRows = await fetchCronJobsRows(dbUrl);
+  const sqlText = buildCronJobsRestoreSql({
+    databaseName,
+    rows: cronRows,
+    generatedAt: nowIso(),
+  });
+  await fs.writeFile(rawFilePath, sqlText, "utf8");
+
+  const rawStats = await fs.stat(rawFilePath);
+  const gzFilePath = await gzipFile(config.gzipBin, rawFilePath);
+  const gzStats = await fs.stat(gzFilePath);
+
+  await dropboxClient.uploadFile(gzFilePath, dropboxPath);
+
+  logStructured("INFO", "supabase_db_dump_cron_jobs_step_finished", {
+    run_id: runId,
+    database: databaseName,
+    dump_kind: CRON_JOBS_DUMP_KIND,
+    source_row_count: cronRows.length,
+    raw_bytes: rawStats.size,
+    gzip_bytes: gzStats.size,
+    dropbox_path: dropboxPath,
+  });
+
+  return {
+    dump_kind: CRON_JOBS_DUMP_KIND,
+    file_name: `${CRON_JOBS_DUMP_KIND}.sql.gz`,
+    raw_bytes: rawStats.size,
+    gzip_bytes: gzStats.size,
+    dropbox_path: dropboxPath,
+    source_row_count: cronRows.length,
+    source_table: "cron.job",
+  };
+}
+
+async function applyDropboxRetention({ config, dropboxClient, databaseName, runDate, runId }) {
+  const databaseRoot = joinDropboxPath(config.dropboxBackupRoot, databaseName);
+  const oldestKeptDate = resolveOldestKeptDate(runDate, config.retentionDays);
+  const entries = await dropboxClient.listFolderEntries(databaseRoot);
+  const { deletes, keeps } = planRetentionDeletes(entries, oldestKeptDate);
+  const deletedPaths = [];
+
+  for (const entry of deletes) {
+    const targetPath = entry.path_display || entry.path_lower;
+    if (!targetPath) {
+      continue;
+    }
+    await dropboxClient.deletePath(targetPath);
+    deletedPaths.push(targetPath);
+    logStructured("INFO", "supabase_db_dump_retention_deleted", {
+      run_id: runId,
+      database: databaseName,
+      dropbox_path: targetPath,
+    });
+  }
+
+  return {
+    root: databaseRoot,
+    retention_days: config.retentionDays,
+    oldest_kept_date: oldestKeptDate,
+    deleted_paths: deletedPaths,
+    kept_dates: keeps.map((entry) => entry.name),
+    scanned_entries: entries.length,
+  };
+}
+
+async function runDatabaseBackup({
+  config,
+  dropboxClient,
+  databaseName,
+  runId,
+  runDate,
+  tempRoot,
+}) {
+  const databaseConfig = config.databases[databaseName];
+  if (!databaseConfig) {
+    throw new Error(`Missing database config for ${databaseName}`);
+  }
+
+  const startedAt = nowIso();
+  const workingDir = await fs.mkdtemp(path.join(tempRoot, `${databaseName}-`));
+  const result = {
+    database: databaseName,
+    ok: false,
+    started_at: startedAt,
+    finished_at: null,
+    dumps: [],
+    retention: null,
+    error: null,
+  };
+
+  logStructured("INFO", "supabase_db_backup_database_started", {
+    run_id: runId,
+    database: databaseName,
+    started_at: startedAt,
+  });
+
+  try {
+    for (const dumpKind of DEFAULT_DUMP_KINDS) {
+      const dumpResult = await runSingleDump({
+        config,
+        runId,
+        databaseName,
+        dumpKind,
+        workingDir,
+        dbUrl: databaseConfig.dbUrl,
+        dropboxClient,
+        runDate,
+      });
+      result.dumps.push(dumpResult);
+    }
+    const cronJobsDumpResult = await runCronJobsDump({
+      config,
+      runId,
+      databaseName,
+      workingDir,
+      dbUrl: databaseConfig.dbUrl,
+      dropboxClient,
+      runDate,
+    });
+    result.dumps.push(cronJobsDumpResult);
+
+    result.retention = await applyDropboxRetention({
+      config,
+      dropboxClient,
+      databaseName,
+      runDate,
+      runId,
+    });
+    result.ok = true;
+    return result;
+  } catch (error) {
+    result.error = sanitizeErrorMessage(error);
+    logStructured("ERROR", "supabase_db_backup_database_failed", {
+      run_id: runId,
+      database: databaseName,
+      error: result.error,
+    });
+    return result;
+  } finally {
+    result.finished_at = nowIso();
+    await fs.rm(workingDir, { recursive: true, force: true });
+    logStructured(
+      result.ok ? "INFO" : "ERROR",
+      "supabase_db_backup_database_finished",
+      {
+        run_id: runId,
+        database: databaseName,
+        ok: result.ok,
+        dump_count: result.dumps.length,
+        finished_at: result.finished_at,
+      },
+    );
+  }
+}
+
+export async function runBackupWorkflow({
+  triggerMode = "manual",
+  requestedDatabases = null,
+}) {
+  const startedAt = nowIso();
+  const runId = randomUUID();
+  const config = resolveConfig();
+  const runDate = formatUtcDate(startedAt);
+  const databases = resolveRequestedDatabases(triggerMode, requestedDatabases);
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "uk-aq-supabase-db-dump-"));
+  const dropboxClient = new DropboxClient(config.dropbox);
+
+  const report = {
+    ok: false,
+    service: SERVICE_NAME,
+    run_id: runId,
+    trigger_mode: triggerMode,
+    requested_databases: databases,
+    started_at: startedAt,
+    finished_at: null,
+    retention_days: config.retentionDays,
+    dropbox_backup_root: config.dropboxBackupRoot,
+    databases: [],
+    error: null,
+  };
+
+  logStructured("INFO", "supabase_db_backup_run_started", {
+    run_id: runId,
+    trigger_mode: triggerMode,
+    databases,
+    started_at: startedAt,
+  });
+
+  try {
+    for (const databaseName of databases) {
+      const databaseResult = await runDatabaseBackup({
+        config,
+        dropboxClient,
+        databaseName,
+        runId,
+        runDate,
+        tempRoot,
+      });
+      report.databases.push(databaseResult);
+    }
+
+    report.ok = report.databases.every((entry) => entry.ok);
+    if (!report.ok) {
+      report.error = "One or more database backups failed.";
+    }
+    return report;
+  } catch (error) {
+    report.ok = false;
+    report.error = sanitizeErrorMessage(error);
+    logStructured("ERROR", "supabase_db_backup_run_failed", {
+      run_id: runId,
+      error: report.error,
+    });
+    return report;
+  } finally {
+    report.finished_at = nowIso();
+    await fs.rm(tempRoot, { recursive: true, force: true });
+    logStructured(
+      report.ok ? "INFO" : "ERROR",
+      "supabase_db_backup_run_finished",
+      {
+        run_id: runId,
+        ok: report.ok,
+        finished_at: report.finished_at,
+        database_results: report.databases.map((entry) => ({
+          database: entry.database,
+          ok: entry.ok,
+          dump_count: entry.dumps.length,
+        })),
+      },
+    );
+  }
+}

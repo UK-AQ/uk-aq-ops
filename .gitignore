@@ -1,0 +1,19 @@
+node_modules/
+.DS_Store
+logs/
+.env.supabase
+.env
+.env.test
+.env.live
+*.numbers
+env-vars-master.csv
+/tmp
+/node_modules 2
+nohup.out
+nohup_MBAir.out
+.dashboards.pids
+.vscode/settings.json
+system_docs_ops.zip
+*.pyc
+*.env
+/scripts/aqi_gaps/r2_aqi_gap_check*
