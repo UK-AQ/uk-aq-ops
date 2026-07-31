@@ -11,7 +11,7 @@ target_type = "github_workflow"
 github_repo = "UK-AQ/uk-aq-ops"
 github_workflow_file = "uk_aq_observs_partition_maintenance.yml"
 github_ref = "main"
-dry_run = false
+dry_run = true
 notes = "Observations partition maintenance via GitHub Actions"
 
 [jobs.uk_aq_prune_daily]
@@ -21,7 +21,7 @@ target_type = "github_workflow"
 github_repo = "UK-AQ/uk-aq-ops"
 github_workflow_file = "uk_aq_prune_daily.yml"
 github_ref = "main"
-dry_run = false
+dry_run = true
 notes = "Prune Daily via GitHub Actions"
 
 [jobs.uk_aq_chart_metrics]
@@ -54,7 +54,7 @@ target_type = "github_workflow"
 github_repo = "UK-AQ/uk-aq-ops"
 github_workflow_file = "uk_aq_r2_core_snapshot.yml"
 github_ref = "main"
-dry_run = false
+dry_run = true
 notes = "R2 core snapshot"
 
 [jobs.uk_aq_who_2021_daily]
@@ -80,7 +80,7 @@ target_type = "github_workflow"
 github_repo = "UK-AQ/uk-aq-ops"
 github_workflow_file = "uk_aq_r2_history_dropbox_backup.yml"
 github_ref = "main"
-dry_run = false
+dry_run = true
 notes = "R2 history Dropbox backup"
 
 [jobs.uk_aq_r2_history_dropbox_backup_force_prune_recheck]
@@ -90,7 +90,7 @@ target_type = "github_workflow"
 github_repo = "UK-AQ/uk-aq-ops"
 github_workflow_file = "uk_aq_r2_history_dropbox_backup.yml"
 github_ref = "main"
-dry_run = false
+dry_run = true
 notes = "Weekly forced prune recheck"
 
 [jobs.uk_aq_r2_history_dropbox_backup_force_prune_recheck.github_inputs]
