@@ -8,7 +8,7 @@ crons = ["* * * * *"]
 [[d1_databases]]
 binding = "SCHEDULER_DB"
 database_name = "uk_aq_cron_scheduler_ops_db"
-database_id = "9efc661d-8300-4f97-8b31-5545547a4419"
+database_id = "9b5f32af-fb17-4bff-b9df-6c211cc8b307"
 
 [observability]
 enabled = true
