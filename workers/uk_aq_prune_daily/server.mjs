@@ -3,13 +3,14 @@ import { createServer } from "node:http";
 import { fileURLToPath } from "node:url";
 import { createClient } from "@supabase/supabase-js";
 import {
-  fetchBackupDoneDays,
+  fetchBackupDoneConnectorDays,
   resolvePhaseBRuntimeConfig,
   runPhaseBBackup,
 } from "./phase_b_history_r2.mjs";
+import { connectorDayGateKey } from "../shared/uk_aq_connector_day_gate.mjs";
 import { groupFingerprintRechecksByHour } from "./fingerprint_recheck.mjs";
+import { deletePruneBucketsWithSourceIdentity } from "./source_identity_deletion.mjs";
 import { withDailyTaskRun } from "../shared/daily_task_health.mjs";
-import { rebuildR2HistoryIndexes } from "../shared/uk_aq_r2_history_index.mjs";
 
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
@@ -35,13 +36,8 @@ const LATE_ARRIVAL_DISCOVERY_PAGE_SIZE = 1000;
 const MAX_LATE_ARRIVAL_DISCOVERY_PAGES = 100;
 const MAX_LATE_ARRIVAL_WINDOWS_PER_RUN = 14;
 const RPC_SCHEMA = "uk_aq_public";
-const DEFAULT_CHART_METRICS_RETENTION_DAYS = 90;
-const DEFAULT_CHART_METRICS_DAILY_REFRESH_DAYS = 7;
-const DEFAULT_CHART_METRICS_CLEANUP_RPC = "uk_aq_rpc_chart_load_metrics_cleanup";
-const DEFAULT_CHART_METRICS_DAILY_REFRESH_RPC = "uk_aq_rpc_chart_load_metrics_daily_refresh";
 
 const RPC_HOURLY_FINGERPRINT = "uk_aq_rpc_observations_hourly_fingerprint";
-const RPC_DELETE_HOUR_BUCKET = "uk_aq_rpc_observations_delete_hour_bucket";
 const RPC_REPAIR_FETCH_HOUR_BUCKET = "uk_aq_rpc_observations_select_hour_bucket";
 const RPC_OBSERVS_UPSERT = "uk_aq_rpc_observs_observations_upsert";
 const RPC_OBSERVS_RECEIPTS_UPSERT = "uk_aq_rpc_observs_sync_receipt_daily_upsert";
@@ -147,14 +143,25 @@ function compactPruneHealthSummary(summary = {}) {
     deleted_rows: pickCount(summary, ["total_deleted_rows", "total_deleted_after_repair_rows"]),
     mismatch_count: summary.mismatch_count,
     mismatch_after_repair_count: summary.mismatch_after_repair_count,
-    backup_gate_blocked_bucket_count: pickCount(summary, [
-      "history_gate_blocked_bucket_count",
-      "history_gate_blocked_after_repair_bucket_count",
-    ]),
+    connector_history_gate_blocked_bucket_count:
+      Number(summary.connector_history_gate_blocked_bucket_count || 0)
+      + Number(summary.connector_history_gate_blocked_after_repair_bucket_count || 0),
     delete_error_count: pickCount(summary, ["delete_error_count", "delete_after_repair_error_count"]),
     repair_replay_count: summary.repair_replay_success_count,
     repair_replay_error_count: summary.repair_replay_error_count,
     alert_condition_count: summary.alert_condition_count,
+    connector_day_atomic_delete_planned_count:
+      summary.connector_day_atomic_delete_planned_count,
+    connector_day_atomic_delete_committed_count:
+      summary.connector_day_atomic_delete_committed_count,
+    connector_day_atomic_delete_rolled_back_count:
+      summary.connector_day_atomic_delete_rolled_back_count,
+    connector_day_atomic_delete_blocked_bucket_count:
+      summary.connector_day_atomic_delete_blocked_bucket_count,
+    connector_day_atomic_delete_plan_preview:
+      summary.connector_day_atomic_delete_plan_preview,
+    connector_day_atomic_delete_result_preview:
+      summary.connector_day_atomic_delete_result_preview,
     phase_a_recent: summary.phase_a_recent
       ? {
         skipped: summary.phase_a_recent.skipped,
@@ -169,16 +176,9 @@ function compactPruneHealthSummary(summary = {}) {
         enabled: summary.phase_b_history.enabled,
         ok: summary.phase_b_history.ok,
         run_id: summary.phase_b_history.run_id,
+        status: summary.phase_b_history.status,
+        stopped_for_budget: summary.phase_b_history.stopped_for_budget,
         error_count: summary.phase_b_history.error_count,
-      }
-      : undefined,
-    chart_load_metrics: summary.chart_load_metrics
-      ? {
-        enabled: summary.chart_load_metrics.enabled,
-        skipped: summary.chart_load_metrics.skipped,
-        raw_rows_deleted: summary.chart_load_metrics.raw_rows_deleted,
-        daily_rows_upserted: summary.chart_load_metrics.daily_rows_upserted,
-        error: summary.chart_load_metrics.error,
       }
       : undefined,
     late_arrival: summary.late_arrival
@@ -192,9 +192,24 @@ function compactPruneHealthSummary(summary = {}) {
         processed_day_count: summary.late_arrival.processed_day_count,
         obs_aqidb_cutoff_day_utc: summary.late_arrival.obs_aqidb_cutoff_day_utc,
         error_count: summary.late_arrival.error_count,
+        connector_day_atomic_delete_planned_count:
+          summary.late_arrival.connector_day_atomic_delete_planned_count,
+        connector_day_atomic_delete_committed_count:
+          summary.late_arrival.connector_day_atomic_delete_committed_count,
+        connector_day_atomic_delete_rolled_back_count:
+          summary.late_arrival.connector_day_atomic_delete_rolled_back_count,
+        connector_day_atomic_delete_blocked_bucket_count:
+          summary.late_arrival.connector_day_atomic_delete_blocked_bucket_count,
+        connector_day_atomic_delete_plan_preview:
+          summary.late_arrival.connector_day_atomic_delete_plan_preview,
+        connector_day_atomic_delete_result_preview:
+          summary.late_arrival.connector_day_atomic_delete_result_preview,
       }
       : undefined,
     warnings: [
+      summary.phase_b_history?.status === "stopped_budget"
+        ? "Phase B stopped at its controlled internal budget; downstream prune work was skipped"
+        : null,
       summary.cap_warning_count ? `delete cap warnings: ${summary.cap_warning_count}` : null,
       summary.cap_after_repair_warning_count
         ? `delete-after-repair cap warnings: ${summary.cap_after_repair_warning_count}`
@@ -569,6 +584,36 @@ function mergePreviewField(rows, field) {
   return merged;
 }
 
+export function aggregateAtomicDeletionSummaryForTest(rows) {
+  const summaries = Array.isArray(rows) ? rows : [];
+  return {
+    connector_day_atomic_delete_planned_count: sumIntField(
+      summaries,
+      "connector_day_atomic_delete_planned_count",
+    ),
+    connector_day_atomic_delete_committed_count: sumIntField(
+      summaries,
+      "connector_day_atomic_delete_committed_count",
+    ),
+    connector_day_atomic_delete_rolled_back_count: sumIntField(
+      summaries,
+      "connector_day_atomic_delete_rolled_back_count",
+    ),
+    connector_day_atomic_delete_blocked_bucket_count: sumIntField(
+      summaries,
+      "connector_day_atomic_delete_blocked_bucket_count",
+    ),
+    connector_day_atomic_delete_plan_preview: mergePreviewField(
+      summaries,
+      "connector_day_atomic_delete_plan_preview",
+    ),
+    connector_day_atomic_delete_result_preview: mergePreviewField(
+      summaries,
+      "connector_day_atomic_delete_result_preview",
+    ),
+  };
+}
+
 function aggregateDryRunRepairPilot(batchSummaries) {
   const pilots = batchSummaries
     .map((summary) => summary?.repair_one_mismatch_bucket_result)
@@ -602,8 +647,23 @@ function aggregateBatchSummary(config, overallWindow, batches, batchSummaries, p
     mismatch_count: sumIntField(batchSummaries, "mismatch_count"),
     observs_count_exceeds_ingest_count: sumIntField(batchSummaries, "observs_count_exceeds_ingest_count"),
     observs_extra_bucket_count: sumIntField(batchSummaries, "observs_extra_bucket_count"),
-    history_gate_enabled: Boolean(config.phaseB?.enabled),
-    history_gate_blocked_bucket_count: sumIntField(batchSummaries, "history_gate_blocked_bucket_count"),
+    connector_history_gate_enabled: Boolean(config.phaseB?.enabled),
+    connector_history_gate_allowed_bucket_count: sumIntField(
+      batchSummaries,
+      "connector_history_gate_allowed_bucket_count",
+    ),
+    connector_history_gate_blocked_bucket_count: sumIntField(
+      batchSummaries,
+      "connector_history_gate_blocked_bucket_count",
+    ),
+    duplicate_connector_day_skipped_count: sumIntField(
+      batchSummaries,
+      "duplicate_connector_day_skipped_count",
+    ),
+    duplicate_connector_day_skipped_preview: mergePreviewField(
+      batchSummaries,
+      "duplicate_connector_day_skipped_preview",
+    ),
     batch_count: batches.length,
     batch_window_hours: DEFAULT_MAX_HOURS_PER_BATCH,
     batch_windows_preview: sampleRows(batches),
@@ -617,15 +677,16 @@ function aggregateBatchSummary(config, overallWindow, batches, batchSummaries, p
       repair_one_mismatch_bucket_result: aggregateDryRunRepairPilot(batchSummaries),
       deletable_buckets_preview: mergePreviewField(batchSummaries, "deletable_buckets_preview"),
       mismatches_preview: mergePreviewField(batchSummaries, "mismatches_preview"),
-      history_gate_blocked_buckets_preview: mergePreviewField(
+      connector_history_gate_blocked_buckets_preview: mergePreviewField(
         batchSummaries,
-        "history_gate_blocked_buckets_preview",
+        "connector_history_gate_blocked_buckets_preview",
       ),
     };
   }
 
   return {
     ...summaryBase,
+    ...aggregateAtomicDeletionSummaryForTest(batchSummaries),
     repairable_mismatch_bucket_count: sumIntField(batchSummaries, "repairable_mismatch_bucket_count"),
     repair_replay_success_count: sumIntField(batchSummaries, "repair_replay_success_count"),
     repair_replay_error_count: sumIntField(batchSummaries, "repair_replay_error_count"),
@@ -641,9 +702,13 @@ function aggregateBatchSummary(config, overallWindow, batches, batchSummaries, p
       batchSummaries,
       "repaired_now_deletable_bucket_count_before_history_gate",
     ),
-    history_gate_blocked_after_repair_bucket_count: sumIntField(
+    connector_history_gate_allowed_after_repair_bucket_count: sumIntField(
       batchSummaries,
-      "history_gate_blocked_after_repair_bucket_count",
+      "connector_history_gate_allowed_after_repair_bucket_count",
+    ),
+    connector_history_gate_blocked_after_repair_bucket_count: sumIntField(
+      batchSummaries,
+      "connector_history_gate_blocked_after_repair_bucket_count",
     ),
     deleted_bucket_count: sumIntField(batchSummaries, "deleted_bucket_count"),
     total_deleted_rows: sumBigIntField(batchSummaries, "total_deleted_rows").toString(),
@@ -659,15 +724,23 @@ function aggregateBatchSummary(config, overallWindow, batches, batchSummaries, p
     cap_warning_count: sumIntField(batchSummaries, "cap_warning_count"),
     delete_after_repair_error_count: sumIntField(batchSummaries, "delete_after_repair_error_count"),
     cap_after_repair_warning_count: sumIntField(batchSummaries, "cap_after_repair_warning_count"),
+    source_identity_blocked_bucket_count: sumIntField(
+      batchSummaries,
+      "source_identity_blocked_bucket_count",
+    ),
+    source_identity_invalidated_connector_days: sumIntField(
+      batchSummaries,
+      "source_identity_invalidated_connector_days",
+    ),
     alert_condition_count: sumIntField(batchSummaries, "alert_condition_count"),
     deleted_buckets_preview: mergePreviewField(batchSummaries, "deleted_buckets_preview"),
     deleted_after_repair_buckets_preview: mergePreviewField(
       batchSummaries,
       "deleted_after_repair_buckets_preview",
     ),
-    history_gate_blocked_after_repair_preview: mergePreviewField(
+    connector_history_gate_blocked_after_repair_buckets_preview: mergePreviewField(
       batchSummaries,
-      "history_gate_blocked_after_repair_preview",
+      "connector_history_gate_blocked_after_repair_buckets_preview",
     ),
     mismatches_before_repair_preview: mergePreviewField(
       batchSummaries,
@@ -688,6 +761,10 @@ function aggregateBatchSummary(config, overallWindow, batches, batchSummaries, p
     cap_after_repair_warnings_preview: mergePreviewField(
       batchSummaries,
       "cap_after_repair_warnings_preview",
+    ),
+    source_identity_blocked_buckets_preview: mergePreviewField(
+      batchSummaries,
+      "source_identity_blocked_buckets_preview",
     ),
   };
 }
@@ -1255,48 +1332,145 @@ async function recheckMismatchBuckets(
   };
 }
 
-async function deleteHourBucket(client, bucket, deleteBatchSize, maxDeleteBatchesPerHour, pollutantCodes = null) {
-  const connectorId = toIntField(bucket.connector_id, "bucket.connector_id");
-  let totalDeleted = 0n;
-  let batchesRun = 0;
-  let drained = false;
-  let lastDeleted = 0;
+function connectorDayPlanKey(dayUtc, connectorId) {
+  return `${String(dayUtc).slice(0, 10)}|${Number(connectorId)}`;
+}
 
-  for (let batchNumber = 1; batchNumber <= maxDeleteBatchesPerHour; batchNumber += 1) {
-    batchesRun = batchNumber;
-    const { data, error } = await client.schema(RPC_SCHEMA).rpc(RPC_DELETE_HOUR_BUCKET, {
-      p_connector_id: connectorId,
-      p_hour_start: bucket.hour_start,
-      p_delete_limit: deleteBatchSize,
-      p_pollutant_codes: pollutantCodes,
-    });
+function bucketConnectorDayPlanKey(bucket) {
+  return connectorDayPlanKey(toBucketDayUtc(bucket), bucket.connector_id);
+}
 
-    if (error) {
-      throw new Error(`delete RPC failed: ${error.message}`);
+export function claimConnectorDaysForParentRun(buckets, processedConnectorDays = new Set()) {
+  const discoveredKeys = Array.from(new Set(
+    (Array.isArray(buckets) ? buckets : []).map(bucketConnectorDayPlanKey),
+  )).sort();
+  const claimedKeys = new Set();
+  const duplicateConnectorDays = [];
+  for (const key of discoveredKeys) {
+    if (processedConnectorDays.has(key)) {
+      const [dayUtc, connectorId] = key.split("|");
+      duplicateConnectorDays.push({ day_utc: dayUtc, connector_id: Number(connectorId) });
+      continue;
     }
+    processedConnectorDays.add(key);
+    claimedKeys.add(key);
+  }
+  return {
+    claimedBuckets: (Array.isArray(buckets) ? buckets : []).filter((bucket) => (
+      claimedKeys.has(bucketConnectorDayPlanKey(bucket))
+    )),
+    duplicateConnectorDays,
+    processedConnectorDays,
+  };
+}
 
-    const firstRow = Array.isArray(data) ? data[0] : data;
-    const deletedCount = Number(firstRow?.deleted_count ?? 0);
-    if (!Number.isFinite(deletedCount) || deletedCount < 0) {
-      throw new Error(`delete RPC returned invalid deleted_count: ${String(firstRow?.deleted_count)}`);
-    }
+async function recheckCompleteConnectorDays(
+  ingestClient,
+  observsClient,
+  initialIngestBuckets,
+  pollutantCodes = null,
+) {
+  const connectorIdsByDay = new Map();
+  for (const bucket of initialIngestBuckets) {
+    const dayUtc = toBucketDayUtc(bucket);
+    if (!connectorIdsByDay.has(dayUtc)) connectorIdsByDay.set(dayUtc, new Set());
+    connectorIdsByDay.get(dayUtc).add(Number(bucket.connector_id));
+  }
 
-    lastDeleted = deletedCount;
-    if (deletedCount === 0) {
-      drained = true;
-      break;
-    }
-    totalDeleted += BigInt(deletedCount);
+  const finalIngestBuckets = [];
+  const finalObservsBuckets = [];
+  for (const [dayUtc, connectorIds] of Array.from(connectorIdsByDay.entries()).sort()) {
+    const windowStart = `${dayUtc}T00:00:00.000Z`;
+    const windowEnd = new Date(Date.parse(windowStart) + DAY_MS).toISOString();
+    const [ingestRows, observsRows] = await Promise.all([
+      fetchHourlyFingerprints(
+        ingestClient,
+        windowStart,
+        windowEnd,
+        "ingest_final_connector_day_recheck",
+        pollutantCodes,
+      ),
+      fetchHourlyFingerprints(
+        observsClient,
+        windowStart,
+        windowEnd,
+        "observs_final_connector_day_recheck",
+        pollutantCodes,
+      ),
+    ]);
+    finalIngestBuckets.push(...ingestRows.filter((row) => connectorIds.has(Number(row.connector_id))));
+    finalObservsBuckets.push(...observsRows.filter((row) => connectorIds.has(Number(row.connector_id))));
   }
 
   return {
-    connector_id: bucket.connector_id,
-    hour_start: bucket.hour_start,
-    deleted_rows: totalDeleted,
-    batches_run: batchesRun,
-    drained,
-    max_batches_reached_with_remaining_rows: !drained && lastDeleted > 0,
+    finalIngestBuckets,
+    finalObservsBuckets,
+    ...compareBuckets(finalIngestBuckets, finalObservsBuckets),
   };
+}
+
+export function buildAtomicConnectorDayDeletionPlan({
+  currentBuckets,
+  eligibleBuckets,
+  unresolvedBuckets = [],
+  gateBlockedBuckets = [],
+  pollutantCodes = null,
+}) {
+  const currentGroups = new Map();
+  for (const bucket of Array.isArray(currentBuckets) ? currentBuckets : []) {
+    const key = bucketConnectorDayPlanKey(bucket);
+    if (!currentGroups.has(key)) currentGroups.set(key, []);
+    currentGroups.get(key).push(bucket);
+  }
+  const eligibleByKey = new Map(
+    (Array.isArray(eligibleBuckets) ? eligibleBuckets : [])
+      .map((bucket) => [buildBucketKey(bucket.connector_id, bucket.hour_start), bucket]),
+  );
+  const unresolvedDays = new Set(
+    (Array.isArray(unresolvedBuckets) ? unresolvedBuckets : []).map(bucketConnectorDayPlanKey),
+  );
+  const gateBlockedDays = new Set(
+    (Array.isArray(gateBlockedBuckets) ? gateBlockedBuckets : []).map(bucketConnectorDayPlanKey),
+  );
+  const hasPollutantSubset = Array.isArray(pollutantCodes) && pollutantCodes.length > 0;
+  const plannedBuckets = [];
+  const blockedBuckets = [];
+  const connectorDays = [];
+
+  for (const [key, group] of Array.from(currentGroups.entries()).sort()) {
+    const eligible = group.filter((bucket) => {
+      const planned = eligibleByKey.get(buildBucketKey(bucket.connector_id, bucket.hour_start));
+      return planned && planned.observation_count === bucket.observation_count;
+    });
+    let failureReason = null;
+    if (hasPollutantSubset) failureReason = "connector_day_scope_mismatch";
+    else if (unresolvedDays.has(key)) failureReason = "connector_day_not_fully_eligible";
+    else if (gateBlockedDays.has(key)) failureReason = "history_not_complete_for_connector_day";
+    else if (eligible.length !== group.length) failureReason = "connector_day_not_fully_eligible";
+
+    const [dayUtc, connectorId] = key.split("|");
+    connectorDays.push({
+      day_utc: dayUtc,
+      connector_id: Number(connectorId),
+      connector_day_current_bucket_count: group.length,
+      connector_day_eligible_bucket_count: eligible.length,
+      connector_day_atomic_delete_planned: failureReason === null,
+      connector_day_atomic_delete_failure_reason: failureReason,
+    });
+    if (!failureReason) {
+      plannedBuckets.push(...group);
+      continue;
+    }
+    blockedBuckets.push(...group.map((bucket) => ({
+      connector_id: bucket.connector_id,
+      hour_start: bucket.hour_start,
+      day_utc: dayUtc,
+      observation_count: bucket.observation_count.toString(),
+      reason: failureReason,
+    })));
+  }
+
+  return { plannedBuckets, blockedBuckets, connectorDays };
 }
 
 export function buildRunConfig(url) {
@@ -1435,26 +1609,20 @@ function toBucketDayUtc(bucket) {
   return String(bucket.hour_start || "").slice(0, 10);
 }
 
-async function applyBackupGateFilter(config, runId, buckets, gateStage) {
-  if (!config.phaseB?.enabled || !Array.isArray(buckets) || buckets.length === 0) {
-    return {
-      allowedBuckets: Array.isArray(buckets) ? buckets : [],
-      blockedBuckets: [],
-      dayGateMap: new Map(),
-    };
-  }
-
-  const dayGateMap = await fetchBackupDoneDays({
-    supabaseDbUrl: config.phaseB.supabase_db_url,
-    dayUtcList: buckets.map(toBucketDayUtc),
-  });
-
+export function filterBucketsByConnectorHistoryGate(buckets, connectorGateMap) {
   const allowedBuckets = [];
   const blockedBuckets = [];
-  for (const bucket of buckets) {
+  for (const bucket of Array.isArray(buckets) ? buckets : []) {
     const dayUtc = toBucketDayUtc(bucket);
-    const historyDone = dayGateMap.get(dayUtc) === true;
-    if (historyDone) {
+    let gateComplete = false;
+    try {
+      gateComplete = connectorGateMap.get(
+        connectorDayGateKey(dayUtc, bucket.connector_id),
+      ) === true;
+    } catch (_error) {
+      gateComplete = false;
+    }
+    if (gateComplete) {
       allowedBuckets.push(bucket);
       continue;
     }
@@ -1463,30 +1631,133 @@ async function applyBackupGateFilter(config, runId, buckets, gateStage) {
       hour_start: bucket.hour_start,
       day_utc: dayUtc,
       observation_count: bucket.observation_count.toString(),
-      reason: "history_not_complete_for_day",
+      reason: "history_not_complete_for_connector_day",
     });
   }
+  return { allowedBuckets, blockedBuckets };
+}
+
+async function applyConnectorHistoryGateFilter(config, runId, buckets, gateStage) {
+  if (!config.phaseB?.enabled || !Array.isArray(buckets) || buckets.length === 0) {
+    return {
+      allowedBuckets: Array.isArray(buckets) ? buckets : [],
+      blockedBuckets: [],
+      connectorGateMap: new Map(),
+    };
+  }
+
+  const connectorGateMap = await fetchBackupDoneConnectorDays({
+    supabaseDbUrl: config.phaseB.supabase_db_url,
+    connectorDays: buckets.map((bucket) => ({
+      day_utc: toBucketDayUtc(bucket),
+      connector_id: bucket.connector_id,
+    })),
+  });
+
+  const { allowedBuckets, blockedBuckets } = filterBucketsByConnectorHistoryGate(
+    buckets,
+    connectorGateMap,
+  );
 
   if (blockedBuckets.length > 0) {
-    logStructured("WARNING", "history_gate_blocked_buckets", {
+    logStructured("WARNING", "connector_history_gate_blocked_buckets", {
       run_id: runId,
       gate_stage: gateStage,
-      blocked_count: blockedBuckets.length,
-      blocked_preview: sampleRows(blockedBuckets),
-      prune_blocked_for_day: true,
+      connector_history_gate_allowed_bucket_count: allowedBuckets.length,
+      connector_history_gate_blocked_bucket_count: blockedBuckets.length,
+      connector_history_gate_blocked_buckets_preview: sampleRows(blockedBuckets),
     });
   } else {
-    logStructured("INFO", "history_gate_allows_all_buckets", {
+    logStructured("INFO", "connector_history_gate_allows_all_buckets", {
       run_id: runId,
       gate_stage: gateStage,
-      allowed_count: allowedBuckets.length,
+      connector_history_gate_allowed_bucket_count: allowedBuckets.length,
     });
   }
 
   return {
     allowedBuckets,
     blockedBuckets,
-    dayGateMap,
+    connectorGateMap,
+  };
+}
+
+async function deleteBucketsWithConnectorSourceIdentity(
+  config,
+  runId,
+  buckets,
+  pollutantCodes,
+  deleteStage,
+) {
+  const bucketResults = [];
+  const errors = [];
+  const capWarnings = [];
+  const blockedBuckets = [];
+  let totalDeletedRows = 0n;
+  let sourceIdentityInvalidatedConnectorDays = 0;
+  const transactionResults = await deletePruneBucketsWithSourceIdentity({
+    databaseUrl: config.phaseB?.supabase_db_url,
+    buckets,
+    deleteBatchSize: config.deleteBatchSize,
+    maxDeleteBatchesPerHour: config.maxDeleteBatchesPerHour,
+    pollutantCodes,
+  });
+  for (const transactionResult of transactionResults) {
+    logStructured(
+      transactionResult.ok ? "INFO" : "WARNING",
+      "connector_day_source_identity_delete_result",
+      {
+        run_id: runId,
+        delete_stage: deleteStage,
+        day_utc: transactionResult.day_utc,
+        connector_id: transactionResult.connector_id,
+        ...transactionResult.diagnostics,
+      },
+    );
+    if (!transactionResult.ok) {
+      sourceIdentityInvalidatedConnectorDays += Number(
+        transactionResult.diagnostics.source_identity_invalidated_connector_days || 0,
+      );
+      blockedBuckets.push(...transactionResult.blocked_buckets);
+      errors.push({
+        day_utc: transactionResult.day_utc,
+        connector_id: transactionResult.connector_id,
+        reason: transactionResult.diagnostics.source_identity_failure_reason,
+        retained_bucket_count: transactionResult.blocked_buckets.length,
+      });
+      continue;
+    }
+    for (const result of transactionResult.bucket_results) {
+      totalDeletedRows += result.deleted_rows;
+      const bucketResult = {
+        connector_id: result.connector_id,
+        hour_start: result.hour_start,
+        deleted_rows: result.deleted_rows.toString(),
+        batches_run: result.batches_run,
+        drained: result.drained,
+      };
+      bucketResults.push(bucketResult);
+      if (result.max_batches_reached_with_remaining_rows) {
+        capWarnings.push({
+          connector_id: result.connector_id,
+          hour_start: result.hour_start,
+          deleted_rows: result.deleted_rows.toString(),
+          batches_run: result.batches_run,
+          max_delete_batches_per_hour: config.maxDeleteBatchesPerHour,
+          reason: "max_batches_reached_before_drain",
+          alert_condition: true,
+        });
+      }
+    }
+  }
+  return {
+    bucketResults,
+    errors,
+    capWarnings,
+    blockedBuckets,
+    totalDeletedRows,
+    sourceIdentityInvalidatedConnectorDays,
+    transactionResults,
   };
 }
 
@@ -1523,20 +1794,44 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     delete_batch_size: config.deleteBatchSize,
     max_delete_batches_per_hour: config.maxDeleteBatchesPerHour,
     repair_one_mismatch_bucket: config.repairOneMismatchBucket,
-    history_gate_enabled: historyGateEnabled,
+    connector_history_gate_enabled: historyGateEnabled,
     delete_filter_mode: deleteEligiblePollutantCodes ? "pollutant_allow_list" : "all_observations",
     delete_eligible_pollutant_codes: deleteEligiblePollutantCodes,
     phase: repairOnlyMode ? "phase_a_recent" : "prune",
   });
 
-  const [ingestBuckets, observsBuckets] = await Promise.all([
+  let [ingestBuckets, observsBuckets] = await Promise.all([
     fetchHourlyFingerprints(ingestClient, windowStart, windowEnd, "ingest", deleteEligiblePollutantCodes),
     fetchHourlyFingerprints(observsClient, windowStart, windowEnd, "observs", deleteEligiblePollutantCodes),
   ]);
 
+  let duplicateConnectorDaysSkipped = [];
+  if (!repairOnlyMode && !dryRunMode) {
+    const claimed = claimConnectorDaysForParentRun(
+      ingestBuckets,
+      runContext.processed_connector_days instanceof Set
+        ? runContext.processed_connector_days
+        : new Set(),
+    );
+    duplicateConnectorDaysSkipped = claimed.duplicateConnectorDays;
+    if (claimed.claimedBuckets.length > 0) {
+      const completeInitialState = await recheckCompleteConnectorDays(
+        ingestClient,
+        observsClient,
+        claimed.claimedBuckets,
+        deleteEligiblePollutantCodes,
+      );
+      ingestBuckets = completeInitialState.finalIngestBuckets;
+      observsBuckets = completeInitialState.finalObservsBuckets;
+    } else {
+      ingestBuckets = [];
+      observsBuckets = [];
+    }
+  }
+
   const { deletableBuckets, mismatches, observsExtraBuckets } = compareBuckets(ingestBuckets, observsBuckets);
   const preRepairBackupGate = historyGateEnabled
-    ? await applyBackupGateFilter(
+    ? await applyConnectorHistoryGateFilter(
       config,
       runId,
       deletableBuckets,
@@ -1545,7 +1840,7 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     : {
       allowedBuckets: deletableBuckets,
       blockedBuckets: [],
-      dayGateMap: new Map(),
+      connectorGateMap: new Map(),
     };
   const gatedDeletableBuckets = preRepairBackupGate.allowedBuckets;
   const historyGateBlockedBuckets = preRepairBackupGate.blockedBuckets;
@@ -1598,11 +1893,14 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     mismatch_count: mismatches.length,
     observs_count_exceeds_ingest_count: observsCountGreaterThanIngest.length,
     observs_extra_bucket_count: observsExtraBuckets.length,
-    history_gate_enabled: historyGateEnabled,
+    connector_history_gate_enabled: historyGateEnabled,
     delete_filter_mode: deleteEligiblePollutantCodes ? "pollutant_allow_list" : "all_observations",
     delete_eligible_pollutant_codes: deleteEligiblePollutantCodes,
-    history_gate_blocked_bucket_count: historyGateBlockedBuckets.length,
-    history_gate_blocked_buckets_preview: sampleRows(historyGateBlockedBuckets),
+    connector_history_gate_allowed_bucket_count: gatedDeletableBuckets.length,
+    connector_history_gate_blocked_bucket_count: historyGateBlockedBuckets.length,
+    connector_history_gate_blocked_buckets_preview: sampleRows(historyGateBlockedBuckets),
+    duplicate_connector_day_skipped_count: duplicateConnectorDaysSkipped.length,
+    duplicate_connector_day_skipped_preview: sampleRows(duplicateConnectorDaysSkipped),
     phase: repairOnlyMode ? "phase_a_recent" : "prune",
   };
 
@@ -1684,60 +1982,6 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     };
   }
 
-  const deletedBucketResults = [];
-  const deleteErrors = [];
-  const capWarnings = [];
-  let totalDeletedRows = 0n;
-
-  if (!repairOnlyMode) {
-    for (const bucket of gatedDeletableBuckets) {
-      try {
-        const result = await deleteHourBucket(
-          ingestClient,
-          bucket,
-          config.deleteBatchSize,
-          config.maxDeleteBatchesPerHour,
-          deleteEligiblePollutantCodes,
-        );
-        totalDeletedRows += result.deleted_rows;
-
-        const bucketResult = {
-          connector_id: result.connector_id,
-          hour_start: result.hour_start,
-          deleted_rows: result.deleted_rows.toString(),
-          batches_run: result.batches_run,
-          drained: result.drained,
-        };
-        deletedBucketResults.push(bucketResult);
-        logStructured("INFO", "hour_bucket_delete_result", { run_id: runId, ...bucketResult });
-
-        if (result.max_batches_reached_with_remaining_rows) {
-          const warningPayload = {
-            connector_id: result.connector_id,
-            hour_start: result.hour_start,
-            deleted_rows: result.deleted_rows.toString(),
-            batches_run: result.batches_run,
-            max_delete_batches_per_hour: config.maxDeleteBatchesPerHour,
-            reason: "max_batches_reached_before_drain",
-            alert_condition: true,
-          };
-          capWarnings.push(warningPayload);
-          logStructured("WARNING", "hour_bucket_delete_cap_reached", { run_id: runId, ...warningPayload });
-        }
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        const errorPayload = {
-          connector_id: bucket.connector_id,
-          hour_start: bucket.hour_start,
-          reason: "delete_error",
-          message,
-        };
-        deleteErrors.push(errorPayload);
-        logStructured("ERROR", "hour_bucket_delete_error", { run_id: runId, ...errorPayload });
-      }
-    }
-  }
-
   const repairReplayResults = [];
   const repairReplayErrors = [];
 
@@ -1777,7 +2021,10 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
 
   let repairedNowDeletableBuckets = [];
   let mismatchesAfterRepair = mismatches;
-  if (repairableMismatches.length > 0) {
+  let finalCurrentBuckets = [];
+  let finalEligibleBuckets = [];
+  let finalObservsBucketCount = 0;
+  if (repairOnlyMode && repairableMismatches.length > 0) {
     const recheckResult = await recheckMismatchBuckets(
       ingestClient,
       observsClient,
@@ -1786,22 +2033,48 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     );
     repairedNowDeletableBuckets = recheckResult.nowDeletableBuckets;
     mismatchesAfterRepair = recheckResult.stillMismatched;
+  } else if (!repairOnlyMode) {
+    const finalRecheck = await recheckCompleteConnectorDays(
+      ingestClient,
+      observsClient,
+      ingestBuckets,
+      deleteEligiblePollutantCodes,
+    );
+    finalCurrentBuckets = finalRecheck.finalIngestBuckets;
+    finalEligibleBuckets = finalRecheck.deletableBuckets;
+    finalObservsBucketCount = finalRecheck.finalObservsBuckets.length;
+    mismatchesAfterRepair = finalRecheck.mismatches;
+    const initiallyMismatchedKeys = new Set(
+      mismatches.map((bucket) => buildBucketKey(bucket.connector_id, bucket.hour_start)),
+    );
+    repairedNowDeletableBuckets = finalEligibleBuckets.filter((bucket) => (
+      initiallyMismatchedKeys.has(buildBucketKey(bucket.connector_id, bucket.hour_start))
+    ));
   }
 
   const postRepairBackupGate = historyGateEnabled
-    ? await applyBackupGateFilter(
+    ? await applyConnectorHistoryGateFilter(
       config,
       runId,
-      repairedNowDeletableBuckets,
-      "post_repair",
+      finalEligibleBuckets,
+      "final_connector_day_plan",
     )
     : {
-      allowedBuckets: repairedNowDeletableBuckets,
+      allowedBuckets: repairOnlyMode ? repairedNowDeletableBuckets : finalEligibleBuckets,
       blockedBuckets: [],
-      dayGateMap: new Map(),
+      connectorGateMap: new Map(),
     };
-  const gatedRepairedNowDeletableBuckets = postRepairBackupGate.allowedBuckets;
+  const gatedFinalEligibleBuckets = postRepairBackupGate.allowedBuckets;
   const historyGateBlockedAfterRepairBuckets = postRepairBackupGate.blockedBuckets;
+  const atomicDeletionPlan = repairOnlyMode
+    ? { plannedBuckets: [], blockedBuckets: [], connectorDays: [] }
+    : buildAtomicConnectorDayDeletionPlan({
+      currentBuckets: finalCurrentBuckets,
+      eligibleBuckets: gatedFinalEligibleBuckets,
+      unresolvedBuckets: mismatchesAfterRepair,
+      gateBlockedBuckets: historyGateBlockedAfterRepairBuckets,
+      pollutantCodes: deleteEligiblePollutantCodes,
+    });
 
   for (const mismatch of mismatchesAfterRepair) {
     logStructured("ERROR", "hour_bucket_mismatch_after_repair", {
@@ -1809,7 +2082,7 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
       ...mismatch,
     });
   }
-  for (const bucket of gatedRepairedNowDeletableBuckets) {
+  for (const bucket of repairedNowDeletableBuckets) {
     logStructured("INFO", "hour_bucket_repaired_and_now_deletable", {
       run_id: runId,
       connector_id: bucket.connector_id,
@@ -1818,68 +2091,44 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     });
   }
 
-  const deletedAfterRepairBucketResults = [];
-  const deleteAfterRepairErrors = [];
+  const finalDeletion = !repairOnlyMode
+    ? await deleteBucketsWithConnectorSourceIdentity(
+      config,
+      runId,
+      atomicDeletionPlan.plannedBuckets,
+      deleteEligiblePollutantCodes,
+      "final_connector_day_atomic_delete",
+    )
+    : {
+      bucketResults: [],
+      errors: [],
+      capWarnings: [],
+      blockedBuckets: [],
+      totalDeletedRows: 0n,
+      sourceIdentityInvalidatedConnectorDays: 0,
+      transactionResults: [],
+    };
+  const deletedBucketResults = finalDeletion.bucketResults;
+  const deleteErrors = finalDeletion.errors;
+  const capWarnings = finalDeletion.capWarnings;
+  const totalDeletedRows = finalDeletion.totalDeletedRows;
+  const initiallyMismatchedKeys = new Set(
+    mismatches.map((bucket) => buildBucketKey(bucket.connector_id, bucket.hour_start)),
+  );
+  const deletedAfterRepairBucketResults = deletedBucketResults.filter((bucket) => (
+    initiallyMismatchedKeys.has(buildBucketKey(bucket.connector_id, bucket.hour_start))
+  ));
+  const totalDeletedAfterRepairRows = deletedAfterRepairBucketResults.reduce(
+    (total, bucket) => total + BigInt(bucket.deleted_rows),
+    0n,
+  );
+  const deleteAfterRepairErrors = deleteErrors.filter((error) => (
+    mismatches.some((bucket) => (
+      toBucketDayUtc(bucket) === error.day_utc
+      && Number(bucket.connector_id) === Number(error.connector_id)
+    ))
+  ));
   const capAfterRepairWarnings = [];
-  let totalDeletedAfterRepairRows = 0n;
-
-  if (!repairOnlyMode) {
-    for (const bucket of gatedRepairedNowDeletableBuckets) {
-      try {
-        const result = await deleteHourBucket(
-          ingestClient,
-          bucket,
-          config.deleteBatchSize,
-          config.maxDeleteBatchesPerHour,
-          deleteEligiblePollutantCodes,
-        );
-        totalDeletedAfterRepairRows += result.deleted_rows;
-
-        const bucketResult = {
-          connector_id: result.connector_id,
-          hour_start: result.hour_start,
-          deleted_rows: result.deleted_rows.toString(),
-          batches_run: result.batches_run,
-          drained: result.drained,
-        };
-        deletedAfterRepairBucketResults.push(bucketResult);
-        logStructured("INFO", "hour_bucket_delete_after_repair_result", {
-          run_id: runId,
-          ...bucketResult,
-        });
-
-        if (result.max_batches_reached_with_remaining_rows) {
-          const warningPayload = {
-            connector_id: result.connector_id,
-            hour_start: result.hour_start,
-            deleted_rows: result.deleted_rows.toString(),
-            batches_run: result.batches_run,
-            max_delete_batches_per_hour: config.maxDeleteBatchesPerHour,
-            reason: "max_batches_reached_before_drain",
-            alert_condition: true,
-          };
-          capAfterRepairWarnings.push(warningPayload);
-          logStructured("WARNING", "hour_bucket_delete_after_repair_cap_reached", {
-            run_id: runId,
-            ...warningPayload,
-          });
-        }
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        const errorPayload = {
-          connector_id: bucket.connector_id,
-          hour_start: bucket.hour_start,
-          reason: "delete_after_repair_error",
-          message,
-        };
-        deleteAfterRepairErrors.push(errorPayload);
-        logStructured("ERROR", "hour_bucket_delete_after_repair_error", {
-          run_id: runId,
-          ...errorPayload,
-        });
-      }
-    }
-  }
 
   const finalMismatchCount = mismatchesAfterRepair.length;
   const totalRowsSelectedForRepair = repairReplayResults.reduce(
@@ -1904,9 +2153,15 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     repair_rows_replayed_total: totalRowsReplayedForRepair.toString(),
     repair_receipts_upserted_total: totalReceiptsUpsertedForRepair.toString(),
     mismatch_after_repair_count: finalMismatchCount,
-    repaired_now_deletable_bucket_count: gatedRepairedNowDeletableBuckets.length,
+    repaired_now_deletable_bucket_count: repairedNowDeletableBuckets.length,
     repaired_now_deletable_bucket_count_before_history_gate: repairedNowDeletableBuckets.length,
-    history_gate_blocked_after_repair_bucket_count: historyGateBlockedAfterRepairBuckets.length,
+    connector_history_gate_allowed_after_repair_bucket_count: repairedNowDeletableBuckets.filter((bucket) => (
+      gatedFinalEligibleBuckets.some((allowed) => (
+        buildBucketKey(allowed.connector_id, allowed.hour_start)
+          === buildBucketKey(bucket.connector_id, bucket.hour_start)
+      ))
+    )).length,
+    connector_history_gate_blocked_after_repair_bucket_count: historyGateBlockedAfterRepairBuckets.length,
     deleted_bucket_count: deletedBucketResults.length,
     total_deleted_rows: totalDeletedRows.toString(),
     deleted_after_repair_bucket_count: deletedAfterRepairBucketResults.length,
@@ -1915,26 +2170,49 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     cap_warning_count: capWarnings.length,
     delete_after_repair_error_count: deleteAfterRepairErrors.length,
     cap_after_repair_warning_count: capAfterRepairWarnings.length,
+    source_identity_blocked_bucket_count:
+      finalDeletion.blockedBuckets.length,
+    source_identity_invalidated_connector_days:
+      finalDeletion.sourceIdentityInvalidatedConnectorDays,
+    final_connector_day_ingest_bucket_count: finalCurrentBuckets.length,
+    final_connector_day_observs_bucket_count: finalObservsBucketCount,
+    connector_day_atomic_delete_planned_count: atomicDeletionPlan.connectorDays.filter(
+      (row) => row.connector_day_atomic_delete_planned,
+    ).length,
+    connector_day_atomic_delete_committed_count: finalDeletion.transactionResults.filter(
+      (row) => row.diagnostics.connector_day_atomic_delete_committed,
+    ).length,
+    connector_day_atomic_delete_rolled_back_count: finalDeletion.transactionResults.filter(
+      (row) => row.diagnostics.connector_day_atomic_delete_rolled_back,
+    ).length,
+    connector_day_atomic_delete_blocked_bucket_count: atomicDeletionPlan.blockedBuckets.length,
     alert_condition_count:
       finalMismatchCount +
       deleteErrors.length +
-      capWarnings.length +
       repairReplayErrors.length +
-      deleteAfterRepairErrors.length +
-      capAfterRepairWarnings.length +
-      historyGateBlockedBuckets.length +
-      historyGateBlockedAfterRepairBuckets.length,
+      atomicDeletionPlan.blockedBuckets.length +
+      finalDeletion.blockedBuckets.length,
     deleted_buckets_preview: sampleRows(deletedBucketResults),
     deleted_after_repair_buckets_preview: sampleRows(deletedAfterRepairBucketResults),
     mismatches_before_repair_preview: sampleRows(mismatches),
     mismatches_after_repair_preview: sampleRows(mismatchesAfterRepair),
-    history_gate_blocked_after_repair_preview: sampleRows(historyGateBlockedAfterRepairBuckets),
+    connector_history_gate_blocked_after_repair_buckets_preview: sampleRows(historyGateBlockedAfterRepairBuckets),
     repair_replay_results_preview: sampleRows(repairReplayResults),
     repair_replay_errors_preview: sampleRows(repairReplayErrors),
     delete_errors_preview: sampleRows(deleteErrors),
     cap_warnings_preview: sampleRows(capWarnings),
     delete_after_repair_errors_preview: sampleRows(deleteAfterRepairErrors),
     cap_after_repair_warnings_preview: sampleRows(capAfterRepairWarnings),
+    source_identity_blocked_buckets_preview: sampleRows([
+      ...atomicDeletionPlan.blockedBuckets,
+      ...finalDeletion.blockedBuckets,
+    ]),
+    connector_day_atomic_delete_plan_preview: sampleRows(atomicDeletionPlan.connectorDays),
+    connector_day_atomic_delete_result_preview: sampleRows(finalDeletion.transactionResults.map((row) => ({
+      day_utc: row.day_utc,
+      connector_id: row.connector_id,
+      ...row.diagnostics,
+    }))),
   };
   logStructured(
     "INFO",
@@ -1997,68 +2275,6 @@ async function runPhaseARecent(config) {
   return aggregateSummary;
 }
 
-async function runChartLoadMetricsMaintenance(config) {
-  if (config.dryRun) {
-    return {
-      enabled: false,
-      skipped: true,
-      reason: "dry_run",
-    };
-  }
-
-  const retentionDays = parsePositiveInt(
-    process.env.UK_AQ_CHART_METRICS_RETENTION_DAYS,
-    DEFAULT_CHART_METRICS_RETENTION_DAYS,
-    1,
-    3650,
-  );
-  const refreshDays = parsePositiveInt(
-    process.env.UK_AQ_CHART_METRICS_DAILY_REFRESH_DAYS,
-    DEFAULT_CHART_METRICS_DAILY_REFRESH_DAYS,
-    1,
-    31,
-  );
-  const cleanupRpc = (process.env.UK_AQ_CHART_METRICS_CLEANUP_RPC || DEFAULT_CHART_METRICS_CLEANUP_RPC).trim();
-  const dailyRefreshRpc = (process.env.UK_AQ_CHART_METRICS_DAILY_REFRESH_RPC || DEFAULT_CHART_METRICS_DAILY_REFRESH_RPC)
-    .trim();
-
-  const observsClient = createClient(config.observsSupabaseUrl, config.observsSecretKey, {
-    auth: { persistSession: false, autoRefreshToken: false },
-    db: { schema: RPC_SCHEMA },
-  });
-
-  const cleanupResult = await observsClient.schema(RPC_SCHEMA).rpc(cleanupRpc, {
-    p_retention_days: retentionDays,
-  });
-  if (cleanupResult.error) {
-    throw new Error(`chart metrics cleanup RPC failed: ${cleanupResult.error.message}`);
-  }
-  const cleanupRowsDeleted = Number(cleanupResult.data?.[0]?.rows_deleted ?? 0);
-
-  const refreshResult = await observsClient.schema(RPC_SCHEMA).rpc(dailyRefreshRpc, {
-    p_recent_days: refreshDays,
-  });
-  if (refreshResult.error) {
-    throw new Error(`chart metrics daily refresh RPC failed: ${refreshResult.error.message}`);
-  }
-  const refreshRow = refreshResult.data?.[0] || {};
-  const summary = {
-    enabled: true,
-    skipped: false,
-    retention_days: retentionDays,
-    refresh_days: refreshDays,
-    cleanup_rpc: cleanupRpc,
-    daily_refresh_rpc: dailyRefreshRpc,
-    raw_rows_deleted: Number.isFinite(cleanupRowsDeleted) ? cleanupRowsDeleted : 0,
-    daily_rows_upserted: Number(refreshRow.rows_upserted ?? 0),
-    daily_days_refreshed: Number(refreshRow.days_refreshed ?? refreshDays),
-    daily_refreshed_from_day_utc: refreshRow.refreshed_from_day_utc ?? null,
-    daily_refreshed_to_day_utc: refreshRow.refreshed_to_day_utc ?? null,
-  };
-  logStructured("INFO", "chart_load_metrics_maintenance_summary", summary);
-  return summary;
-}
-
 async function discoverLateArrivalDays(ingestClient, overallWindow) {
   const cutoffWindowStart = toIso(overallWindow.window_start, "late_arrival.window_start");
   const distinctDaySet = new Set();
@@ -2109,15 +2325,28 @@ async function discoverLateArrivalDays(ingestClient, overallWindow) {
   };
 }
 
-async function runLateArrivalDirectDeleteDay(config, ingestClient, dayWindow, runId, batchIndex, batchCount) {
+async function runLateArrivalDirectDeleteDay(
+  config,
+  ingestClient,
+  dayWindow,
+  runId,
+  batchIndex,
+  batchCount,
+  processedConnectorDays,
+) {
   const deleteEligiblePollutantCodes = observationPollutantCodesForPrune(config, false);
-  const ingestBuckets = await fetchHourlyFingerprints(
+  const discoveredIngestBuckets = await fetchHourlyFingerprints(
     ingestClient,
     dayWindow.window_start,
     dayWindow.window_end,
     "ingest",
     deleteEligiblePollutantCodes,
   );
+  const claimed = claimConnectorDaysForParentRun(
+    discoveredIngestBuckets,
+    processedConnectorDays instanceof Set ? processedConnectorDays : new Set(),
+  );
+  const ingestBuckets = claimed.claimedBuckets;
   const batchSummaryMeta = batchCount > 1
     ? {
       parent_run_id: runId,
@@ -2137,14 +2366,24 @@ async function runLateArrivalDirectDeleteDay(config, ingestClient, dayWindow, ru
       window_start: dayWindow.window_start,
       window_end: dayWindow.window_end,
       ingest_bucket_count: 0,
+      duplicate_connector_day_skipped_count: claimed.duplicateConnectorDays.length,
+      duplicate_connector_day_skipped_preview: sampleRows(claimed.duplicateConnectorDays),
       delete_filter_mode: deleteEligiblePollutantCodes ? "pollutant_allow_list" : "all_observations",
       delete_eligible_pollutant_codes: deleteEligiblePollutantCodes,
       deleted_bucket_count: 0,
       total_deleted_rows: "0",
       delete_error_count: 0,
       alert_condition_count: 0,
+      connector_day_atomic_delete_planned_count: 0,
+      connector_day_atomic_delete_committed_count: 0,
+      connector_day_atomic_delete_rolled_back_count: 0,
+      connector_day_atomic_delete_blocked_bucket_count: 0,
+      connector_day_atomic_delete_plan_preview: [],
+      connector_day_atomic_delete_result_preview: [],
       skipped: true,
-      reason: "no_ingest_buckets_detected",
+      reason: discoveredIngestBuckets.length === 0
+        ? "no_ingest_buckets_detected"
+        : "connector_days_already_processed_in_parent_run",
       deleted_buckets_preview: [],
       delete_errors_preview: [],
     };
@@ -2157,59 +2396,45 @@ async function runLateArrivalDirectDeleteDay(config, ingestClient, dayWindow, ru
     day_utc: dayWindow.day_utc,
     mode: config.dryRun ? "dry-run" : "delete",
     ingest_bucket_count: ingestBuckets.length,
+    duplicate_connector_day_skipped_count: claimed.duplicateConnectorDays.length,
+    duplicate_connector_day_skipped_preview: sampleRows(claimed.duplicateConnectorDays),
     delete_filter_mode: deleteEligiblePollutantCodes ? "pollutant_allow_list" : "all_observations",
     delete_eligible_pollutant_codes: deleteEligiblePollutantCodes,
     window_start: dayWindow.window_start,
     window_end: dayWindow.window_end,
     ingest_bucket_preview: sampleRows(ingestBuckets.map(toBucketOutput)),
   });
-
-  const deletedBucketResults = [];
-  const deleteErrors = [];
-  let totalDeletedRows = 0n;
-
-  if (!config.dryRun) {
-    for (const bucket of ingestBuckets) {
-      try {
-        const result = await deleteHourBucket(
-          ingestClient,
-          bucket,
-          config.deleteBatchSize,
-          config.maxDeleteBatchesPerHour,
-          deleteEligiblePollutantCodes,
-        );
-        totalDeletedRows += result.deleted_rows;
-
-        const bucketResult = {
-          connector_id: result.connector_id,
-          hour_start: result.hour_start,
-          deleted_rows: result.deleted_rows.toString(),
-          batches_run: result.batches_run,
-          drained: result.drained,
-        };
-        deletedBucketResults.push(bucketResult);
-        logStructured("INFO", "hour_bucket_late_arrival_direct_delete_result", {
-          run_id: runId,
-          day_utc: dayWindow.day_utc,
-          ...bucketResult,
-        });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        const errorPayload = {
-          connector_id: bucket.connector_id,
-          hour_start: bucket.hour_start,
-          reason: "direct_delete_error",
-          message,
-        };
-        deleteErrors.push(errorPayload);
-        logStructured("ERROR", "hour_bucket_late_arrival_direct_delete_error", {
-          run_id: runId,
-          day_utc: dayWindow.day_utc,
-          ...errorPayload,
-        });
-      }
-    }
-  }
+  const directDeleteGate = await applyConnectorHistoryGateFilter(
+    config,
+    runId,
+    ingestBuckets,
+    "late_arrival_direct_delete",
+  );
+  const atomicDeletionPlan = buildAtomicConnectorDayDeletionPlan({
+    currentBuckets: ingestBuckets,
+    eligibleBuckets: directDeleteGate.allowedBuckets,
+    gateBlockedBuckets: directDeleteGate.blockedBuckets,
+    pollutantCodes: deleteEligiblePollutantCodes,
+  });
+  const directDeletion = !config.dryRun
+    ? await deleteBucketsWithConnectorSourceIdentity(
+      config,
+      runId,
+      atomicDeletionPlan.plannedBuckets,
+      deleteEligiblePollutantCodes,
+      "late_arrival_final_connector_day_atomic_delete",
+    )
+    : {
+      bucketResults: [],
+      errors: [],
+      blockedBuckets: [],
+      totalDeletedRows: 0n,
+      sourceIdentityInvalidatedConnectorDays: 0,
+      transactionResults: [],
+    };
+  const deletedBucketResults = directDeletion.bucketResults;
+  const deleteErrors = directDeletion.errors;
+  const totalDeletedRows = directDeletion.totalDeletedRows;
 
   const summary = {
     run_id: randomUUID(),
@@ -2220,22 +2445,55 @@ async function runLateArrivalDirectDeleteDay(config, ingestClient, dayWindow, ru
     window_start: dayWindow.window_start,
     window_end: dayWindow.window_end,
     ingest_bucket_count: ingestBuckets.length,
+    duplicate_connector_day_skipped_count: claimed.duplicateConnectorDays.length,
+    duplicate_connector_day_skipped_preview: sampleRows(claimed.duplicateConnectorDays),
     delete_filter_mode: deleteEligiblePollutantCodes ? "pollutant_allow_list" : "all_observations",
     delete_eligible_pollutant_codes: deleteEligiblePollutantCodes,
     deleted_bucket_count: deletedBucketResults.length,
     total_deleted_rows: totalDeletedRows.toString(),
     delete_error_count: deleteErrors.length,
-    alert_condition_count: deleteErrors.length,
+    connector_history_gate_blocked_bucket_count: directDeleteGate.blockedBuckets.length,
+    source_identity_blocked_bucket_count:
+      atomicDeletionPlan.blockedBuckets.length + directDeletion.blockedBuckets.length,
+    source_identity_invalidated_connector_days:
+      directDeletion.sourceIdentityInvalidatedConnectorDays,
+    connector_day_atomic_delete_planned_count: atomicDeletionPlan.connectorDays.filter(
+      (row) => row.connector_day_atomic_delete_planned,
+    ).length,
+    connector_day_atomic_delete_committed_count: directDeletion.transactionResults.filter(
+      (row) => row.diagnostics.connector_day_atomic_delete_committed,
+    ).length,
+    connector_day_atomic_delete_rolled_back_count: directDeletion.transactionResults.filter(
+      (row) => row.diagnostics.connector_day_atomic_delete_rolled_back,
+    ).length,
+    connector_day_atomic_delete_blocked_bucket_count: atomicDeletionPlan.blockedBuckets.length,
+    alert_condition_count:
+      deleteErrors.length
+      + atomicDeletionPlan.blockedBuckets.length
+      + directDeletion.blockedBuckets.length,
     skipped: false,
     reason: "older_than_obs_aqidb_retention_cutoff",
     deleted_buckets_preview: sampleRows(deletedBucketResults),
     delete_errors_preview: sampleRows(deleteErrors),
+    connector_history_gate_blocked_buckets_preview: sampleRows(directDeleteGate.blockedBuckets),
+    source_identity_blocked_buckets_preview: sampleRows([
+      ...atomicDeletionPlan.blockedBuckets,
+      ...directDeletion.blockedBuckets,
+    ]),
+    connector_day_atomic_delete_plan_preview: sampleRows(atomicDeletionPlan.connectorDays),
+    connector_day_atomic_delete_result_preview: sampleRows(
+      directDeletion.transactionResults.map((row) => ({
+        day_utc: row.day_utc,
+        connector_id: row.connector_id,
+        ...row.diagnostics,
+      })),
+    ),
   };
   logStructured("INFO", "ingestdb_late_arrival_direct_delete_summary", summary);
   return summary;
 }
 
-async function runLateArrivalCleanup(config, overallWindow) {
+async function runLateArrivalCleanup(config, overallWindow, runContext = {}) {
   const runId = randomUUID();
   const ingestClient = createClient(config.supabaseUrl, config.ingestSecretKey, {
     auth: { persistSession: false, autoRefreshToken: false },
@@ -2279,11 +2537,19 @@ async function runLateArrivalCleanup(config, overallWindow) {
       processed_day_count: 0,
       delete_error_count: 0,
       mismatch_after_repair_count: 0,
-      history_gate_blocked_bucket_count: 0,
-      history_gate_blocked_after_repair_bucket_count: 0,
+      connector_history_gate_blocked_bucket_count: 0,
+      connector_history_gate_blocked_after_repair_bucket_count: 0,
       total_deleted_rows: "0",
       total_deleted_after_repair_rows: "0",
       alert_condition_count: 0,
+      duplicate_connector_day_skipped_count: 0,
+      duplicate_connector_day_skipped_preview: [],
+      connector_day_atomic_delete_planned_count: 0,
+      connector_day_atomic_delete_committed_count: 0,
+      connector_day_atomic_delete_rolled_back_count: 0,
+      connector_day_atomic_delete_blocked_bucket_count: 0,
+      connector_day_atomic_delete_plan_preview: [],
+      connector_day_atomic_delete_result_preview: [],
       batch_summaries_preview: [],
     };
   }
@@ -2303,6 +2569,9 @@ async function runLateArrivalCleanup(config, overallWindow) {
   });
 
   const batchSummaries = [];
+  const processedConnectorDays = runContext.processed_connector_days instanceof Set
+    ? runContext.processed_connector_days
+    : new Set();
   for (const dayWindow of directDeleteDayWindows) {
     try {
       const summary = await runLateArrivalDirectDeleteDay(
@@ -2312,6 +2581,7 @@ async function runLateArrivalCleanup(config, overallWindow) {
         runId,
         batchSummaries.length + 1,
         dayWindows.length,
+        processedConnectorDays,
       );
       batchSummaries.push(summary);
     } catch (error) {
@@ -2341,6 +2611,7 @@ async function runLateArrivalCleanup(config, overallWindow) {
         parent_run_id: runId,
         batch_index: batchSummaries.length + 1,
         batch_count: dayWindows.length,
+        processed_connector_days: processedConnectorDays,
       });
       batchSummaries.push(summary);
     } catch (error) {
@@ -2379,89 +2650,78 @@ async function runLateArrivalCleanup(config, overallWindow) {
       sumIntField(batchSummaries, "delete_error_count") +
       sumIntField(batchSummaries, "delete_after_repair_error_count"),
     mismatch_after_repair_count: sumIntField(batchSummaries, "mismatch_after_repair_count"),
-    history_gate_blocked_bucket_count:
-      sumIntField(batchSummaries, "history_gate_blocked_bucket_count") +
-      sumIntField(batchSummaries, "history_gate_blocked_after_repair_bucket_count"),
-    history_gate_blocked_after_repair_bucket_count: sumIntField(
+    connector_history_gate_blocked_bucket_count:
+      sumIntField(batchSummaries, "connector_history_gate_blocked_bucket_count") +
+      sumIntField(batchSummaries, "connector_history_gate_blocked_after_repair_bucket_count"),
+    connector_history_gate_blocked_after_repair_bucket_count: sumIntField(
       batchSummaries,
-      "history_gate_blocked_after_repair_bucket_count",
+      "connector_history_gate_blocked_after_repair_bucket_count",
     ),
     total_deleted_rows: sumBigIntField(batchSummaries, "total_deleted_rows").toString(),
     total_deleted_after_repair_rows: sumBigIntField(batchSummaries, "total_deleted_after_repair_rows").toString(),
     alert_condition_count: sumIntField(batchSummaries, "alert_condition_count"),
+    duplicate_connector_day_skipped_count: sumIntField(
+      batchSummaries,
+      "duplicate_connector_day_skipped_count",
+    ),
+    duplicate_connector_day_skipped_preview: mergePreviewField(
+      batchSummaries,
+      "duplicate_connector_day_skipped_preview",
+    ),
+    ...aggregateAtomicDeletionSummaryForTest(batchSummaries),
     batch_summaries_preview: sampleRows(batchSummaries),
   };
   logStructured("INFO", "ingestdb_late_arrival_cleanup_summary", summary);
   return summary;
 }
 
-async function runPrune(config) {
-  const phaseARecentSummary = await runPhaseARecent(config);
+async function runPrune(config, adapters = {}) {
+  const runPhaseARecentAdapter = adapters.runPhaseARecent || runPhaseARecent;
+  const runPhaseBBackupAdapter = adapters.runPhaseBBackup || runPhaseBBackup;
+  const runPruneSingleWindowAdapter = adapters.runPruneSingleWindow || runPruneSingleWindow;
+  const runLateArrivalCleanupAdapter = adapters.runLateArrivalCleanup || runLateArrivalCleanup;
+
+  const phaseARecentSummary = await runPhaseARecentAdapter(config);
 
   const phaseBRunId = randomUUID();
-  const phaseBHistorySummary = await runPhaseBBackup({
+  const phaseBHistorySummary = await runPhaseBBackupAdapter({
     dryRun: config.dryRun,
     phaseB: config.phaseB,
     ingestRetentionDays: config.ingestDbRetentionDays,
     logStructured,
     runId: phaseBRunId,
   });
-  let phaseBHistoryIndexSummary = {
-    enabled: false,
-    rebuilt: false,
-    reason: "phase_b_not_completed",
-  };
-  if (!config.dryRun && phaseBHistorySummary?.enabled) {
-    try {
-      const indexSummary = await rebuildR2HistoryIndexes({
-        env: process.env,
-        historyVersion: config.phaseB.history_write_version,
-      });
-      phaseBHistoryIndexSummary = {
-        enabled: true,
-        rebuilt: true,
-        ...indexSummary,
-      };
-      logStructured("INFO", "phase_b_history_index_rebuild_complete", {
-        run_id: phaseBRunId,
-        bucket: indexSummary.bucket,
-        history_version: indexSummary.history_version,
-        index_prefix: indexSummary.index_prefix,
-        results: indexSummary.results,
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      phaseBHistoryIndexSummary = {
-        enabled: true,
-        rebuilt: false,
-        error: message,
-      };
-      logStructured("WARNING", "phase_b_history_index_rebuild_failed", {
-        run_id: phaseBRunId,
-        error: message,
-      });
-    }
-  }
-
-  let chartLoadMetricsSummary = {
-    enabled: false,
-    skipped: true,
-    reason: "not_started",
-  };
-  try {
-    chartLoadMetricsSummary = await runChartLoadMetricsMaintenance(config);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    chartLoadMetricsSummary = {
-      enabled: true,
-      skipped: false,
-      error: message,
-    };
-    logStructured("WARNING", "chart_load_metrics_maintenance_failed", {
-      error: message,
+  if (phaseBHistorySummary?.enabled === true && phaseBHistorySummary?.status === "stopped_budget") {
+    const overallWindow = buildWindow(
+      config.maxHoursPerRun,
+      config.ingestDbRetentionDays,
+    );
+    const skipped = (extra = {}) => ({
+      enabled: false,
+      skipped: true,
+      reason: "phase_b_stopped_budget",
+      ...extra,
     });
+    const summary = {
+      mode: config.dryRun ? "dry-run" : "delete",
+      window_start: overallWindow.window_start,
+      window_end: overallWindow.window_end,
+      skipped: true,
+      reason: "phase_b_stopped_budget",
+      deletion_attempted: false,
+      normal_prune: skipped({ deletion_attempted: false }),
+      phase_a_recent: phaseARecentSummary,
+      phase_b_history: phaseBHistorySummary,
+      late_arrival: skipped(),
+    };
+    logStructured("WARNING", "ingestdb_prune_stopped_after_phase_b_budget", {
+      phase_b_history_run_id: phaseBHistorySummary.run_id || phaseBRunId,
+      phase_b_history_status: phaseBHistorySummary.status,
+      stopped_for_budget: phaseBHistorySummary.stopped_for_budget === true,
+      downstream_skip_reason: "phase_b_stopped_budget",
+    });
+    return summary;
   }
-
   const overallWindow = buildWindow(
     config.maxHoursPerRun,
     config.ingestDbRetentionDays,
@@ -2471,10 +2731,13 @@ async function runPrune(config) {
     overallWindow.window_end,
     DEFAULT_MAX_HOURS_PER_BATCH,
   );
+  const processedConnectorDays = new Set();
 
   let pruneWindowSummary;
   if (batches.length <= 1) {
-    pruneWindowSummary = await runPruneSingleWindow(config, batches[0] ?? overallWindow);
+    pruneWindowSummary = await runPruneSingleWindowAdapter(config, batches[0] ?? overallWindow, {
+      processed_connector_days: processedConnectorDays,
+    });
   } else {
     const parentRunId = randomUUID();
     logStructured("INFO", "ingestdb_prune_batch_plan", {
@@ -2493,10 +2756,11 @@ async function runPrune(config) {
 
     const batchSummaries = [];
     for (const batch of batches) {
-      const summary = await runPruneSingleWindow(config, batch, {
+      const summary = await runPruneSingleWindowAdapter(config, batch, {
         parent_run_id: parentRunId,
         batch_index: batch.batch_index,
         batch_count: batches.length,
+        processed_connector_days: processedConnectorDays,
       });
       batchSummaries.push(summary);
     }
@@ -2516,7 +2780,9 @@ async function runPrune(config) {
     reason: "not_started",
   };
   try {
-    lateArrivalSummary = await runLateArrivalCleanup(config, overallWindow);
+    lateArrivalSummary = await runLateArrivalCleanupAdapter(config, overallWindow, {
+      processed_connector_days: processedConnectorDays,
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     lateArrivalSummary = {
@@ -2531,10 +2797,23 @@ async function runPrune(config) {
 
   const combinedSummary = {
     ...pruneWindowSummary,
+    duplicate_connector_day_skipped_count:
+      toSafeInt(pruneWindowSummary.duplicate_connector_day_skipped_count)
+      + toSafeInt(lateArrivalSummary.duplicate_connector_day_skipped_count),
+    duplicate_connector_day_skipped_preview: sampleRows([
+      ...(Array.isArray(pruneWindowSummary.duplicate_connector_day_skipped_preview)
+        ? pruneWindowSummary.duplicate_connector_day_skipped_preview
+        : []),
+      ...(Array.isArray(lateArrivalSummary.duplicate_connector_day_skipped_preview)
+        ? lateArrivalSummary.duplicate_connector_day_skipped_preview
+        : []),
+    ]),
+    ...aggregateAtomicDeletionSummaryForTest([
+      pruneWindowSummary,
+      lateArrivalSummary,
+    ]),
     phase_a_recent: phaseARecentSummary,
     phase_b_history: phaseBHistorySummary,
-    phase_b_history_index: phaseBHistoryIndexSummary,
-    chart_load_metrics: chartLoadMetricsSummary,
     late_arrival: lateArrivalSummary,
   };
   if (batches.length > 1) {
@@ -2547,8 +2826,13 @@ async function runPrune(config) {
   return combinedSummary;
 }
 
-export async function executePruneDaily(config) {
-  return withDailyTaskRun(
+export async function runPruneForTest(config, adapters = {}) {
+  return runPrune(config, adapters);
+}
+
+export async function executePruneDaily(config, adapters = {}) {
+  const withDailyTaskRunAdapter = adapters.withDailyTaskRun || withDailyTaskRun;
+  return withDailyTaskRunAdapter(
     {
       task_key: "ops.prune_daily",
       source_repo: "uk-aq-ops",
@@ -2563,7 +2847,7 @@ export async function executePruneDaily(config) {
       },
       buildFinishedSummary: compactPruneHealthSummary,
     },
-    () => runPrune(config),
+    () => runPrune(config, adapters),
   );
 }
 

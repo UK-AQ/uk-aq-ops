@@ -2,12 +2,14 @@ import {
   classifyObservationRowsForV2PollutantPartitions,
   createAqiV2ConnectorManifest,
   createAqiV2PollutantManifest,
+  loadSosSiteRefBridgeSnapshot,
+  normaliseConcentrationUnitForComparison,
   parseOpenaqCsvObservations,
   parseUkAirFlatFileObservations,
   summarizeAqilevelsPartRows,
 } from "./run_job.ts";
 
-const propertyMapping = (sourceLabel: string, code: string, sourceUom = "ugm-3") => ({
+const propertyMapping = (sourceLabel: string, code: string, sourceUom = "ug/m3") => ({
   connector_id: 1,
   source_label: sourceLabel,
   source_uom: sourceUom,
@@ -24,6 +26,88 @@ function assertEquals(actual: unknown, expected: unknown): void {
     throw new Error(`assertEquals failed: actual=${actualJson} expected=${expectedJson}`);
   }
 }
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).sort().map((key) =>
+      `${JSON.stringify(key)}:${canonicalJson(record[key])}`
+    ).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+async function testSha256(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(value),
+  );
+  return Array.from(new Uint8Array(digest))
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+Deno.test("v2 SOS bridge snapshot preserves imported mapping identity", async () => {
+  const tempDir = await Deno.makeTempDir();
+  const path = `${tempDir}/sos-site-ref-bridge.json`;
+  const semantic = {
+    schema_version: 1,
+    connector_id: 1,
+    mapping_identity: "sos_station_timeseries_site_refs_snapshot",
+    bridge_artifact_sha256: "a".repeat(64),
+    bridge_artifact_row_count: 2,
+    selected_bridge_row_count: 1,
+    bridge_row_count: 2,
+    rows: [{
+      site_ref: "abd9",
+      uk_air_ref: null,
+      pollutant_code: "no2",
+      station_id: 81,
+      timeseries_id: 144,
+      station_ref: "8126",
+      timeseries_ref: "ts-144",
+      valid_from_day_utc: "2026-01-01",
+      valid_to_day_utc: null,
+    }],
+  };
+  const payload = {
+    ...semantic,
+    bridge_content_sha256: await testSha256(canonicalJson(semantic)),
+  };
+  await Deno.writeTextFile(path, JSON.stringify(payload));
+  Deno.env.set("UK_AQ_BACKFILL_SOS_SITE_REF_BRIDGE_FILE", path);
+  try {
+    const loaded = loadSosSiteRefBridgeSnapshot();
+    assertEquals(loaded?.mapping_identity, semantic.mapping_identity);
+    assertEquals(loaded?.mapping_hash, semantic.bridge_artifact_sha256);
+    assertEquals(loaded?.bridge_artifact_row_count, 2);
+    assertEquals(loaded?.selected_bridge_row_count, 1);
+    assertEquals(loaded?.rows[0].site_ref, "ABD9");
+    assertEquals(loaded?.rows[0].timeseries_id, 144);
+  } finally {
+    Deno.env.delete("UK_AQ_BACKFILL_SOS_SITE_REF_BRIDGE_FILE");
+    await Deno.remove(tempDir, { recursive: true });
+  }
+});
+
+Deno.test("UK-AIR concentration-unit aliases preserve scale and reject a different scale", () => {
+  assertEquals(
+    ["ug/m3", "ugm-3", "ug m-3", "µg/m3", "μg/m3", "µg/m³", "μg/m³"]
+      .map(normaliseConcentrationUnitForComparison),
+    ["ug/m3", "ug/m3", "ug/m3", "ug/m3", "ug/m3", "ug/m3", "ug/m3"],
+  );
+  assertEquals(
+    ["mg/m3", "mgm-3", "mg m-3", "mg/m³"]
+      .map(normaliseConcentrationUnitForComparison),
+    ["mg/m3", "mg/m3", "mg/m3", "mg/m3"],
+  );
+  assertEquals(
+    normaliseConcentrationUnitForComparison("mg/m3") ===
+      normaliseConcentrationUnitForComparison("ug/m3"),
+    false,
+  );
+});
 
 Deno.test("v2 classifier skips blank, null, and invalid pollutant_code rows", () => {
   const classified = classifyObservationRowsForV2PollutantPartitions([
@@ -61,6 +145,9 @@ Deno.test("OpenAQ CSV mapping populates pollutant_code from source parameter whe
     binding_by_timeseries_id: new Map(),
     binding_by_timeseries_ref: new Map(),
     binding_by_timeseries_ref_pollutant: new Map(),
+    ambiguous_station_pollutant_keys: new Set<string>(),
+    ambiguous_timeseries_ref_keys: new Set<string>(),
+    ambiguous_timeseries_ref_pollutant_keys: new Set<string>(),
   };
   const csvText = [
     "location_id,sensors_id,datetime,parameter,value",
@@ -80,40 +167,162 @@ Deno.test("OpenAQ CSV mapping populates pollutant_code from source parameter whe
   assertEquals(parsed.rows[0].source_parameter, "pm25");
 });
 
-Deno.test("UK-AIR CSV parses GMT hour-ending rows into UTC hour starts", () => {
-  const parsed = parseUkAirFlatFileObservations({
+Deno.test("UK-AIR CSV preserves ordinary UTC times and rolls 24:00 into the next partition", () => {
+  const mappings = [{
+    site_ref: "EA8",
+    uk_air_ref: "EA8",
+    pollutant_code: "pm10" as const,
+    station_id: 1,
+    timeseries_id: 66,
+    station_ref: "station-ea8",
+    timeseries_ref: "timeseries-old",
+    valid_from_day_utc: "2020-01-01",
+    valid_to_day_utc: "2026-05-17",
+  }, {
+    site_ref: "EA8",
+    uk_air_ref: "EA8",
+    pollutant_code: "pm10" as const,
+    station_id: 1,
+    timeseries_id: 95,
+    station_ref: "station-ea8",
+    timeseries_ref: "timeseries-new",
+    valid_from_day_utc: "2026-05-18",
+    valid_to_day_utc: null,
+  }];
+  const csvText = [
+    "Station metadata",
+    "All Data GMT hour ending ",
+    'Date,time,"PM<sub>10</sub> particulate matter (Hourly measured)",status,unit',
+    "17-05-2026,01:00,10,R,ugm-3",
+    "17-05-2026,24:00,11,P,ugm-3",
+    "18-05-2026,01:00,12,R,ugm-3",
+  ].join("\n");
+  const propertyMappings = [
+    propertyMapping("PM<sub>10</sub> particulate matter (Hourly measured)", "pm10"),
+  ];
+  const firstDay = parseUkAirFlatFileObservations({
     dayUtc: "2026-05-17",
     siteRef: "EA8",
-    csvText: [
-      "Station metadata",
-      "All Data GMT hour ending ",
-      'Date,time,"PM<sub>10</sub> particulate matter (Hourly measured)",status,unit',
-      "17-05-2026,01:00,10,R,ugm-3",
-      "17-05-2026,24:00,11,P,ugm-3",
-      "18-05-2026,01:00,12,R,ugm-3",
-    ].join("\n"),
-    mappings: [{
-      site_ref: "EA8",
-      uk_air_ref: "EA8",
-      pollutant_code: "pm10",
-      station_id: 1,
-      timeseries_id: 66,
-      station_ref: "station-ea8",
-      timeseries_ref: "timeseries-old",
-      valid_from_day_utc: "2020-01-01",
-      valid_to_day_utc: "2026-05-17",
-    }],
-    propertyMappings: [propertyMapping("PM<sub>10</sub> particulate matter (Hourly measured)", "pm10")],
+    csvText,
+    mappings,
+    propertyMappings,
+  });
+  const secondDay = parseUkAirFlatFileObservations({
+    dayUtc: "2026-05-18",
+    siteRef: "EA8",
+    csvText,
+    mappings,
+    propertyMappings,
   });
 
-  assertEquals(parsed.rows.map((row) => row.observed_at), [
-    "2026-05-17T00:00:00.000Z",
-    "2026-05-17T23:00:00.000Z",
+  assertEquals(firstDay.rows.map((row) => row.observed_at), [
+    "2026-05-17T01:00:00.000Z",
   ]);
-  assertEquals(parsed.rows.map((row) => row.value), [10, 11]);
-  assertEquals(parsed.rows.map((row) => row.status), ["R", "P"]);
-  assertEquals(parsed.rows.map((row) => row.timeseries_id), [66, 66]);
-  assertEquals(parsed.units, ["ugm-3"]);
+  assertEquals(firstDay.rows.map((row) => row.value), [10]);
+  assertEquals(firstDay.rows.map((row) => row.status), ["R"]);
+  assertEquals(firstDay.rows.map((row) => row.timeseries_id), [66]);
+  assertEquals(secondDay.rows.map((row) => row.observed_at), [
+    "2026-05-18T00:00:00.000Z",
+    "2026-05-18T01:00:00.000Z",
+  ]);
+  assertEquals(secondDay.rows.map((row) => row.value), [11, 12]);
+  assertEquals(secondDay.rows.map((row) => row.status), ["P", "R"]);
+  assertEquals(secondDay.rows.map((row) => row.timeseries_id), [95, 95]);
+  assertEquals(secondDay.units, ["ugm-3"]);
+});
+
+Deno.test("UK-AIR CSV time-basis declaration accepts notes and warns without blocking", () => {
+  const sourceLabel = "PM<sub>10</sub> particulate matter (Hourly measured)";
+  const baseArgs = {
+    dayUtc: "2026-05-17",
+    siteRef: "HORS",
+    sourceFile: "HORS_2025.csv",
+    mappings: [{
+      site_ref: "HORS", uk_air_ref: "HORS", pollutant_code: "pm10" as const,
+      station_id: 1, timeseries_id: 66, station_ref: "station-hors",
+      timeseries_ref: "timeseries-hors", valid_from_day_utc: null,
+      valid_to_day_utc: null,
+    }],
+    propertyMappings: [propertyMapping(sourceLabel, "pm10")],
+  };
+  const csv = (declaration: string) => [
+    declaration,
+    `Date,time,"${sourceLabel}",status,unit`,
+    "17-05-2026,01:00,10,R,ugm-3",
+  ].join("\n");
+
+  assertEquals(
+    parseUkAirFlatFileObservations({ ...baseArgs, csvText: csv("All Data GMT hour ending") }).rows.length,
+    1,
+  );
+  assertEquals(
+    parseUkAirFlatFileObservations({
+      ...baseArgs,
+      csvText: csv(
+        "All Data GMT hour ending  NB: Upto 21/07/2025 PM10 were measured with a BAM 1020 heated",
+      ),
+    }).rows.length,
+    1,
+  );
+
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (...values: unknown[]) => warnings.push(values.map(String).join(" "));
+  try {
+    assertEquals(
+      parseUkAirFlatFileObservations({
+        ...baseArgs,
+        csvText: csv("Station metadata without the time-basis declaration"),
+      }).rows.length,
+      1,
+    );
+  } finally {
+    console.warn = originalWarn;
+  }
+  assertEquals(warnings.length, 1);
+  const warning = JSON.parse(warnings[0]);
+  assertEquals(warning.event, "sos_uk_air_csv_time_basis_warning");
+  assertEquals(warning.site_ref, "HORS");
+  assertEquals(warning.source_file, "HORS_2025.csv");
+  assertEquals(warning.expected_phrase, "All Data GMT hour ending");
+});
+
+Deno.test("UK-AIR CSV excludes blank and non-numeric values but retains finite negatives", () => {
+  const sourceLabel = "Nitrogen dioxide";
+  const parsed = parseUkAirFlatFileObservations({
+    dayUtc: "2026-07-15",
+    siteRef: "NCA3",
+    csvText: [
+      "All Data GMT hour ending",
+      `Date,time,"${sourceLabel}",status,unit`,
+      "14-07-2026,24:00,,,",
+      "15-07-2026,01:00,not-a-number,P,ugm-3",
+      "15-07-2026,02:00,-1.25,P,ugm-3",
+    ].join("\n"),
+    mappings: [{
+      site_ref: "NCA3",
+      uk_air_ref: "UKA00528",
+      pollutant_code: "no2",
+      station_id: 1768,
+      timeseries_id: 529,
+      station_ref: "1038",
+      timeseries_ref: "363",
+      valid_from_day_utc: null,
+      valid_to_day_utc: null,
+    }],
+    propertyMappings: [propertyMapping(sourceLabel, "no2")],
+  });
+
+  assertEquals(parsed.rows.map((row) => ({
+    observed_at: row.observed_at,
+    value: row.value,
+    status: row.status,
+  })), [{
+    observed_at: "2026-07-15T02:00:00.000Z",
+    value: -1.25,
+    status: "P",
+  }]);
+  assertEquals(parsed.mapped_records, 1);
 });
 
 Deno.test("UK-AIR CSV mapping switches timeseries at the EA8 validity boundary", () => {
@@ -171,6 +380,149 @@ Deno.test("UK-AIR CSV repair fails closed for ambiguous mappings", () => {
     message = error instanceof Error ? error.message : String(error);
   }
   if (!message.includes("matches=2")) throw new Error(`Expected ambiguous mapping failure, got: ${message}`);
+});
+
+Deno.test("UK-AIR CSV skips selected rows when no authoritative timeseries binding exists", () => {
+  const sourceLabel = "PM<sub>10</sub> particulate matter (Hourly measured)";
+  const normalisedSourceLabel = sourceLabel.toLowerCase();
+  const parsed = parseUkAirFlatFileObservations({
+    dayUtc: "2026-07-18",
+    siteRef: "HG4",
+    csvText: [
+      "Station metadata",
+      "All Data GMT hour ending",
+      `Date,time,"${sourceLabel}",status,unit`,
+      "18-07-2026,01:00,10,R,ugm-3",
+      "18-07-2026,02:00,11,R,ugm-3",
+      "19-07-2026,01:00,12,R,ugm-3",
+    ].join("\n"),
+    mappings: [],
+    propertyMappings: [propertyMapping(sourceLabel, "pm10")],
+    registryEntries: new Map([[normalisedSourceLabel, {
+      normalised_source_label: normalisedSourceLabel,
+      status: "mapped",
+      pollutant_code: "pm10",
+      expected_uom: "ug/m3",
+      raw_label_variants: [sourceLabel],
+      observed_units: ["ugm-3"],
+      reviewed_at_utc: "2026-07-18T00:00:00Z",
+      review_notes: null,
+    }]]),
+  });
+
+  assertEquals(parsed.rows, []);
+  assertEquals(parsed.mapped_records, 0);
+  assertEquals(parsed.selected_source_records_examined, 2);
+  assertEquals(parsed.missing_binding_groups, 1);
+  assertEquals(parsed.missing_binding_rows, 2);
+  assertEquals(parsed.source_label_classifications, [{
+    source_label: sourceLabel,
+    normalised_source_label: normalisedSourceLabel,
+    classification: "no_authoritative_timeseries_binding",
+    reason: "no_authoritative_timeseries_binding",
+    site_ref: "HG4",
+    pollutant_code: "pm10",
+    observed_units: ["ugm-3"],
+    target_day_non_null_row_count: 2,
+    target_day_blank_unit_row_count: 0,
+    header_section_index: 1,
+    section_normalised_units: ["ug/m3"],
+    expected_unit: "ug/m3",
+    expected_normalised_unit: "ug/m3",
+    possible_supported_pollutant_label: false,
+  }]);
+});
+
+Deno.test("UK-AIR selected source count includes mapped and missing-binding rows", () => {
+  const pm10Label = "PM<sub>10</sub> particulate matter (Hourly measured)";
+  const no2Label = "Nitrogen dioxide (Hourly measured)";
+  const registryEntries = new Map([
+    [pm10Label.toLowerCase(), {
+      normalised_source_label: pm10Label.toLowerCase(),
+      status: "mapped" as const,
+      pollutant_code: "pm10",
+      expected_uom: "ug/m3",
+      raw_label_variants: [pm10Label],
+      observed_units: ["ugm-3"],
+      reviewed_at_utc: "2026-07-18T00:00:00Z",
+      review_notes: null,
+    }],
+    [no2Label.toLowerCase(), {
+      normalised_source_label: no2Label.toLowerCase(),
+      status: "mapped" as const,
+      pollutant_code: "no2",
+      expected_uom: "ug/m3",
+      raw_label_variants: [no2Label],
+      observed_units: ["ugm-3"],
+      reviewed_at_utc: "2026-07-18T00:00:00Z",
+      review_notes: null,
+    }],
+  ]);
+  const parsed = parseUkAirFlatFileObservations({
+    dayUtc: "2026-07-18",
+    siteRef: "HG4",
+    csvText: [
+      "All Data GMT hour ending",
+      `Date,time,"${pm10Label}",status,unit,"${no2Label}",status,unit`,
+      "18-07-2026,01:00,10,R,ugm-3,20,R,ugm-3",
+      "18-07-2026,02:00,11,R,ugm-3,21,R,ugm-3",
+    ].join("\n"),
+    mappings: [{
+      site_ref: "HG4",
+      uk_air_ref: "HG4",
+      pollutant_code: "no2",
+      station_id: 10,
+      timeseries_id: 20,
+      station_ref: "station-hg4",
+      timeseries_ref: "timeseries-hg4-no2",
+      valid_from_day_utc: "2020-01-01",
+      valid_to_day_utc: null,
+    }],
+    propertyMappings: [
+      propertyMapping(pm10Label, "pm10"),
+      propertyMapping(no2Label, "no2"),
+    ],
+    registryEntries,
+  });
+
+  assertEquals(parsed.mapped_records, 2);
+  assertEquals(parsed.missing_binding_rows, 2);
+  assertEquals(parsed.selected_source_records_examined, 4);
+  assertEquals(parsed.rows.length, 2);
+});
+
+Deno.test("UK-AIR CSV registry and core mapping contradiction remains fail closed", () => {
+  const sourceLabel = "PM<sub>10</sub> particulate matter (Hourly measured)";
+  const normalisedSourceLabel = sourceLabel.toLowerCase();
+  let message = "";
+  try {
+    parseUkAirFlatFileObservations({
+      dayUtc: "2026-07-18",
+      siteRef: "HG4",
+      csvText: [
+        "All Data GMT hour ending",
+        `Date,time,"${sourceLabel}",status,unit`,
+        "18-07-2026,01:00,10,R,ugm-3",
+      ].join("\n"),
+      mappings: [],
+      propertyMappings: [propertyMapping(sourceLabel, "no2")],
+      registryEntries: new Map([[normalisedSourceLabel, {
+        normalised_source_label: normalisedSourceLabel,
+        status: "mapped",
+        pollutant_code: "pm10",
+        expected_uom: "ug/m3",
+        raw_label_variants: [sourceLabel],
+        observed_units: ["ugm-3"],
+        reviewed_at_utc: "2026-07-18T00:00:00Z",
+        review_notes: null,
+      }]]),
+    });
+  } catch (error) {
+    message = error instanceof Error ? error.message : String(error);
+  }
+  if (!message.includes("sos_source_label_registry_mapping_mismatch")) {
+    throw new Error(`Expected registry/core mapping contradiction, got: ${message}`);
+  }
 });
 
 Deno.test("UK-AIR CSV parses every mapped pollutant triplet", () => {

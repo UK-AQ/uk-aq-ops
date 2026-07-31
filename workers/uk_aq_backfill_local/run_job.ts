@@ -40,6 +40,10 @@ import {
   utcDayEndIso,
   utcDayStartIso,
 } from "./backfill_core.mjs";
+import {
+  parseUkAirObservedAtUtc,
+  requiredUkAirAnnualSourceYears,
+} from "./uk_air_timestamp.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import zlib from "node:zlib";
@@ -63,6 +67,52 @@ import {
   r2PutObject,
   sha256Hex,
 } from "../shared/r2_sigv4.mjs";
+import {
+  computeObservationContentHash,
+  normalizeCanonicalObservationRow,
+  normalizeUkAirVerificationStatus,
+  resolveLegacyVerificationStatus,
+} from "../shared/uk_aq_observation_content_hash.mjs";
+import {
+  reconcileIntegritySourceAdapterBlockedRows,
+} from "./source_integrity/blocked_rows.ts";
+import {
+  buildHistoryV2DayManifest as buildCanonicalHistoryV2DayManifest,
+  serializeCanonicalAqilevelDataV2Parquet,
+  serializeCanonicalAqilevelDebugV2Parquet,
+  serializeCanonicalObservationV2Parquet,
+  validateCanonicalHistoryV2Manifest,
+} from "../shared/uk_aq_r2_history_canonical.mjs";
+import {
+  buildHistoryV2ConnectorManifestKey,
+  buildHistoryV2ConnectorPrefix,
+  buildHistoryV2DayManifestKey,
+  buildHistoryV2PartKey,
+  buildHistoryV2PollutantManifestKey,
+  buildHistoryV2PollutantPrefix,
+  normalizePollutantCodeForR2Path,
+} from "./r2/history_paths.ts";
+import {
+  canonicalSemanticJson as canonicalRegistryJson,
+  deterministicSemanticHash,
+} from "./integrity/source_evidence.ts";
+import {
+  createObservationV2ConnectorManifest,
+  createObservationV2PollutantManifest,
+} from "./observations/manifests.ts";
+import {
+  createAqiV2ConnectorManifest,
+  createAqiV2PollutantManifest,
+} from "./aqilevels/manifests.ts";
+import {
+  resolveSourceAdapterRegistry,
+  type SourceAdapterKind,
+} from "./source_adapters/registry.ts";
+export { normalizePollutantCodeForR2Path } from "./r2/history_paths.ts";
+export {
+  createAqiV2ConnectorManifest,
+  createAqiV2PollutantManifest,
+} from "./aqilevels/manifests.ts";
 type RunMode =
   | "local_to_aqilevels"
   | "obs_aqi_to_r2"
@@ -151,12 +201,6 @@ type SourceConnectorLookup = {
   ambiguous_timeseries_ref_keys: Set<string>;
   ambiguous_timeseries_ref_pollutant_keys: Set<string>;
 };
-
-type SourceAdapterKind =
-  | "breathelondon"
-  | "sensorcommunity"
-  | "openaq"
-  | "sos";
 
 type StationRefsLookup = {
   station_refs: Set<string>;
@@ -254,6 +298,7 @@ type ObsHistoryRow = {
   observed_at: string;
   value: number | null;
   status?: string | null;
+  verification_status?: "P" | "R" | null;
 };
 
 type ObsHistoryParquetRow = {
@@ -264,9 +309,14 @@ type ObsHistoryParquetRow = {
   status: string | null;
 };
 
-type ObsHistoryV2ParquetRow = ObsHistoryParquetRow & {
+type ObsHistoryV2ParquetRow = {
+  connector_id: number;
   station_id: number | null;
+  timeseries_id: number;
   pollutant_code: string;
+  observed_at: string;
+  value: number;
+  verification_status: "P" | "R" | null;
 };
 
 type AqilevelsHistoryRow = {
@@ -377,6 +427,42 @@ type ObsConnectorManifest = {
   file_count: number;
   total_bytes: number;
   files: ObsHistoryFileEntry[];
+};
+
+export type FirstValueAtCandidate = {
+  timeseries_id: number;
+  first_observed_at: string;
+};
+
+type FirstValueAtDatabaseReconciliationSummary = {
+  attempted: boolean;
+  submitted_count: number;
+  rpc_call_count: number;
+  matched_count: number;
+  would_update_count: number;
+  updated_count: number;
+  unchanged_count: number;
+  status:
+    | "complete"
+    | "dry_run"
+    | "skipped_empty"
+    | "blocked_dependency"
+    | "failed";
+  error: string | null;
+};
+
+type FirstValueAtReconciliationSummary = {
+  attempted: boolean;
+  dry_run: boolean;
+  connector_id: number;
+  candidate_timeseries_count: number;
+  payload_chunk_count: number;
+  earliest_supplied_at: string | null;
+  latest_supplied_at: string | null;
+  status: "complete" | "dry_run" | "skipped_empty" | "failed";
+  error: string | null;
+  ingestdb: FirstValueAtDatabaseReconciliationSummary;
+  obs_aqidb: FirstValueAtDatabaseReconciliationSummary;
 };
 
 type AqilevelsConnectorManifest = {
@@ -580,6 +666,28 @@ type SourceToAllSummary = {
   local_to_aqilevels_days: string[];
   source_acquisition_pending_days: string[];
   local_to_aqilevels_summary: LocalToAqilevelsSummary | null;
+  first_value_at_reconciliation: {
+    connector_day_count: number;
+    failed_connector_day_count: number;
+    candidate_timeseries_count: number;
+    payload_chunk_count: number;
+    ingestdb: {
+      submitted_count: number;
+      rpc_call_count: number;
+      matched_count: number;
+      would_update_count: number;
+      updated_count: number;
+      unchanged_count: number;
+    };
+    obs_aqidb: {
+      submitted_count: number;
+      rpc_call_count: number;
+      matched_count: number;
+      would_update_count: number;
+      updated_count: number;
+      unchanged_count: number;
+    };
+  };
   warnings: string[];
 };
 
@@ -642,6 +750,9 @@ const AQI_R2_SOURCE_RPC = (Deno.env.get("UK_AQ_BACKFILL_AQI_R2_SOURCE_RPC") ||
 const AQI_R2_CONNECTOR_COUNTS_RPC =
   (Deno.env.get("UK_AQ_BACKFILL_AQI_R2_CONNECTOR_COUNTS_RPC") ||
     "uk_aq_rpc_aqilevels_history_day_connector_counts").trim();
+const FIRST_VALUE_AT_RECONCILE_RPC =
+  (Deno.env.get("UK_AQ_BACKFILL_FIRST_VALUE_AT_RECONCILE_RPC") ||
+    "uk_aq_rpc_timeseries_first_value_at_reconcile").trim();
 
 const HISTORY_OBSERVATIONS_SCHEMA_NAME = "observations";
 const HISTORY_OBSERVATIONS_SCHEMA_VERSION = 2;
@@ -660,7 +771,7 @@ const HISTORY_OBSERVATIONS_COLUMNS_R2_V2 = Object.freeze([
   "pollutant_code",
   "observed_at_utc",
   "value",
-  "status",
+  "verification_status",
 ]);
 const HISTORY_AQILEVELS_SCHEMA_NAME = "aqilevels_hourly";
 const HISTORY_AQILEVELS_SCHEMA_VERSION = 1;
@@ -744,7 +855,9 @@ const HISTORY_R2_V2_OBSERVATIONS_PREFIX = "history/v2/observations";
 const HISTORY_R2_V2_AQILEVELS_HOURLY_DATA_PREFIX = "history/v2/aqilevels/hourly/data";
 const HISTORY_R2_V2_AQILEVELS_HOURLY_DEBUG_PREFIX = "history/v2/aqilevels/hourly/debug";
 const HISTORY_R2_V2_SCHEMA_VERSION = 2;
+const HISTORY_R2_V2_OBSERVATIONS_SCHEMA_VERSION = 3;
 const HISTORY_R2_V2_WRITER_VERSION = "parquet-wasm-zstd-v2";
+const HISTORY_R2_V2_OBSERVATIONS_WRITER_VERSION = "parquet-wasm-zstd-v3";
 
 const CANONICAL_R2_HISTORY_VERSION_ENV = "UK_AQ_R2_HISTORY_VERSION";
 const DEPRECATED_R2_HISTORY_VERSION_ENVS = [
@@ -884,6 +997,12 @@ const SOURCE_RPC_TIMESERIES_FILTER_CHUNK_SIZE = parsePositiveInt(
   500,
   25,
   5000,
+);
+const FIRST_VALUE_AT_RECONCILE_CHUNK_SIZE = parsePositiveInt(
+  Deno.env.get("UK_AQ_BACKFILL_FIRST_VALUE_AT_RECONCILE_CHUNK_SIZE"),
+  1000,
+  1,
+  2000,
 );
 const OBS_R2_SOURCE_PAGE_SIZE = parsePositiveInt(
   Deno.env.get("UK_AQ_BACKFILL_OBS_R2_PAGE_SIZE"),
@@ -1480,6 +1599,218 @@ async function postgrestRpc<T>(
   return { data: null, error: { message: "unknown_rpc_error" }, status: 0 };
 }
 
+export function deriveFirstValueAtCandidates(
+  rows: Pick<ObsHistoryRow, "timeseries_id" | "observed_at">[],
+): FirstValueAtCandidate[] {
+  const earliestByTimeseries = new Map<number, string>();
+  for (const row of rows) {
+    const timeseriesId = Number(row.timeseries_id);
+    const observedAtMs = Date.parse(String(row.observed_at || ""));
+    if (
+      !Number.isSafeInteger(timeseriesId) ||
+      timeseriesId <= 0 ||
+      !Number.isFinite(observedAtMs)
+    ) {
+      throw new Error(
+        "canonical observation row has invalid first_value_at identity",
+      );
+    }
+    const observedAt = new Date(observedAtMs).toISOString();
+    const current = earliestByTimeseries.get(timeseriesId);
+    if (!current || observedAt < current) {
+      earliestByTimeseries.set(timeseriesId, observedAt);
+    }
+  }
+  return Array.from(
+    earliestByTimeseries,
+    ([timeseries_id, first_observed_at]) => ({
+      timeseries_id,
+      first_observed_at,
+    }),
+  ).sort((left, right) => left.timeseries_id - right.timeseries_id);
+}
+
+export function chunkFirstValueAtCandidates(
+  candidates: FirstValueAtCandidate[],
+  chunkSize = FIRST_VALUE_AT_RECONCILE_CHUNK_SIZE,
+): FirstValueAtCandidate[][] {
+  if (!Number.isSafeInteger(chunkSize) || chunkSize <= 0 || chunkSize > 2000) {
+    throw new Error(
+      "first_value_at reconciliation chunk size must be between 1 and 2000",
+    );
+  }
+  const sorted = [...candidates].sort((left, right) =>
+    left.timeseries_id - right.timeseries_id
+  );
+  const chunks: FirstValueAtCandidate[][] = [];
+  for (let index = 0; index < sorted.length; index += chunkSize) {
+    chunks.push(sorted.slice(index, index + chunkSize));
+  }
+  return chunks;
+}
+
+async function reconcileTimeseriesFirstValueAt(args: {
+  connector_id: number;
+  rows: Pick<ObsHistoryRow, "timeseries_id" | "observed_at">[];
+  dry_run: boolean;
+  day_utc: string;
+  r2_verification: "newly_written_verified" | "unchanged_verified" | "dry_run";
+}): Promise<FirstValueAtReconciliationSummary> {
+  const candidates = deriveFirstValueAtCandidates(args.rows);
+  const chunks = chunkFirstValueAtCandidates(
+    candidates,
+    FIRST_VALUE_AT_RECONCILE_CHUNK_SIZE,
+  );
+  const timestamps = candidates.map((row) => row.first_observed_at).sort();
+  const emptyDatabaseSummary = (
+    status: FirstValueAtDatabaseReconciliationSummary["status"],
+  ): FirstValueAtDatabaseReconciliationSummary => ({
+    attempted: false,
+    submitted_count: 0,
+    rpc_call_count: 0,
+    matched_count: 0,
+    would_update_count: 0,
+    updated_count: 0,
+    unchanged_count: 0,
+    status,
+    error: null,
+  });
+  const summary: FirstValueAtReconciliationSummary = {
+    attempted: candidates.length > 0,
+    dry_run: args.dry_run,
+    connector_id: args.connector_id,
+    candidate_timeseries_count: candidates.length,
+    payload_chunk_count: chunks.length,
+    earliest_supplied_at: timestamps[0] ?? null,
+    latest_supplied_at: timestamps[timestamps.length - 1] ?? null,
+    status: candidates.length === 0
+      ? "skipped_empty"
+      : args.dry_run
+      ? "dry_run"
+      : "complete",
+    error: null,
+    ingestdb: emptyDatabaseSummary(
+      candidates.length === 0 ? "skipped_empty" : "blocked_dependency",
+    ),
+    obs_aqidb: emptyDatabaseSummary(
+      candidates.length === 0 ? "skipped_empty" : "blocked_dependency",
+    ),
+  };
+  if (!candidates.length) {
+    logStructured("info", "source_to_r2_first_value_at_reconciliation", {
+      day_utc: args.day_utc,
+      r2_verification: args.r2_verification,
+      ...summary,
+    });
+    return summary;
+  }
+
+  const reconcileDatabase = async (
+    databaseKind: "ingestdb" | "obs_aqidb",
+  ): Promise<void> => {
+    const databaseSummary = summary[databaseKind];
+    databaseSummary.attempted = true;
+    databaseSummary.status = args.dry_run ? "dry_run" : "complete";
+    const source = SOURCE_DB_BY_KIND[databaseKind];
+    if (!source) {
+      throw new Error(
+        databaseKind === "ingestdb"
+          ? "first_value_at reconciliation requires SUPABASE_URL + SB_SECRET_KEY"
+          : "first_value_at reconciliation requires OBS_AQIDB_SUPABASE_URL + OBS_AQIDB_SECRET_KEY",
+      );
+    }
+    for (const chunk of chunks) {
+      const response = await postgrestRpc<unknown[]>(
+        source,
+        FIRST_VALUE_AT_RECONCILE_RPC,
+        {
+          p_connector_id: args.connector_id,
+          p_rows: chunk,
+          p_dry_run: args.dry_run,
+        },
+      );
+      if (response.error) {
+        throw new Error(response.error.message);
+      }
+      const result = Array.isArray(response.data) ? response.data[0] : null;
+      if (!result || typeof result !== "object" || Array.isArray(result)) {
+        throw new Error(
+          "first_value_at reconciliation RPC returned no summary row",
+        );
+      }
+      const record = result as Record<string, unknown>;
+      const submitted = Number(record.submitted_count);
+      const matched = Number(record.matched_count);
+      const wouldUpdate = Number(record.would_update_count);
+      const updated = Number(record.updated_count);
+      const unchanged = Number(record.already_equal_or_earlier_count);
+      if (
+        ![submitted, matched, wouldUpdate, updated, unchanged].every((value) =>
+          Number.isSafeInteger(value) && value >= 0
+        ) ||
+        submitted !== chunk.length ||
+        matched !== chunk.length ||
+        unchanged + wouldUpdate !== matched ||
+        (args.dry_run ? updated !== 0 : updated !== wouldUpdate) ||
+        Boolean(record.dry_run) !== args.dry_run
+      ) {
+        throw new Error(
+          "first_value_at reconciliation RPC returned an invalid summary",
+        );
+      }
+      databaseSummary.submitted_count += submitted;
+      databaseSummary.rpc_call_count += 1;
+      databaseSummary.matched_count += matched;
+      databaseSummary.would_update_count += wouldUpdate;
+      databaseSummary.updated_count += updated;
+      databaseSummary.unchanged_count += unchanged;
+    }
+  };
+
+  try {
+    await reconcileDatabase("ingestdb");
+  } catch (error) {
+    summary.ingestdb.status = "failed";
+    summary.ingestdb.error =
+      (error instanceof Error ? error.message : String(error)).slice(0, 1200);
+    summary.status = "failed";
+    summary.error = summary.ingestdb.error;
+    logStructured("error", "source_to_r2_first_value_at_reconciliation", {
+      day_utc: args.day_utc,
+      r2_verification: args.r2_verification,
+      ...summary,
+    });
+    throw new Error(
+      `R2 observation partition verified but authoritative IngestDB first_value_at reconciliation failed: ${summary.error}`,
+    );
+  }
+
+  try {
+    await reconcileDatabase("obs_aqidb");
+  } catch (error) {
+    summary.obs_aqidb.status = "failed";
+    summary.obs_aqidb.error =
+      (error instanceof Error ? error.message : String(error)).slice(0, 1200);
+    summary.status = "failed";
+    summary.error = summary.obs_aqidb.error;
+    logStructured("error", "source_to_r2_first_value_at_reconciliation", {
+      day_utc: args.day_utc,
+      r2_verification: args.r2_verification,
+      ...summary,
+    });
+    throw new Error(
+      `R2 observation partition verified and authoritative IngestDB reconciliation succeeded, but Obs AQI DB first_value_at reconciliation failed: ${summary.error}`,
+    );
+  }
+
+  logStructured("info", "source_to_r2_first_value_at_reconciliation", {
+    day_utc: args.day_utc,
+    r2_verification: args.r2_verification,
+    ...summary,
+  });
+  return summary;
+}
+
 async function postgrestTable<T>(
   baseUrl: string,
   privilegedKey: string,
@@ -1843,66 +2174,6 @@ function activeAqiHistoryDebugPrefix(): string {
   return HISTORY_R2_WRITE_VERSION === "v2"
     ? AQI_R2_HISTORY_DEBUG_PREFIX_V2
     : AQI_R2_HISTORY_PREFIX;
-}
-
-export function normalizePollutantCodeForR2Path(pollutantCode: string): string {
-  const value = String(pollutantCode || "").trim().toLowerCase();
-  if (!/^[a-z0-9_]+$/.test(value)) {
-    throw new Error(`Invalid pollutant_code for R2 path: ${pollutantCode}`);
-  }
-  return value;
-}
-
-function buildHistoryV2ConnectorPrefix(
-  basePrefix: string,
-  dayUtc: string,
-  connectorId: number,
-): string {
-  return `${basePrefix}/day_utc=${dayUtc}/connector_id=${connectorId}`;
-}
-
-function buildHistoryV2PollutantPrefix(
-  basePrefix: string,
-  dayUtc: string,
-  connectorId: number,
-  pollutantCode: string,
-): string {
-  return `${buildHistoryV2ConnectorPrefix(basePrefix, dayUtc, connectorId)}/pollutant_code=${
-    normalizePollutantCodeForR2Path(pollutantCode)
-  }`;
-}
-
-function buildHistoryV2DayManifestKey(basePrefix: string, dayUtc: string): string {
-  return `${basePrefix}/day_utc=${dayUtc}/manifest.json`;
-}
-
-function buildHistoryV2ConnectorManifestKey(
-  basePrefix: string,
-  dayUtc: string,
-  connectorId: number,
-): string {
-  return `${buildHistoryV2ConnectorPrefix(basePrefix, dayUtc, connectorId)}/manifest.json`;
-}
-
-function buildHistoryV2PollutantManifestKey(
-  basePrefix: string,
-  dayUtc: string,
-  connectorId: number,
-  pollutantCode: string,
-): string {
-  return `${buildHistoryV2PollutantPrefix(basePrefix, dayUtc, connectorId, pollutantCode)}/manifest.json`;
-}
-
-function buildHistoryV2PartKey(
-  basePrefix: string,
-  dayUtc: string,
-  connectorId: number,
-  pollutantCode: string,
-  partIndex: number,
-): string {
-  return `${buildHistoryV2PollutantPrefix(basePrefix, dayUtc, connectorId, pollutantCode)}/part-${
-    String(partIndex).padStart(5, "0")
-  }.parquet`;
 }
 
 function resolveIntegrityProposalStageDir(
@@ -2747,7 +3018,7 @@ function statsFromFileEntries(
 }
 
 function summarizeObservationPartRows(
-  rows: ObsHistoryParquetRow[],
+  rows: Array<ObsHistoryParquetRow | ObsHistoryV2ParquetRow>,
 ): {
   min_timeseries_id: number | null;
   max_timeseries_id: number | null;
@@ -3000,115 +3271,6 @@ function createObsDayManifest(args: {
   });
 }
 
-function createObservationV2PollutantManifest(args: {
-  dayUtc: string;
-  connectorId: number;
-  pollutantCode: string;
-  runId: string;
-  manifestKey: string;
-  sourceRowCount: number;
-  fileEntries: ObsHistoryFileEntry[];
-  writerGitSha: string | null;
-  backedUpAtUtc: string;
-}) {
-  const files = args.fileEntries.map((entry) => ({
-    ...entry,
-    pollutant_code: args.pollutantCode,
-  }));
-  const totalBytes = files.reduce((sum, entry) => sum + Number(entry.bytes || 0), 0);
-  return withManifestHash({
-    manifest_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
-    history_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
-    history_version: "v2",
-    manifest_kind: "pollutant",
-    domain: "observations",
-    day_utc: args.dayUtc,
-    connector_id: args.connectorId,
-    pollutant_code: args.pollutantCode,
-    pollutant_codes: [args.pollutantCode],
-    run_id: args.runId,
-    manifest_key: args.manifestKey,
-    source_row_count: args.sourceRowCount,
-    row_count: args.sourceRowCount,
-    min_timeseries_id: minFileEntryNumber(files, "min_timeseries_id"),
-    max_timeseries_id: maxFileEntryNumber(files, "max_timeseries_id"),
-    min_observed_at_utc: minFileEntryString(files, "min_observed_at"),
-    max_observed_at_utc: maxFileEntryString(files, "max_observed_at"),
-    parquet_object_keys: Array.from(new Set(files.map((entry) => entry.key))).sort(),
-    file_count: files.length,
-    total_bytes: totalBytes,
-    files,
-    child_manifests: [],
-    columns: HISTORY_OBSERVATIONS_COLUMNS_R2_V2,
-    writer_version: HISTORY_R2_V2_WRITER_VERSION,
-    writer_git_sha: args.writerGitSha,
-    ...statsFromFileEntries(files, args.sourceRowCount),
-    backed_up_at_utc: args.backedUpAtUtc,
-  });
-}
-
-function createObservationV2ConnectorManifest(args: {
-  dayUtc: string;
-  connectorId: number;
-  runId: string;
-  manifestKey: string;
-  pollutantManifests: Array<Record<string, unknown>>;
-  writerGitSha: string | null;
-  backedUpAtUtc: string;
-}) {
-  const files = args.pollutantManifests.flatMap((manifest) =>
-    Array.isArray(manifest.files) ? manifest.files as ObsHistoryFileEntry[] : []
-  );
-  const pollutantCodes = Array.from(new Set(args.pollutantManifests
-    .map((manifest) => String(manifest.pollutant_code || "").trim())
-    .filter(Boolean))).sort();
-  const totalRows = args.pollutantManifests.reduce((sum, manifest) => sum + toSafeInt(manifest.source_row_count), 0);
-  const totalBytes = files.reduce((sum, entry) => sum + Number(entry.bytes || 0), 0);
-  const childManifests = args.pollutantManifests.map((manifest) => ({
-    pollutant_code: manifest.pollutant_code,
-    manifest_key: manifest.manifest_key,
-    manifest_hash: manifest.manifest_hash,
-    source_row_count: manifest.source_row_count,
-    row_count: manifest.row_count,
-    file_count: manifest.file_count,
-    total_bytes: manifest.total_bytes,
-    min_timeseries_id: manifest.min_timeseries_id ?? null,
-    max_timeseries_id: manifest.max_timeseries_id ?? null,
-    min_observed_at_utc: manifest.min_observed_at_utc ?? null,
-    max_observed_at_utc: manifest.max_observed_at_utc ?? null,
-  }));
-  return withManifestHash({
-    manifest_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
-    history_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
-    history_version: "v2",
-    manifest_kind: "connector",
-    domain: "observations",
-    day_utc: args.dayUtc,
-    connector_id: args.connectorId,
-    pollutant_code: null,
-    pollutant_codes: pollutantCodes,
-    run_id: args.runId,
-    manifest_key: args.manifestKey,
-    source_row_count: totalRows,
-    row_count: totalRows,
-    min_timeseries_id: minFileEntryNumber(files, "min_timeseries_id"),
-    max_timeseries_id: maxFileEntryNumber(files, "max_timeseries_id"),
-    min_observed_at_utc: minFileEntryString(files, "min_observed_at"),
-    max_observed_at_utc: maxFileEntryString(files, "max_observed_at"),
-    parquet_object_keys: Array.from(new Set(files.map((entry) => entry.key))).sort(),
-    file_count: files.length,
-    total_bytes: totalBytes,
-    files,
-    child_manifests: childManifests,
-    pollutant_manifests: childManifests,
-    columns: HISTORY_OBSERVATIONS_COLUMNS_R2_V2,
-    writer_version: HISTORY_R2_V2_WRITER_VERSION,
-    writer_git_sha: args.writerGitSha,
-    ...statsFromFileEntries(files, totalRows),
-    backed_up_at_utc: args.backedUpAtUtc,
-  });
-}
-
 export function createAqiConnectorManifest(args: {
   dayUtc: string;
   connectorId: number;
@@ -3353,131 +3515,6 @@ function historyV2AqiColumns(profile: "data" | "debug"): readonly string[] {
     : HISTORY_AQILEVELS_HOURLY_DEBUG_COLUMNS_R2_V2;
 }
 
-export function createAqiV2PollutantManifest(args: {
-  profile: "data" | "debug";
-  dayUtc: string;
-  connectorId: number;
-  pollutantCode: "no2" | "pm25" | "pm10";
-  runId: string;
-  manifestKey: string;
-  sourceRowCount: number;
-  fileEntries: ObsHistoryFileEntry[];
-  writerGitSha: string | null;
-  backedUpAtUtc: string;
-}) {
-  const filesWithCounts = args.fileEntries.map((entry) => ({
-    ...entry,
-    pollutant_code: args.pollutantCode,
-  }));
-  const files = stripTimeseriesCountsFromFileEntries(filesWithCounts);
-  const totalBytes = files.reduce((sum, entry) => sum + Number(entry.bytes || 0), 0);
-  const timeseriesRowCounts = aggregateTimeseriesRowCounts(filesWithCounts);
-  return withManifestHash({
-    manifest_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
-    history_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
-    history_version: "v2",
-    manifest_kind: "pollutant",
-    domain: "aqilevels",
-    grain: "hourly",
-    profile: args.profile,
-    day_utc: args.dayUtc,
-    connector_id: args.connectorId,
-    pollutant_code: args.pollutantCode,
-    pollutant_codes: [args.pollutantCode],
-    run_id: args.runId,
-    manifest_key: args.manifestKey,
-    source_row_count: args.sourceRowCount,
-    row_count: args.sourceRowCount,
-    min_timeseries_id: minFileEntryNumber(files, "min_timeseries_id"),
-    max_timeseries_id: maxFileEntryNumber(files, "max_timeseries_id"),
-    min_timestamp_hour_utc: minFileEntryString(files, "min_timestamp_hour_utc"),
-    max_timestamp_hour_utc: maxFileEntryString(files, "max_timestamp_hour_utc"),
-    parquet_object_keys: Array.from(new Set(files.map((entry) => entry.key))).sort(),
-    file_count: files.length,
-    total_bytes: totalBytes,
-    files,
-    child_manifests: [],
-    columns: historyV2AqiColumns(args.profile),
-    writer_version: HISTORY_R2_V2_WRITER_VERSION,
-    writer_git_sha: args.writerGitSha,
-    ...statsFromFileEntries(files, args.sourceRowCount),
-    timeseries_row_counts: timeseriesRowCounts,
-    backed_up_at_utc: args.backedUpAtUtc,
-  });
-}
-
-export function createAqiV2ConnectorManifest(args: {
-  profile: "data" | "debug";
-  dayUtc: string;
-  connectorId: number;
-  runId: string;
-  manifestKey: string;
-  pollutantManifests: Array<Record<string, unknown>>;
-  writerGitSha: string | null;
-  backedUpAtUtc: string;
-}) {
-  const files = args.pollutantManifests.flatMap((manifest) =>
-    Array.isArray(manifest.files) ? manifest.files as ObsHistoryFileEntry[] : []
-  );
-  const pollutantCodes = Array.from(new Set(args.pollutantManifests
-    .map((manifest) => String(manifest.pollutant_code || "").trim())
-    .filter(Boolean))).sort();
-  const totalRows = args.pollutantManifests.reduce(
-    (sum, manifest) => sum + toSafeInt(manifest.source_row_count),
-    0,
-  );
-  const totalBytes = files.reduce((sum, entry) => sum + Number(entry.bytes || 0), 0);
-  const timeseriesRowCounts = aggregateTimeseriesRowCounts(
-    args.pollutantManifests as Array<{ timeseries_row_counts?: Record<string, number> | null | undefined }>,
-  );
-  const childManifests = args.pollutantManifests.map((manifest) => ({
-    pollutant_code: manifest.pollutant_code,
-    manifest_key: manifest.manifest_key,
-    manifest_hash: manifest.manifest_hash,
-    source_row_count: manifest.source_row_count,
-    row_count: manifest.row_count,
-    file_count: manifest.file_count,
-    total_bytes: manifest.total_bytes,
-    min_timeseries_id: manifest.min_timeseries_id ?? null,
-    max_timeseries_id: manifest.max_timeseries_id ?? null,
-    min_timestamp_hour_utc: manifest.min_timestamp_hour_utc ?? null,
-    max_timestamp_hour_utc: manifest.max_timestamp_hour_utc ?? null,
-  }));
-  return withManifestHash({
-    manifest_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
-    history_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
-    history_version: "v2",
-    manifest_kind: "connector",
-    domain: "aqilevels",
-    grain: "hourly",
-    profile: args.profile,
-    day_utc: args.dayUtc,
-    connector_id: args.connectorId,
-    pollutant_code: null,
-    pollutant_codes: pollutantCodes,
-    run_id: args.runId,
-    manifest_key: args.manifestKey,
-    source_row_count: totalRows,
-    row_count: totalRows,
-    min_timeseries_id: minFileEntryNumber(files, "min_timeseries_id"),
-    max_timeseries_id: maxFileEntryNumber(files, "max_timeseries_id"),
-    min_timestamp_hour_utc: minFileEntryString(files, "min_timestamp_hour_utc"),
-    max_timestamp_hour_utc: maxFileEntryString(files, "max_timestamp_hour_utc"),
-    parquet_object_keys: Array.from(new Set(files.map((entry) => entry.key))).sort(),
-    file_count: files.length,
-    total_bytes: totalBytes,
-    files,
-    child_manifests: childManifests,
-    pollutant_manifests: childManifests,
-    columns: historyV2AqiColumns(args.profile),
-    writer_version: HISTORY_R2_V2_WRITER_VERSION,
-    writer_git_sha: args.writerGitSha,
-    ...statsFromFileEntries(files, totalRows),
-    timeseries_row_counts: timeseriesRowCounts,
-    backed_up_at_utc: args.backedUpAtUtc,
-  });
-}
-
 function createAqiV2DayManifest(args: {
   profile: "data" | "debug";
   dayUtc: string;
@@ -3487,69 +3524,17 @@ function createAqiV2DayManifest(args: {
   writerGitSha: string | null;
   backedUpAtUtc: string;
 }) {
-  const files = args.connectorManifests.flatMap((manifest) =>
-    Array.isArray(manifest.files) ? manifest.files as ObsHistoryFileEntry[] : []
-  );
-  const connectorIds = args.connectorManifests
-    .map((manifest) => Number(manifest.connector_id))
-    .filter((value) => Number.isInteger(value))
-    .sort((left, right) => left - right);
-  const pollutantCodes = Array.from(new Set(args.connectorManifests
-    .flatMap((manifest) => Array.isArray(manifest.pollutant_codes) ? manifest.pollutant_codes : [])
-    .map((value) => String(value || "").trim())
-    .filter(Boolean))).sort();
-  const totalRows = args.connectorManifests.reduce(
-    (sum, manifest) => sum + toSafeInt(manifest.source_row_count),
-    0,
-  );
-  const totalBytes = files.reduce((sum, entry) => sum + Number(entry.bytes || 0), 0);
-  const childManifests = args.connectorManifests.map((manifest) => ({
-    connector_id: manifest.connector_id,
-    manifest_key: manifest.manifest_key,
-    manifest_hash: manifest.manifest_hash,
-    source_row_count: manifest.source_row_count,
-    row_count: manifest.row_count,
-    file_count: manifest.file_count,
-    total_bytes: manifest.total_bytes,
-    pollutant_codes: manifest.pollutant_codes,
-    min_timeseries_id: manifest.min_timeseries_id ?? null,
-    max_timeseries_id: manifest.max_timeseries_id ?? null,
-    min_timestamp_hour_utc: manifest.min_timestamp_hour_utc ?? null,
-    max_timestamp_hour_utc: manifest.max_timestamp_hour_utc ?? null,
-  }));
-  return withManifestHash({
-    manifest_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
-    history_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
-    history_version: "v2",
-    manifest_kind: "day",
+  const manifest = buildCanonicalHistoryV2DayManifest({
     domain: "aqilevels",
     grain: "hourly",
-    profile: args.profile,
-    day_utc: args.dayUtc,
-    connector_id: null,
-    connector_ids: connectorIds,
-    pollutant_code: null,
-    pollutant_codes: pollutantCodes,
-    run_id: args.runId,
-    manifest_key: args.manifestKey,
-    source_row_count: totalRows,
-    row_count: totalRows,
-    min_timeseries_id: minFileEntryNumber(files, "min_timeseries_id"),
-    max_timeseries_id: maxFileEntryNumber(files, "max_timeseries_id"),
-    min_timestamp_hour_utc: minFileEntryString(files, "min_timestamp_hour_utc"),
-    max_timestamp_hour_utc: maxFileEntryString(files, "max_timestamp_hour_utc"),
-    parquet_object_keys: Array.from(new Set(files.map((entry) => entry.key))).sort(),
-    file_count: files.length,
-    total_bytes: totalBytes,
-    files,
-    child_manifests: childManifests,
-    connector_manifests: childManifests,
-    columns: historyV2AqiColumns(args.profile),
-    writer_version: HISTORY_R2_V2_WRITER_VERSION,
-    writer_git_sha: args.writerGitSha,
-    ...statsFromFileEntries(files, totalRows),
-    backed_up_at_utc: args.backedUpAtUtc,
+    ...args,
   });
+  validateCanonicalHistoryV2Manifest(manifest, {
+    domain: "aqilevels",
+    manifest_kind: "day",
+    profile: args.profile,
+  });
+  return manifest;
 }
 
 function ensureParquetWasmInitialized(): void {
@@ -3721,99 +3706,15 @@ function writeArrowTableToParquet(table: unknown, writerProperties: unknown): Ui
 }
 
 function rowsToObservationV2ParquetBuffer(rows: ObsHistoryV2ParquetRow[]): Uint8Array {
-  ensureParquetWasmInitialized();
-  const int32Vector = (values: Array<number | null>) =>
-    arrow.vectorFromArray(values, new arrow.Int32());
-  const textVector = (values: Array<string | null>) =>
-    arrow.vectorFromArray(values, new arrow.Utf8());
-  const timestampVector = (values: Array<Date | null>) =>
-    arrow.vectorFromArray(values, new arrow.TimestampMillisecond());
-  const table = (arrow as unknown as {
-    tableFromArrays: (data: Record<string, unknown>) => unknown;
-  }).tableFromArrays({
-    connector_id: int32Vector(rows.map((row) => row.connector_id)),
-    station_id: int32Vector(rows.map((row) => row.station_id)),
-    timeseries_id: int32Vector(rows.map((row) => row.timeseries_id)),
-    pollutant_code: textVector(rows.map((row) => row.pollutant_code)),
-    observed_at_utc: timestampVector(rows.map((row) => new Date(row.observed_at))),
-    value: rows.map((row) => row.value === null || row.value === undefined ? null : Number(row.value)),
-    status: textVector(rows.map((row) => row.status ?? null)),
-  });
-  return writeArrowTableToParquet(
-    table,
-    parquetWriterProperties(OBS_R2_ROW_GROUP_SIZE, HISTORY_R2_V2_WRITER_VERSION),
-  );
+  return serializeCanonicalObservationV2Parquet(rows, { rowGroupSize: OBS_R2_ROW_GROUP_SIZE });
 }
 
 function rowsToAqiDataV2ParquetBuffer(rows: AqilevelsHistoryParquetRow[]): Uint8Array {
-  ensureParquetWasmInitialized();
-  const int32Vector = (values: Array<number | null>) =>
-    arrow.vectorFromArray(values, new arrow.Int32());
-  const textVector = (values: Array<string | null>) =>
-    arrow.vectorFromArray(values, new arrow.Utf8());
-  const timestampVector = (values: Array<Date | null>) =>
-    arrow.vectorFromArray(values, new arrow.TimestampMillisecond());
-  const table = (arrow as unknown as {
-    tableFromArrays: (data: Record<string, unknown>) => unknown;
-  }).tableFromArrays({
-    connector_id: int32Vector(rows.map((row) => row.connector_id)),
-    station_id: int32Vector(rows.map((row) => row.station_id)),
-    timeseries_id: int32Vector(rows.map((row) => row.timeseries_id)),
-    pollutant_code: textVector(rows.map((row) => row.pollutant_code)),
-    timestamp_hour_utc: timestampVector(rows.map((row) => new Date(row.timestamp_hour_utc))),
-    daqi_index_level: int32Vector(rows.map((row) => row.daqi_index_level)),
-    eaqi_index_level: int32Vector(rows.map((row) => row.eaqi_index_level)),
-    daqi_calculation_status: textVector(rows.map((row) => row.daqi_calculation_status)),
-    daqi_missing_reason: textVector(rows.map((row) => row.daqi_missing_reason)),
-    eaqi_calculation_status: textVector(rows.map((row) => row.eaqi_calculation_status)),
-    eaqi_missing_reason: textVector(rows.map((row) => row.eaqi_missing_reason)),
-  });
-  return writeArrowTableToParquet(
-    table,
-    parquetWriterProperties(AQI_R2_ROW_GROUP_SIZE, HISTORY_R2_V2_WRITER_VERSION),
-  );
+  return serializeCanonicalAqilevelDataV2Parquet(rows, { rowGroupSize: AQI_R2_ROW_GROUP_SIZE });
 }
 
 function rowsToAqiDebugV2ParquetBuffer(rows: AqilevelsHistoryParquetRow[]): Uint8Array {
-  ensureParquetWasmInitialized();
-  const int32Vector = (values: Array<number | null>) =>
-    arrow.vectorFromArray(values, new arrow.Int32());
-  const float64Vector = (values: Array<number | null>) =>
-    arrow.vectorFromArray(values, new arrow.Float64());
-  const textVector = (values: Array<string | null>) =>
-    arrow.vectorFromArray(values, new arrow.Utf8());
-  const timestampVector = (values: Array<Date | null>) =>
-    arrow.vectorFromArray(values, new arrow.TimestampMillisecond());
-  const table = (arrow as unknown as {
-    tableFromArrays: (data: Record<string, unknown>) => unknown;
-  }).tableFromArrays({
-    connector_id: int32Vector(rows.map((row) => row.connector_id)),
-    station_id: int32Vector(rows.map((row) => row.station_id)),
-    timeseries_id: int32Vector(rows.map((row) => row.timeseries_id)),
-    pollutant_code: textVector(rows.map((row) => row.pollutant_code)),
-    timestamp_hour_utc: timestampVector(rows.map((row) => new Date(row.timestamp_hour_utc))),
-    daqi_input_value_ugm3: float64Vector(rows.map((row) => row.daqi_input_value_ugm3)),
-    daqi_input_averaging_code: textVector(rows.map((row) => row.daqi_input_averaging_code)),
-    daqi_index_level: int32Vector(rows.map((row) => row.daqi_index_level)),
-    daqi_source_observation_count: int32Vector(rows.map((row) => row.daqi_source_observation_count)),
-    daqi_required_observation_count: int32Vector(rows.map((row) => row.daqi_required_observation_count)),
-    daqi_calculation_status: textVector(rows.map((row) => row.daqi_calculation_status)),
-    daqi_missing_reason: textVector(rows.map((row) => row.daqi_missing_reason)),
-    eaqi_input_value_ugm3: float64Vector(rows.map((row) => row.eaqi_input_value_ugm3)),
-    eaqi_input_averaging_code: textVector(rows.map((row) => row.eaqi_input_averaging_code)),
-    eaqi_index_level: int32Vector(rows.map((row) => row.eaqi_index_level)),
-    eaqi_source_observation_count: int32Vector(rows.map((row) => row.eaqi_source_observation_count)),
-    eaqi_required_observation_count: int32Vector(rows.map((row) => row.eaqi_required_observation_count)),
-    eaqi_calculation_status: textVector(rows.map((row) => row.eaqi_calculation_status)),
-    eaqi_missing_reason: textVector(rows.map((row) => row.eaqi_missing_reason)),
-    hourly_sample_count: int32Vector(rows.map((row) => row.hourly_sample_count)),
-    algorithm_version: textVector(rows.map((row) => row.algorithm_version)),
-    computed_at_utc: timestampVector(rows.map((row) => row.computed_at_utc ? new Date(row.computed_at_utc) : null)),
-  });
-  return writeArrowTableToParquet(
-    table,
-    parquetWriterProperties(AQI_R2_ROW_GROUP_SIZE, HISTORY_R2_V2_WRITER_VERSION),
-  );
+  return serializeCanonicalAqilevelDebugV2Parquet(rows, { rowGroupSize: AQI_R2_ROW_GROUP_SIZE });
 }
 
 async function deleteR2Keys(keys: string[]): Promise<number> {
@@ -3948,6 +3849,185 @@ async function loadExistingConnectorManifest(
       files.reduce((sum, file) => sum + file.bytes, 0),
     files,
   };
+}
+
+async function loadVerifiedR2ObservationRowsForConnectorDay(
+  dayUtc: string,
+  connectorId: number,
+  requireLocalByteIdentity: boolean,
+): Promise<ObsHistoryRow[]> {
+  if (!hasRequiredR2Config(OBS_R2_CONFIG)) {
+    throw new Error(
+      "verified observation history read requires complete R2 configuration",
+    );
+  }
+  const manifestKey = buildObsConnectorManifestKey(dayUtc, connectorId);
+  const liveManifest = await r2GetObject({
+    r2: OBS_R2_CONFIG,
+    key: manifestKey,
+  });
+  const localManifest = loadLocalHistoryObjectBytesByR2Key(manifestKey);
+  if (requireLocalByteIdentity && !localManifest) {
+    throw new Error(
+      `unchanged observation connector manifest is unavailable for byte verification: ${manifestKey}`,
+    );
+  }
+  if (
+    requireLocalByteIdentity &&
+    localManifest &&
+    sha256Hex(localManifest) !== sha256Hex(liveManifest.body)
+  ) {
+    throw new Error(
+      `unchanged observation connector manifest failed byte verification: ${manifestKey}`,
+    );
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(new TextDecoder().decode(liveManifest.body));
+  } catch {
+    throw new Error(
+      `verified observation connector manifest is invalid JSON: ${manifestKey}`,
+    );
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(
+      `verified observation connector manifest is not an object: ${manifestKey}`,
+    );
+  }
+  const record = parsed as Record<string, unknown>;
+  if (
+    String(record.history_version || "") !== "v2" ||
+    String(record.domain || "") !== "observations" ||
+    String(record.day_utc || "") !== dayUtc ||
+    Number(record.connector_id) !== connectorId
+  ) {
+    throw new Error(
+      `verified observation connector manifest identity mismatch: ${manifestKey}`,
+    );
+  }
+
+  const childManifestKeys = Array.from(
+    new Set(
+      (Array.isArray(record.child_manifests) ? record.child_manifests : [])
+        .map((entry) =>
+          entry && typeof entry === "object" && !Array.isArray(entry)
+            ? String((entry as Record<string, unknown>).manifest_key || "")
+              .trim()
+            : ""
+        )
+        .filter(Boolean),
+    ),
+  ).sort();
+  for (const childKey of childManifestKeys) {
+    const liveChild = await r2GetObject({ r2: OBS_R2_CONFIG, key: childKey });
+    const localChild = loadLocalHistoryObjectBytesByR2Key(childKey);
+    if (requireLocalByteIdentity && !localChild) {
+      throw new Error(
+        `unchanged observation pollutant manifest is unavailable for byte verification: ${childKey}`,
+      );
+    }
+    if (
+      requireLocalByteIdentity &&
+      localChild &&
+      sha256Hex(localChild) !== sha256Hex(liveChild.body)
+    ) {
+      throw new Error(
+        `unchanged observation pollutant manifest failed byte verification: ${childKey}`,
+      );
+    }
+  }
+
+  const files = Array.isArray(record.files) ? record.files : [];
+  const fileEntries = files.map((entry) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new Error(
+        `verified observation connector manifest has an invalid file entry: ${manifestKey}`,
+      );
+    }
+    const file = entry as Record<string, unknown>;
+    const key = String(file.key || "").trim();
+    const rowCount = Number(file.row_count);
+    const bytes = Number(file.bytes);
+    if (
+      !key ||
+      !Number.isSafeInteger(rowCount) ||
+      rowCount < 0 ||
+      !Number.isSafeInteger(bytes) ||
+      bytes < 0
+    ) {
+      throw new Error(
+        `verified observation connector manifest has an invalid file identity: ${manifestKey}`,
+      );
+    }
+    return { key, row_count: rowCount, bytes };
+  }).sort((left, right) => left.key.localeCompare(right.key));
+  if (
+    Number(record.file_count) !== fileEntries.length ||
+    new Set(fileEntries.map((entry) => entry.key)).size !== fileEntries.length
+  ) {
+    throw new Error(
+      `verified observation connector manifest file count mismatch: ${manifestKey}`,
+    );
+  }
+
+  const rows: ObsHistoryRow[] = [];
+  const dayStart = Date.parse(`${dayUtc}T00:00:00.000Z`);
+  const dayEnd = dayStart + 24 * 60 * 60 * 1000;
+  for (const file of fileEntries) {
+    const livePart = await r2GetObject({ r2: OBS_R2_CONFIG, key: file.key });
+    if (livePart.body.byteLength !== file.bytes) {
+      throw new Error(
+        `verified observation parquet byte count mismatch: ${file.key}`,
+      );
+    }
+    const localPart = loadLocalHistoryObjectBytesByR2Key(file.key);
+    if (requireLocalByteIdentity && !localPart) {
+      throw new Error(
+        `unchanged observation parquet is unavailable for byte verification: ${file.key}`,
+      );
+    }
+    if (
+      requireLocalByteIdentity &&
+      localPart &&
+      sha256Hex(localPart) !== sha256Hex(livePart.body)
+    ) {
+      throw new Error(
+        `unchanged observation parquet failed byte verification: ${file.key}`,
+      );
+    }
+    const partRows = await readObsHistoryRowsFromParquetBytes(livePart.body);
+    if (partRows.length !== file.row_count) {
+      throw new Error(
+        `verified observation parquet row count mismatch: ${file.key}`,
+      );
+    }
+    for (const row of partRows) {
+      const observedAtMs = Date.parse(row.observed_at);
+      if (
+        !Number.isSafeInteger(row.timeseries_id) ||
+        row.timeseries_id <= 0 ||
+        !Number.isFinite(observedAtMs) ||
+        observedAtMs < dayStart ||
+        observedAtMs >= dayEnd
+      ) {
+        throw new Error(
+          `verified observation parquet row identity mismatch: ${file.key}`,
+        );
+      }
+      rows.push(row);
+    }
+  }
+  const declaredRows = Number(record.row_count ?? record.source_row_count);
+  if (
+    !Number.isSafeInteger(declaredRows) || declaredRows < 0 ||
+    rows.length !== declaredRows
+  ) {
+    throw new Error(
+      `verified observation connector row count mismatch: ${manifestKey}`,
+    );
+  }
+  return dedupeObsHistoryRows(rows);
 }
 
 async function loadR2ObservationConnectorIdsForDay(
@@ -4717,8 +4797,28 @@ async function exportObsConnectorRowsToR2V2(args: {
   let objectsWritten = 0;
 
   for (const [pollutantCode, pollutantRows] of Array.from(pollutantGroups.entries()).sort(([left], [right]) => left.localeCompare(right))) {
+    const canonicalHashResult = computeObservationContentHash(
+      pollutantRows.map((row) => normalizeCanonicalObservationRow({
+        connector_id: args.connector_id,
+        station_id: row.station_id ?? null,
+        timeseries_id: row.timeseries_id,
+        pollutant_code: pollutantCode,
+        observed_at_utc: new Date(row.observed_at).toISOString(),
+        value: row.value,
+        verification_status: args.connector_id === SOS_CONNECTOR_ID_FALLBACK
+          ? normalizeUkAirVerificationStatus(
+            row.verification_status ?? row.status ?? null,
+          )
+          : null,
+      })),
+    );
+    const {
+      canonical_rows: canonicalPollutantRows,
+      ...observationContentHash
+    } = canonicalHashResult;
     const fileEntries: ObsHistoryFileEntry[] = [];
-    const rowChunks = chunkRows(pollutantRows, OBS_R2_PART_MAX_ROWS);
+    const liveParquetBodies: Uint8Array[] = [];
+    const rowChunks = chunkRows(canonicalPollutantRows, OBS_R2_PART_MAX_ROWS);
     for (let partIndex = 0; partIndex < rowChunks.length; partIndex += 1) {
       const chunk = rowChunks[partIndex];
       if (!chunk.length) continue;
@@ -4727,9 +4827,9 @@ async function exportObsConnectorRowsToR2V2(args: {
         station_id: row.station_id ?? null,
         timeseries_id: row.timeseries_id,
         pollutant_code: pollutantCode,
-        observed_at: row.observed_at,
+        observed_at: row.observed_at_utc,
         value: row.value,
-        status: row.status ?? null,
+        verification_status: row.verification_status,
       }));
       const partSummary = summarizeObservationPartRows(parquetRows);
       const partKey = buildHistoryV2PartKey(
@@ -4755,6 +4855,7 @@ async function exportObsConnectorRowsToR2V2(args: {
         }
         verifiedBytes = actual.bytes;
         verifiedEtag = actual.etag || putResult.etag;
+        liveParquetBodies.push(actual.body);
       }
       fileEntries.push({
         key: partKey,
@@ -4769,6 +4870,28 @@ async function exportObsConnectorRowsToR2V2(args: {
         timeseries_row_counts: partSummary.timeseries_row_counts,
       });
       objectsWritten += 1;
+    }
+    if (!INTEGRITY_PROPOSAL_MODE) {
+      const liveCanonicalRows = (
+        await Promise.all(
+          liveParquetBodies.map((body) =>
+            readCanonicalObservationRowsFromParquet(body, {
+              isSos: args.connector_id === SOS_CONNECTOR_ID_FALLBACK,
+            })
+          ),
+        )
+      ).flat();
+      const liveHashResult = computeObservationContentHash(liveCanonicalRows);
+      if (
+        liveHashResult.observation_content_hash !==
+          observationContentHash.observation_content_hash ||
+        JSON.stringify(liveHashResult.verification_status_counts) !==
+          JSON.stringify(observationContentHash.verification_status_counts)
+      ) {
+        throw new Error(
+          `v2 observation live Parquet content verification failed: day=${args.day_utc} connector=${args.connector_id} pollutant=${pollutantCode}`,
+        );
+      }
     }
     const manifestKey = buildHistoryV2PollutantManifestKey(
       OBS_R2_HISTORY_PREFIX_V2,
@@ -4786,6 +4909,7 @@ async function exportObsConnectorRowsToR2V2(args: {
       fileEntries,
       writerGitSha: OBS_R2_WRITER_GIT_SHA,
       backedUpAtUtc: nowIso(),
+      observationContentHash,
     });
     await publishOrStageHistoryObject({
       key: manifestKey,
@@ -6865,10 +6989,168 @@ function isSosMappingValidForDay(
   return true;
 }
 
+type SosSiteRefBridgeSnapshot = {
+  connector_id: number;
+  mapping_identity: string;
+  mapping_hash: string;
+  content_hash: string;
+  bridge_artifact_row_count: number;
+  selected_bridge_row_count: number;
+  rows: SosSiteTimeseriesRef[];
+};
+
+let sosSiteRefBridgeSnapshot:
+  | SosSiteRefBridgeSnapshot
+  | null
+  | undefined;
+
+export function loadSosSiteRefBridgeSnapshot(): SosSiteRefBridgeSnapshot | null {
+  if (sosSiteRefBridgeSnapshot !== undefined) return sosSiteRefBridgeSnapshot;
+  const sourceFile = optionalEnv("UK_AQ_BACKFILL_SOS_SITE_REF_BRIDGE_FILE");
+  if (!sourceFile) return sosSiteRefBridgeSnapshot = null;
+  if (!fs.existsSync(sourceFile)) {
+    throw new Error(`sos_site_ref_bridge_file_missing path=${sourceFile}`);
+  }
+  const text = fs.readFileSync(sourceFile, "utf8");
+  const payload = JSON.parse(text) as Record<string, unknown>;
+  const connectorId = Number(payload.connector_id);
+  const mappingIdentity = String(payload.mapping_identity || "");
+  const mappingHash = String(payload.bridge_artifact_sha256 || "");
+  const declaredContentHash = String(payload.bridge_content_sha256 || "");
+  const compatibilityRowCount = Number(payload.bridge_row_count);
+  const bridgeArtifactRowCount = Number(
+    payload.bridge_artifact_row_count ?? payload.bridge_row_count,
+  );
+  const selectedBridgeRowCount = Number(
+    payload.selected_bridge_row_count ?? (
+      Array.isArray(payload.rows) ? payload.rows.length : -1
+    ),
+  );
+  if (
+    Number(payload.schema_version) !== 1 ||
+    !Number.isInteger(connectorId) || connectorId <= 0 ||
+    mappingIdentity !== "sos_station_timeseries_site_refs_snapshot" ||
+    !/^[a-f0-9]{64}$/.test(mappingHash) ||
+    !/^[a-f0-9]{64}$/.test(declaredContentHash) ||
+    !Array.isArray(payload.rows) ||
+    !Number.isSafeInteger(compatibilityRowCount) ||
+    !Number.isSafeInteger(bridgeArtifactRowCount) ||
+    !Number.isSafeInteger(selectedBridgeRowCount) ||
+    compatibilityRowCount !== bridgeArtifactRowCount ||
+    bridgeArtifactRowCount <= 0 ||
+    selectedBridgeRowCount < 0 ||
+    selectedBridgeRowCount > bridgeArtifactRowCount ||
+    selectedBridgeRowCount !== payload.rows.length
+  ) {
+    throw new Error(`sos_site_ref_bridge_invalid path=${sourceFile}`);
+  }
+  const semantic: Record<string, unknown> = {
+    schema_version: payload.schema_version,
+    connector_id: payload.connector_id,
+    mapping_identity: payload.mapping_identity,
+    bridge_artifact_sha256: payload.bridge_artifact_sha256,
+    bridge_row_count: payload.bridge_row_count,
+    rows: payload.rows,
+  };
+  if (Object.hasOwn(payload, "bridge_artifact_row_count")) {
+    semantic.bridge_artifact_row_count = payload.bridge_artifact_row_count;
+  }
+  if (Object.hasOwn(payload, "selected_bridge_row_count")) {
+    semantic.selected_bridge_row_count = payload.selected_bridge_row_count;
+  }
+  const actualContentHash = sha256Hex(canonicalRegistryJson(semantic));
+  if (actualContentHash !== declaredContentHash) {
+    throw new Error(`sos_site_ref_bridge_content_hash_invalid path=${sourceFile}`);
+  }
+  const rows: SosSiteTimeseriesRef[] = [];
+  const identities = new Set<string>();
+  for (const raw of payload.rows) {
+    if (!raw || typeof raw !== "object") {
+      throw new Error(`sos_site_ref_bridge_invalid_entry path=${sourceFile}`);
+    }
+    const entry = raw as Record<string, unknown>;
+    const siteRef = String(entry.site_ref || "").trim().toUpperCase();
+    const pollutantCode = parseSourcePollutantCode(
+      String(entry.pollutant_code || ""),
+    );
+    const stationId = Number(entry.station_id);
+    const timeseriesId = Number(entry.timeseries_id);
+    if (
+      !siteRef || !pollutantCode ||
+      !["pm25", "pm10", "no2", "o3"].includes(pollutantCode) ||
+      !Number.isInteger(stationId) || stationId <= 0 ||
+      !Number.isInteger(timeseriesId) || timeseriesId <= 0
+    ) {
+      throw new Error(`sos_site_ref_bridge_invalid_entry path=${sourceFile}`);
+    }
+    const row: SosSiteTimeseriesRef = {
+      site_ref: siteRef,
+      uk_air_ref: entry.uk_air_ref == null ? null : String(entry.uk_air_ref),
+      pollutant_code: pollutantCode,
+      station_id: Math.trunc(stationId),
+      timeseries_id: Math.trunc(timeseriesId),
+      station_ref: entry.station_ref == null ? null : String(entry.station_ref),
+      timeseries_ref: entry.timeseries_ref == null
+        ? null
+        : String(entry.timeseries_ref),
+      valid_from_day_utc: parseOptionalDay(entry.valid_from_day_utc),
+      valid_to_day_utc: parseOptionalDay(entry.valid_to_day_utc),
+    };
+    const identity = [
+      row.site_ref,
+      row.pollutant_code,
+      row.timeseries_id,
+      row.valid_from_day_utc || "",
+      row.valid_to_day_utc || "",
+    ].join("|");
+    if (identities.has(identity)) {
+      throw new Error(`sos_site_ref_bridge_duplicate_entry path=${sourceFile}`);
+    }
+    identities.add(identity);
+    rows.push(row);
+  }
+  logStructured("info", "sos_site_ref_bridge_snapshot_loaded", {
+    connector_id: connectorId,
+    mapping_identity: mappingIdentity,
+    mapping_hash: mappingHash,
+    bridge_artifact_row_count: bridgeArtifactRowCount,
+    selected_bridge_row_count: selectedBridgeRowCount,
+  });
+  return sosSiteRefBridgeSnapshot = {
+    connector_id: connectorId,
+    mapping_identity: mappingIdentity,
+    mapping_hash: mappingHash,
+    content_hash: actualContentHash,
+    bridge_artifact_row_count: bridgeArtifactRowCount,
+    selected_bridge_row_count: selectedBridgeRowCount,
+    rows,
+  };
+}
+
 async function fetchSosSiteTimeseriesRefsForConnector(
   connectorId: number,
   candidateTimeseriesIds: number[],
 ): Promise<SosSiteTimeseriesRef[]> {
+  const importedBridge = loadSosSiteRefBridgeSnapshot();
+  if (importedBridge) {
+    if (importedBridge.connector_id !== connectorId) {
+      throw new Error(
+        `sos_site_ref_bridge_connector_mismatch expected=${connectorId} ` +
+          `actual=${importedBridge.connector_id}`,
+      );
+    }
+    if (INTEGRITY_COMPLETE_CONNECTOR_DAY) return importedBridge.rows;
+    const candidateIdSet = new Set(candidateTimeseriesIds);
+    return importedBridge.rows.filter((row) =>
+      candidateIdSet.has(row.timeseries_id)
+    );
+  }
+  if (INTEGRITY_COMPLETE_CONNECTOR_DAY && HISTORY_R2_WRITE_VERSION === "v2") {
+    throw new Error(
+      "v2_integrity_sos_site_ref_bridge_snapshot_required; " +
+        "live Supabase mapping lookup is not an authoritative fallback",
+    );
+  }
   if (!(INGEST_SUPABASE_URL && INGEST_PRIVILEGED_KEY)) {
     throw new Error(
       "UK-AIR flat-file mapping guard requires SUPABASE_URL and SB_SECRET_KEY",
@@ -6950,13 +7232,25 @@ async function assertSosFlatFileMappingsForBackfill(args: {
     args.connector_id,
     candidateIds,
   );
-  const validRows = mappingRows.filter((row) =>
+  const scopedMappingRows = INTEGRITY_POLLUTANT_SCOPED_REPAIR
+    ? mappingRows.filter((row) =>
+      INTEGRITY_REPAIR_POLLUTANTS.has(row.pollutant_code)
+    )
+    : mappingRows;
+  const validRows = scopedMappingRows.filter((row) =>
     isSosMappingValidForDay(row, args.day_utc)
+  );
+  const candidateIdSet = new Set(candidateIds);
+  const candidateMappingRows = validRows.filter((row) =>
+    candidateIdSet.has(row.timeseries_id)
+  );
+  const mappingsOutsideCandidateScope = validRows.filter((row) =>
+    !candidateIdSet.has(row.timeseries_id)
   );
   const validByTimeseriesId = new Map<number, SosSiteTimeseriesRef[]>();
   const validBySitePollutant = new Map<string, SosSiteTimeseriesRef[]>();
 
-  for (const row of validRows) {
+  for (const row of candidateMappingRows) {
     const byId = validByTimeseriesId.get(row.timeseries_id) || [];
     byId.push(row);
     validByTimeseriesId.set(row.timeseries_id, byId);
@@ -6994,7 +7288,8 @@ async function assertSosFlatFileMappingsForBackfill(args: {
     }));
 
   if (
-    missing.length ||
+    (!INTEGRITY_COMPLETE_CONNECTOR_DAY && missing.length) ||
+    mappingsOutsideCandidateScope.length ||
     ambiguousByTimeseries.length ||
     ambiguousBySitePollutant.length
   ) {
@@ -7003,16 +7298,22 @@ async function assertSosFlatFileMappingsForBackfill(args: {
       connector_id: args.connector_id,
       candidate_timeseries_count: candidateIds.length,
       mapping_rows: mappingRows.length,
+      scoped_mapping_rows: scopedMappingRows.length,
       valid_mapping_rows: validRows.length,
+      candidate_mapping_rows: candidateMappingRows.length,
+      unmapped_candidate_timeseries_count: missing.length,
       missing_timeseries_ids: missing.slice(0, 50),
+      mapping_timeseries_outside_candidate_scope:
+        mappingsOutsideCandidateScope.slice(0, 50).map((row) => row.timeseries_id),
       ambiguous_timeseries_sample: ambiguousByTimeseries.slice(0, 10),
       ambiguous_site_pollutant_sample: ambiguousBySitePollutant.slice(0, 10),
     };
     logStructured("error", "sos_flat_file_mapping_guard_failed", details);
     throw new Error(
       `UK-AIR flat-file mapping guard failed for day_utc=${args.day_utc} connector_id=${args.connector_id}: ` +
-        `missing_timeseries=${missing.length} ambiguous_timeseries=${ambiguousByTimeseries.length} ` +
-        `ambiguous_site_ref_pollutant=${ambiguousBySitePollutant.length}`,
+      `missing_timeseries=${missing.length} ambiguous_timeseries=${ambiguousByTimeseries.length} ` +
+        `ambiguous_site_ref_pollutant=${ambiguousBySitePollutant.length} ` +
+        `mapping_timeseries_outside_candidate_scope=${mappingsOutsideCandidateScope.length}`,
     );
   }
 
@@ -7020,10 +7321,13 @@ async function assertSosFlatFileMappingsForBackfill(args: {
     day_utc: args.day_utc,
     connector_id: args.connector_id,
     candidate_timeseries_count: candidateIds.length,
+    scoped_mapping_rows: scopedMappingRows.length,
     valid_mapping_rows: validRows.length,
-    site_ref_count: new Set(validRows.map((row) => row.site_ref)).size,
+    candidate_mapping_rows: candidateMappingRows.length,
+    unmapped_candidate_timeseries_count: missing.length,
+    site_ref_count: new Set(candidateMappingRows.map((row) => row.site_ref)).size,
   });
-  return validRows;
+  return candidateMappingRows;
 }
 
 async function fetchMetadataSourceLookupForConnector(
@@ -8115,6 +8419,13 @@ function toFiniteNumber(value: unknown): number | null {
   return Number.isFinite(numeric) ? numeric : null;
 }
 
+function toFiniteUkAirCsvNumber(value: unknown): number | null {
+  if (typeof value === "string" && !value.trim()) {
+    return null;
+  }
+  return toFiniteNumber(value);
+}
+
 function normalizeBreatheLondonSensors(
   payload: unknown,
 ): Record<string, unknown>[] {
@@ -8826,31 +9137,114 @@ function resolveCsvHeaderIndex(
 }
 
 function normalizeUkAirSourceLabel(value: string): string {
-  return value.trim().replace(/\s+/g, " ");
+  return value.trim().replace(/\s+/g, " ").toLowerCase();
 }
 
-function parseUkAirCsvDay(value: string): string | null {
-  const match = value.trim().match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{2}|\d{4})$/);
-  if (!match) return null;
-  const year = match[3].length === 2 ? 2000 + Number(match[3]) : Number(match[3]);
-  const month = Number(match[2]);
-  const day = Number(match[1]);
-  const parsed = new Date(Date.UTC(year, month - 1, day));
-  if (
-    parsed.getUTCFullYear() !== year || parsed.getUTCMonth() !== month - 1 ||
-    parsed.getUTCDate() !== day
-  ) return null;
-  return parsed.toISOString().slice(0, 10);
+type SosSourceLabelRegistryStatus = "mapped" | "ignore" | "review";
+export type SosSourceLabelRegistryEntry = {
+  normalised_source_label: string;
+  status: SosSourceLabelRegistryStatus;
+  pollutant_code: string | null;
+  expected_uom: string | null;
+  raw_label_variants: string[];
+  observed_units: string[];
+  reviewed_at_utc: string | null;
+  review_notes: string | null;
+};
+type SosSourceLabelRegistrySnapshot = {
+  source_file: string;
+  file_sha256: string;
+  content_sha256: string;
+  entries: Map<string, SosSourceLabelRegistryEntry>;
+};
+
+const SOURCE_EVIDENCE_CONTRACT_VERSION = 4;
+
+let sosSourceLabelRegistrySnapshot: SosSourceLabelRegistrySnapshot | null | undefined;
+
+export function loadSosSourceLabelRegistrySnapshot(): SosSourceLabelRegistrySnapshot | null {
+  if (sosSourceLabelRegistrySnapshot !== undefined) return sosSourceLabelRegistrySnapshot;
+  const sourceFile = optionalEnv("UK_AQ_BACKFILL_SOS_SOURCE_LABEL_REGISTRY_FILE");
+  if (!sourceFile) return sosSourceLabelRegistrySnapshot = null;
+  if (!fs.existsSync(sourceFile)) {
+    throw new Error(`sos_source_label_registry_file_missing path=${sourceFile}`);
+  }
+  const text = fs.readFileSync(sourceFile, "utf8");
+  const payload = JSON.parse(text) as Record<string, unknown>;
+  if (Number(payload.schema_version) !== 1 || Number(payload.connector_id) !== 1 || !Array.isArray(payload.labels)) {
+    throw new Error(`sos_source_label_registry_invalid path=${sourceFile}`);
+  }
+  const declaredContentHash = String(payload.registry_content_sha256 || "");
+  const contentPayload = { ...payload };
+  delete contentPayload.registry_content_sha256;
+  const semanticContentHash = sha256Hex(canonicalRegistryJson({
+    schema_version: payload.schema_version,
+    connector_id: payload.connector_id,
+    labels: payload.labels,
+  }));
+  const legacyContentHash = sha256Hex(canonicalRegistryJson(contentPayload));
+  if (!/^[a-f0-9]{64}$/.test(declaredContentHash) ||
+    (declaredContentHash !== semanticContentHash &&
+      declaredContentHash !== legacyContentHash)) {
+    throw new Error(`sos_source_label_registry_content_hash_invalid path=${sourceFile}`);
+  }
+  const entries = new Map<string, SosSourceLabelRegistryEntry>();
+  for (const raw of payload.labels) {
+    if (!raw || typeof raw !== "object") continue;
+    const entry = raw as SosSourceLabelRegistryEntry;
+    if (
+      !entry.normalised_source_label ||
+      !["mapped", "ignore", "review"].includes(entry.status)
+    ) {
+      throw new Error(`sos_source_label_registry_invalid_entry path=${sourceFile}`);
+    }
+    if (!Array.isArray(entry.raw_label_variants) || !Array.isArray(entry.observed_units) ||
+      (entry.reviewed_at_utc !== null && typeof entry.reviewed_at_utc !== "string") ||
+      (entry.review_notes !== null && typeof entry.review_notes !== "string") ||
+      entries.has(entry.normalised_source_label)) {
+      throw new Error(`sos_source_label_registry_invalid_entry path=${sourceFile}`);
+    }
+    if (
+      (entry.status === "mapped" &&
+        (!['pm25', 'pm10', 'no2', 'o3'].includes(String(entry.pollutant_code || "")) ||
+          !String(entry.expected_uom || "").trim())) ||
+      (entry.status !== "mapped" && entry.pollutant_code !== null)
+    ) {
+      throw new Error(`sos_source_label_registry_invalid_decision path=${sourceFile}`);
+    }
+    entries.set(entry.normalised_source_label, entry);
+  }
+  return sosSourceLabelRegistrySnapshot = {
+    source_file: sourceFile,
+    file_sha256: sha256Hex(text),
+    content_sha256: semanticContentHash,
+    entries,
+  };
 }
 
-function parseUkAirGmtHourEnding(dayUtc: string, value: string): string | null {
-  const match = value.trim().match(/^(\d{1,2}):(\d{2})(?::\d{2})?$/);
-  if (!match) return null;
-  const hour = Number(match[1]);
-  const minute = Number(match[2]);
-  if (hour < 1 || hour > 24 || minute < 0 || minute > 59) return null;
-  const start = Date.parse(`${dayUtc}T00:00:00.000Z`);
-  return new Date(start + ((hour * 60 + minute) - 60) * 60_000).toISOString();
+function isPossibleSupportedSosSourceLabel(label: string): boolean {
+  const compact = label.replace(/[^a-z0-9.]+/g, "");
+  return /pm2\.5|pm25|pm10|nitrogendioxide|no2|ozone|o3/.test(compact);
+}
+
+export function normaliseConcentrationUnitForComparison(
+  value: string | null | undefined,
+): string {
+  const compact = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[µμ]/g, "u")
+    .replace(/³/g, "3")
+    .replace(/[−–]/g, "-")
+    .replace(/\([^)]*\)$/g, "")
+    .replace(/\s+/g, "");
+  const aliases = new Map<string, string>([
+    ["ug/m3", "ug/m3"],
+    ["ugm-3", "ug/m3"],
+    ["mg/m3", "mg/m3"],
+    ["mgm-3", "mg/m3"],
+  ]);
+  return aliases.get(compact) || compact;
 }
 
 export type UkAirFlatFileParseResult = {
@@ -8859,22 +9253,42 @@ export type UkAirFlatFileParseResult = {
   mapped_records: number;
   skipped_other_days: number;
   skipped_invalid_rows: number;
+  skipped_unselected_pollutant_rows: number;
+  source_label_classifications: Array<Record<string, unknown>>;
   blocked_target_day_rows: number;
   blocked_target_day_row_samples: Record<string, unknown>[];
   skipped_ignored_properties: number;
+  selected_source_records_examined: number;
+  missing_binding_groups: number;
+  missing_binding_rows: number;
   units: string[];
 };
 
 export function parseUkAirFlatFileObservations(args: {
   dayUtc: string;
   siteRef: string;
+  sourceFile?: string;
   csvText: string;
   mappings: SosSiteTimeseriesRef[];
   propertyMappings: ObservedPropertyMapping[];
+  registryEntries?: ReadonlyMap<string, SosSourceLabelRegistryEntry> | null;
 }): UkAirFlatFileParseResult {
+  // This is intentionally lazy: non-SOS adapters never read an SOS snapshot.
+  const registryEntries = args.registryEntries === undefined
+    ? loadSosSourceLabelRegistrySnapshot()?.entries
+    : args.registryEntries;
   const lines = args.csvText.split(/\r?\n/);
-  if (!lines.some((line) => line.trim().toLowerCase() === "all data gmt hour ending")) {
-    throw new Error(`UK-AIR CSV ${args.siteRef} does not declare All Data GMT hour ending`);
+  const expectedTimeBasisDeclaration = "All Data GMT hour ending";
+  if (!lines.some((line) =>
+    line.replace(/^\uFEFF/, "").trim().includes(expectedTimeBasisDeclaration)
+  )) {
+    logStructured("warning", "sos_uk_air_csv_time_basis_warning", {
+      site_ref: args.siteRef,
+      source_file: args.sourceFile || args.siteRef,
+      expected_phrase: expectedTimeBasisDeclaration,
+      message:
+        "Expected GMT hour-ending declaration was not found; continuing with CSV processing.",
+    });
   }
 
   const mappingsByPollutant = new Map<string, SosSiteTimeseriesRef[]>();
@@ -8892,9 +9306,14 @@ export function parseUkAirFlatFileObservations(args: {
     mapped_records: 0,
     skipped_other_days: 0,
     skipped_invalid_rows: 0,
+    skipped_unselected_pollutant_rows: 0,
+    source_label_classifications: [],
     blocked_target_day_rows: 0,
     blocked_target_day_row_samples: [],
     skipped_ignored_properties: 0,
+    selected_source_records_examined: 0,
+    missing_binding_groups: 0,
+    missing_binding_rows: 0,
     units: [],
   };
   const units = new Set<string>();
@@ -8910,10 +9329,45 @@ export function parseUkAirFlatFileObservations(args: {
     valueIndex: number;
     statusIndex: number;
     unitIndex: number;
+    sourceLabel: string;
+    normalisedSourceLabel: string;
     property: ObservedPropertyMapping;
     timeseries: SosSiteTimeseriesRef;
+    expectedUom: string;
+    decisionSource: "integrity_registry" | "integrity_registry_and_core" | "core_mapping";
+    units: Set<string>;
+    targetDayNonNullRowCount: number;
+    targetDayBlankUnitRowCount: number;
+    headerSectionIndex: number;
+    pendingRows: Array<{ observedAt: string; value: number; status: string | null; unit: string }>;
   };
   let columnBindings: ColumnBinding[] = [];
+  const mappedSelectedSourceLabelColumns: ColumnBinding[] = [];
+  let headerSectionIndex = 0;
+  let unselectedPollutantValueIndexes: number[] = [];
+  type SkippedSourceLabelColumn = {
+    valueIndex: number;
+    sourceLabel: string;
+    normalisedSourceLabel: string;
+    classification: "ignore" | "review" | "unregistered" | "mapped_out_of_scope";
+    units: Set<string>;
+    targetDayNonNullRowCount: number;
+  };
+  let skippedSourceLabelColumns: SkippedSourceLabelColumn[] = [];
+  const allSkippedSourceLabelColumns: SkippedSourceLabelColumn[] = [];
+  type MissingBindingSourceLabelColumn = {
+    valueIndex: number;
+    sourceLabel: string;
+    normalisedSourceLabel: string;
+    pollutantCode: string;
+    expectedUom: string;
+    units: Set<string>;
+    targetDayNonNullRowCount: number;
+    targetDayBlankUnitRowCount: number;
+    headerSectionIndex: number;
+  };
+  let missingBindingSourceLabelColumns: MissingBindingSourceLabelColumn[] = [];
+  const allMissingBindingSourceLabelColumns: MissingBindingSourceLabelColumn[] = [];
 
   for (const [lineIndex, line] of lines.entries()) {
     if (!line.trim()) continue;
@@ -8922,121 +9376,311 @@ export function parseUkAirFlatFileObservations(args: {
       String(cells[0] || "").toLowerCase() === "date" &&
       String(cells[1] || "").toLowerCase() === "time"
     ) {
+      headerSectionIndex += 1;
       columnBindings = [];
+      unselectedPollutantValueIndexes = [];
+      skippedSourceLabelColumns = [];
+      missingBindingSourceLabelColumns = [];
       for (let valueIndex = 2; valueIndex < cells.length; valueIndex += 3) {
         const sourceLabel = normalizeUkAirSourceLabel(cells[valueIndex] || "");
         if (!sourceLabel) continue;
-        const candidates = propertyMappingsByLabel.get(sourceLabel) || [];
-        if (!candidates.length) {
-          throw new Error(`unmapped_source_label connector_id=1 source_label=${JSON.stringify(sourceLabel)} site_ref=${args.siteRef} day_utc=${args.dayUtc}`);
-        }
-        const active = candidates.filter((mapping) => mapping.is_active);
-        if (!active.length) {
-          throw new Error(`source_label_inactive connector_id=1 source_label=${JSON.stringify(sourceLabel)} site_ref=${args.siteRef} day_utc=${args.dayUtc}`);
-        }
-        if (active.length !== 1) {
-          throw new Error(`source_label_ambiguous connector_id=1 source_label=${JSON.stringify(sourceLabel)} site_ref=${args.siteRef} day_utc=${args.dayUtc} matches=${active.length}`);
-        }
-        const property = active[0];
-        if (property.mapping_kind === "ignored") {
-          result.skipped_ignored_properties += 1;
+        const registryEntry = registryEntries?.get(sourceLabel);
+        const skipSourceLabel = (
+          classification: SkippedSourceLabelColumn["classification"],
+        ) => {
+          const skipped: SkippedSourceLabelColumn = {
+            valueIndex,
+            sourceLabel: String(cells[valueIndex] || "").trim(),
+            normalisedSourceLabel: sourceLabel,
+            classification,
+            units: new Set<string>(),
+            targetDayNonNullRowCount: 0,
+          };
+          skippedSourceLabelColumns.push(skipped);
+          allSkippedSourceLabelColumns.push(skipped);
+        };
+        if (registryEntry?.status === "ignore" || registryEntry?.status === "review") {
+          skipSourceLabel(registryEntry.status);
           continue;
         }
-        if (property.mapping_kind === "unknown") {
-          throw new Error(`source_label_unknown connector_id=1 source_label=${JSON.stringify(sourceLabel)} site_ref=${args.siteRef} day_utc=${args.dayUtc}`);
+        if (registryEntries && !registryEntry) {
+          skipSourceLabel("unregistered");
+          continue;
         }
-        if (property.mapping_kind === "meteorological") {
-          throw new Error(`unsupported_meteorological_mapping connector_id=1 source_label=${JSON.stringify(sourceLabel)} site_ref=${args.siteRef} day_utc=${args.dayUtc}`);
+        const candidates = propertyMappingsByLabel.get(sourceLabel) || [];
+        const active = candidates.filter((mapping) => mapping.is_active);
+        let property: ObservedPropertyMapping;
+        let pollutantCode: string;
+        let decisionSource: "integrity_registry" | "integrity_registry_and_core" | "core_mapping";
+        if (registryEntry?.status === "mapped") {
+          pollutantCode = String(registryEntry.pollutant_code || "");
+          if (!['pm25', 'pm10', 'no2', 'o3'].includes(pollutantCode) || !registryEntry.expected_uom?.trim()) {
+            throw new Error(`sos_source_label_registry_invalid_mapped_decision source_label=${JSON.stringify(sourceLabel)}`);
+          }
+          if (candidates.length) {
+            if (active.length !== 1) {
+              throw new Error(`source_label_ambiguous connector_id=1 source_label=${JSON.stringify(sourceLabel)} site_ref=${args.siteRef} day_utc=${args.dayUtc} matches=${active.length}`);
+            }
+            property = active[0];
+            if (property.mapping_kind !== "raw_observed_property" ||
+              String(property.observed_property_code || "").trim() !== pollutantCode) {
+              throw new Error(`sos_source_label_registry_mapping_mismatch source_label=${JSON.stringify(sourceLabel)} registry_pollutant_code=${pollutantCode} observed_property_code=${property.observed_property_code} mapping_kind=${property.mapping_kind}`);
+            }
+            decisionSource = "integrity_registry_and_core";
+          } else {
+            property = {
+              connector_id: 1, source_label: String(cells[valueIndex] || "").trim(),
+              source_uom: registryEntry.expected_uom, observed_property_id: null,
+              observed_property_code: pollutantCode, mapping_kind: "raw_observed_property",
+              is_aqi_eligible: ['pm25', 'pm10', 'no2'].includes(pollutantCode), is_active: true,
+            };
+            decisionSource = "integrity_registry";
+          }
+        } else {
+          if (!candidates.length) {
+            throw new Error(`unmapped_source_label connector_id=1 source_label=${JSON.stringify(sourceLabel)} site_ref=${args.siteRef} day_utc=${args.dayUtc}`);
+          }
+          if (active.length !== 1) {
+            throw new Error(`source_label_ambiguous connector_id=1 source_label=${JSON.stringify(sourceLabel)} site_ref=${args.siteRef} day_utc=${args.dayUtc} matches=${active.length}`);
+          }
+          property = active[0];
+          if (property.mapping_kind === "ignored") {
+            result.skipped_ignored_properties += 1;
+            continue;
+          }
+          if (property.mapping_kind !== "raw_observed_property") {
+            throw new Error(`unsupported_mapping_kind connector_id=1 source_label=${JSON.stringify(sourceLabel)} mapping_kind=${property.mapping_kind} site_ref=${args.siteRef} day_utc=${args.dayUtc}`);
+          }
+          pollutantCode = String(property.observed_property_code || "").trim();
+          decisionSource = "core_mapping";
         }
-        if (property.mapping_kind !== "raw_observed_property") {
-          throw new Error(`unsupported_mapping_kind connector_id=1 source_label=${JSON.stringify(sourceLabel)} mapping_kind=${property.mapping_kind} site_ref=${args.siteRef} day_utc=${args.dayUtc}`);
-        }
-        const pollutantCode = String(property.observed_property_code || "").trim();
         if (!/^[a-z0-9_]+$/.test(pollutantCode)) {
           throw new Error(`invalid_observed_property_code source_label=${JSON.stringify(sourceLabel)} observed_property_code=${JSON.stringify(pollutantCode)}`);
         }
+        if (
+          INTEGRITY_POLLUTANT_SCOPED_REPAIR &&
+          !INTEGRITY_REPAIR_POLLUTANTS.has(pollutantCode)
+        ) {
+          unselectedPollutantValueIndexes.push(valueIndex);
+          skipSourceLabel("mapped_out_of_scope");
+          continue;
+        }
         const timeseries = mappingsByPollutant.get(pollutantCode) || [];
         if (!timeseries.length) {
-          throw new Error(`unmapped_timeseries site_ref=${args.siteRef} source_label=${JSON.stringify(sourceLabel)} observed_property_code=${pollutantCode} day_utc=${args.dayUtc}`);
+          const skipped: MissingBindingSourceLabelColumn = {
+            valueIndex,
+            sourceLabel: String(cells[valueIndex] || "").trim(),
+            normalisedSourceLabel: sourceLabel,
+            pollutantCode,
+            expectedUom: String(
+              registryEntry?.expected_uom || property.source_uom || "",
+            ).trim(),
+            units: new Set<string>(),
+            targetDayNonNullRowCount: 0,
+            targetDayBlankUnitRowCount: 0,
+            headerSectionIndex,
+          };
+          missingBindingSourceLabelColumns.push(skipped);
+          allMissingBindingSourceLabelColumns.push(skipped);
+          continue;
         }
         if (timeseries.length !== 1) {
           throw new Error(`ambiguous_timeseries_mapping site_ref=${args.siteRef} source_label=${JSON.stringify(sourceLabel)} observed_property_code=${pollutantCode} day_utc=${args.dayUtc} matches=${timeseries.length}`);
         }
-        columnBindings.push({
+        const binding: ColumnBinding = {
           valueIndex,
           statusIndex: valueIndex + 1,
           unitIndex: valueIndex + 2,
+          sourceLabel: String(cells[valueIndex] || "").trim(),
+          normalisedSourceLabel: sourceLabel,
           property,
           timeseries: timeseries[0],
-        });
+          expectedUom: String(
+            registryEntry?.expected_uom || property.source_uom || "",
+          ).trim(),
+          decisionSource,
+          units: new Set<string>(),
+          targetDayNonNullRowCount: 0,
+          targetDayBlankUnitRowCount: 0,
+          headerSectionIndex,
+          pendingRows: [],
+        };
+        columnBindings.push(binding);
+        mappedSelectedSourceLabelColumns.push(binding);
       }
       continue;
     }
-    if (!columnBindings.length) continue;
+    if (
+      !columnBindings.length &&
+      !skippedSourceLabelColumns.length &&
+      !missingBindingSourceLabelColumns.length &&
+      !unselectedPollutantValueIndexes.length
+    ) continue;
 
-    const sourceDay = parseUkAirCsvDay(cells[0] || "");
-    if (!sourceDay) {
-      result.skipped_invalid_rows += 1;
-      result.blocked_target_day_rows += 1;
-      if (
-        result.blocked_target_day_row_samples.length <
-          INTEGRITY_SOURCE_EVIDENCE_SAMPLE_LIMIT
-      ) {
-        result.blocked_target_day_row_samples.push({
-          reason: "unparseable_observation_date",
-          site_ref: args.siteRef,
-          line_number: lineIndex + 1,
-          date: String(cells[0] || "").trim(),
-          time: String(cells[1] || "").trim(),
-        });
-      }
-      continue;
+    let observedAt: string;
+    try {
+      observedAt = parseUkAirObservedAtUtc(cells[0] || "", cells[1] || "");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `invalid_uk_air_observation_timestamp site_ref=${args.siteRef} ` +
+          `source_file=${JSON.stringify(args.sourceFile || null)} ` +
+          `line_number=${lineIndex + 1} ${message}`,
+      );
     }
+    const partitionDayUtc = observedAt.slice(0, 10);
     result.source_records += 1;
-    if (sourceDay !== args.dayUtc) {
+    // Unit evidence belongs to the header section, not only to the target
+    // day.  A blank target-day unit may inherit only this section's proven
+    // compatible non-empty unit evidence.
+    for (const binding of columnBindings) {
+      const value = toFiniteUkAirCsvNumber(cells[binding.valueIndex]);
+      if (value === null) continue;
+      const unit = String(cells[binding.unitIndex] || "").trim();
+      if (unit) binding.units.add(unit);
+    }
+    for (const skipped of missingBindingSourceLabelColumns) {
+      const value = toFiniteUkAirCsvNumber(cells[skipped.valueIndex]);
+      if (value === null) continue;
+      const unit = String(cells[skipped.valueIndex + 2] || "").trim();
+      if (unit) skipped.units.add(unit);
+    }
+    if (partitionDayUtc !== args.dayUtc) {
       result.skipped_other_days += 1;
       continue;
     }
-    const observedAt = parseUkAirGmtHourEnding(sourceDay, cells[1] || "");
-    if (!observedAt) {
-      result.skipped_invalid_rows += 1;
-      result.blocked_target_day_rows += 1;
-      if (
-        result.blocked_target_day_row_samples.length <
-          INTEGRITY_SOURCE_EVIDENCE_SAMPLE_LIMIT
-      ) {
-        result.blocked_target_day_row_samples.push({
-          reason: "invalid_gmt_hour_ending",
-          site_ref: args.siteRef,
-          line_number: lineIndex + 1,
-          date: String(cells[0] || "").trim(),
-          time: String(cells[1] || "").trim(),
-        });
+    for (const valueIndex of unselectedPollutantValueIndexes) {
+      if (toFiniteUkAirCsvNumber(cells[valueIndex]) !== null) {
+        result.skipped_unselected_pollutant_rows += 1;
       }
-      continue;
+    }
+    for (const skipped of skippedSourceLabelColumns) {
+      if (toFiniteUkAirCsvNumber(cells[skipped.valueIndex]) !== null) {
+        skipped.targetDayNonNullRowCount += 1;
+        const unit = String(cells[skipped.valueIndex + 2] || "").trim();
+        if (unit) skipped.units.add(unit);
+      }
+    }
+    for (const skipped of missingBindingSourceLabelColumns) {
+      if (toFiniteUkAirCsvNumber(cells[skipped.valueIndex]) !== null) {
+        skipped.targetDayNonNullRowCount += 1;
+        const unit = String(cells[skipped.valueIndex + 2] || "").trim();
+        if (!unit) skipped.targetDayBlankUnitRowCount += 1;
+      }
     }
     for (const binding of columnBindings) {
-      const value = toFiniteNumber(cells[binding.valueIndex]);
+      const value = toFiniteUkAirCsvNumber(cells[binding.valueIndex]);
       if (value === null) continue;
       const unit = String(cells[binding.unitIndex] || "").trim();
-      const expectedUnit = String(binding.property.source_uom || "").trim();
-      if (unit && expectedUnit && unit !== expectedUnit) {
-        throw new Error(`unit_mismatch connector_id=1 site_ref=${args.siteRef} day_utc=${args.dayUtc} source_label=${JSON.stringify(binding.property.source_label)} observed_property_code=${binding.property.observed_property_code} source_uom=${JSON.stringify(expectedUnit)} csv_uom=${JSON.stringify(unit)}`);
-      }
+      binding.targetDayNonNullRowCount += 1;
+      if (!unit) binding.targetDayBlankUnitRowCount += 1;
       if (unit) units.add(unit);
+      binding.pendingRows.push({ observedAt, value, unit, status: String(cells[binding.statusIndex] || "").trim() || null });
+    }
+  }
+  for (const binding of mappedSelectedSourceLabelColumns) {
+    const expectedUnit = binding.expectedUom;
+    const normalisedExpectedUnit = normaliseConcentrationUnitForComparison(expectedUnit);
+    const observedUnits = Array.from(binding.units).sort();
+    const normalisedUnits = observedUnits.map(normaliseConcentrationUnitForComparison);
+    const hasTargetDayValues = binding.targetDayNonNullRowCount > 0;
+    if (!expectedUnit || !normalisedExpectedUnit ||
+      (hasTargetDayValues && !observedUnits.length) ||
+      normalisedUnits.some((unit) => unit !== normalisedExpectedUnit)) {
+      throw new Error(`unit_mismatch connector_id=1 site_ref=${args.siteRef} day_utc=${args.dayUtc} source_label=${JSON.stringify(binding.sourceLabel)} observed_property_code=${binding.property.observed_property_code} header_section_index=${binding.headerSectionIndex} expected_raw_unit=${JSON.stringify(expectedUnit)} expected_normalised_unit=${JSON.stringify(normalisedExpectedUnit)} observed_raw_units=${JSON.stringify(observedUnits)} observed_normalised_units=${JSON.stringify(normalisedUnits)} target_day_non_null_row_count=${binding.targetDayNonNullRowCount} target_day_blank_unit_row_count=${binding.targetDayBlankUnitRowCount}`);
+    }
+    for (const row of binding.pendingRows) {
       result.rows.push({
         timeseries_id: binding.timeseries.timeseries_id,
         station_id: binding.timeseries.station_id,
         pollutant_code: String(binding.property.observed_property_code),
-        observed_at: observedAt,
-        value,
-        status: String(cells[binding.statusIndex] || "").trim() || null,
-        source_parameter: unit ? `uk_air_flat_file:${unit}` : "uk_air_flat_file",
+        observed_at: row.observedAt,
+        value: row.value,
+        status: row.status,
+        source_parameter: row.unit ? `uk_air_flat_file:${row.unit}` : `uk_air_flat_file:${expectedUnit}`,
       });
       result.mapped_records += 1;
     }
   }
   result.units = Array.from(units).sort();
+  for (const skipped of allMissingBindingSourceLabelColumns) {
+    if (skipped.targetDayNonNullRowCount <= 0) continue;
+    const expectedUnit = skipped.expectedUom;
+    const normalisedExpectedUnit = normaliseConcentrationUnitForComparison(
+      expectedUnit,
+    );
+    const observedUnits = Array.from(skipped.units).sort();
+    const normalisedUnits = observedUnits.map(
+      normaliseConcentrationUnitForComparison,
+    );
+    if (
+      !expectedUnit || !normalisedExpectedUnit || !observedUnits.length ||
+      normalisedUnits.some((unit) => unit !== normalisedExpectedUnit)
+    ) {
+      throw new Error(`unit_mismatch connector_id=1 site_ref=${args.siteRef} day_utc=${args.dayUtc} source_label=${JSON.stringify(skipped.sourceLabel)} observed_property_code=${skipped.pollutantCode} header_section_index=${skipped.headerSectionIndex} expected_raw_unit=${JSON.stringify(expectedUnit)} expected_normalised_unit=${JSON.stringify(normalisedExpectedUnit)} observed_raw_units=${JSON.stringify(observedUnits)} observed_normalised_units=${JSON.stringify(normalisedUnits)} target_day_non_null_row_count=${skipped.targetDayNonNullRowCount} target_day_blank_unit_row_count=${skipped.targetDayBlankUnitRowCount}`);
+    }
+  }
+  const missingBindingClassifications = allMissingBindingSourceLabelColumns
+    .filter((column) => column.targetDayNonNullRowCount > 0)
+    .map((column) => ({
+      source_label: column.sourceLabel,
+      normalised_source_label: column.normalisedSourceLabel,
+      classification: "no_authoritative_timeseries_binding",
+      reason: "no_authoritative_timeseries_binding",
+      site_ref: args.siteRef,
+      source_file: args.sourceFile || null,
+      pollutant_code: column.pollutantCode,
+      observed_units: Array.from(column.units).sort(),
+      target_day_non_null_row_count: column.targetDayNonNullRowCount,
+      target_day_blank_unit_row_count: column.targetDayBlankUnitRowCount,
+      header_section_index: column.headerSectionIndex,
+      section_normalised_units: Array.from(column.units).map(
+        normaliseConcentrationUnitForComparison,
+      ).sort(),
+      expected_unit: column.expectedUom,
+      expected_normalised_unit: normaliseConcentrationUnitForComparison(
+        column.expectedUom,
+      ),
+      possible_supported_pollutant_label: false,
+    }));
+  result.source_label_classifications = [
+    ...mappedSelectedSourceLabelColumns.map((column) => ({
+      source_label: column.sourceLabel,
+      normalised_source_label: column.normalisedSourceLabel,
+      classification: "mapped_selected",
+      site_ref: args.siteRef,
+      source_file: args.sourceFile || null,
+      observed_units: Array.from(column.units).sort(),
+      target_day_non_null_row_count: column.targetDayNonNullRowCount,
+      target_day_blank_unit_row_count: column.targetDayBlankUnitRowCount,
+      header_section_index: column.headerSectionIndex,
+      section_normalised_units: Array.from(column.units).map(normaliseConcentrationUnitForComparison).sort(),
+      expected_unit: column.expectedUom,
+      expected_normalised_unit: normaliseConcentrationUnitForComparison(column.expectedUom),
+      possible_supported_pollutant_label: false,
+      mapping_decision_source: column.decisionSource,
+    })),
+    ...allSkippedSourceLabelColumns.map((column) => ({
+      source_label: column.sourceLabel,
+      normalised_source_label: column.normalisedSourceLabel,
+      classification: column.classification,
+      site_ref: args.siteRef,
+      source_file: args.sourceFile || null,
+      observed_units: Array.from(column.units).sort(),
+      target_day_non_null_row_count: column.targetDayNonNullRowCount,
+      possible_supported_pollutant_label:
+        (column.classification === "review" || column.classification === "unregistered") &&
+        isPossibleSupportedSosSourceLabel(column.normalisedSourceLabel),
+    })),
+    ...missingBindingClassifications,
+  ];
+  result.missing_binding_groups = missingBindingClassifications.length;
+  result.missing_binding_rows = missingBindingClassifications.reduce(
+    (total, entry) => total + entry.target_day_non_null_row_count,
+    0,
+  );
+  result.selected_source_records_examined =
+    result.mapped_records + result.missing_binding_rows;
   return result;
 }
 
@@ -9303,13 +9947,17 @@ function normalizeSourceObservationForV2(
   };
 }
 
-function inspectIntegritySourceRowsForBlockingEvidence(
+export function inspectIntegritySourceRowsForBlockingEvidence(
   rows: SourceObservationRow[],
   connectorId: number,
 ): IntegrityDuplicateSourceEvidence {
-  const occurrencesByCanonicalKey = new Map<
+  const occurrencesByObservationIdentity = new Map<
     string,
-    { count: number; identities: Record<string, unknown>[] }
+    {
+      count: number;
+      canonicalIdentity: Record<string, unknown>;
+      valueStatusVariants: Map<string, Record<string, unknown>>;
+    }
   >();
   const blockedRowSamples: Record<string, unknown>[] = [];
   const duplicateCanonicalRowIdentitySamples: Record<string, unknown>[] = [];
@@ -9337,39 +9985,46 @@ function inspectIntegritySourceRowsForBlockingEvidence(
       continue;
     }
     canonicalObservationRows.push(canonical);
-    const canonicalIdentity = {
+    const observationIdentity = {
       connector_id: connectorId,
       station_id: canonical.station_id,
       timeseries_id: canonical.timeseries_id,
       pollutant_code: canonical.pollutant_code,
       observed_at: canonical.observed_at,
+    };
+    const valueStatusIdentity = {
       value: canonical.value,
       value_identity: normalizeObservationValueIdentity(canonical.value),
       status: canonical.status ?? null,
     };
-    const canonicalKey = JSON.stringify(canonicalIdentity);
-    const occurrence = occurrencesByCanonicalKey.get(canonicalKey) || {
+    const observationKey = JSON.stringify(observationIdentity);
+    const valueStatusKey = JSON.stringify(valueStatusIdentity);
+    const occurrence = occurrencesByObservationIdentity.get(observationKey) || {
       count: 0,
-      identities: [],
+      canonicalIdentity: observationIdentity,
+      valueStatusVariants: new Map<string, Record<string, unknown>>(),
     };
     occurrence.count += 1;
-    if (occurrence.identities.length < 2) {
-      occurrence.identities.push(canonicalIdentity);
-    }
-    occurrencesByCanonicalKey.set(canonicalKey, occurrence);
+    occurrence.valueStatusVariants.set(valueStatusKey, valueStatusIdentity);
+    occurrencesByObservationIdentity.set(observationKey, occurrence);
   }
 
   let duplicateCanonicalRowCount = 0;
-  for (const [canonicalKey, occurrence] of Array.from(
-    occurrencesByCanonicalKey.entries(),
+  for (const [, occurrence] of Array.from(
+    occurrencesByObservationIdentity.entries(),
   ).sort(([left], [right]) => left.localeCompare(right))) {
     if (occurrence.count <= 1) continue;
     duplicateCanonicalRowCount += occurrence.count - 1;
+    const conflicting = occurrence.valueStatusVariants.size > 1;
     const duplicateSample = {
-      reason: "duplicate_canonical_source_row",
-      canonical_identity: occurrence.identities[0],
+      reason: conflicting
+        ? "contradictory_duplicate_source_observation"
+        : "duplicate_canonical_source_row",
+      canonical_identity: occurrence.canonicalIdentity,
       duplicate_row_count: occurrence.count - 1,
-      identities: occurrence.identities,
+      value_status_variants: Array.from(
+        occurrence.valueStatusVariants.values(),
+      ),
     };
     if (
       duplicateCanonicalRowIdentitySamples.length <
@@ -9794,6 +10449,75 @@ async function readParquetColumnValues(
     },
   });
   return rows.map((entry) => Array.isArray(entry) ? entry[0] : undefined);
+}
+
+async function readCanonicalObservationRowsFromParquet(
+  bytes: Uint8Array,
+  { isSos }: { isSos: boolean },
+): Promise<Array<ReturnType<typeof normalizeCanonicalObservationRow>>> {
+  const file = toArrayBufferView(bytes);
+  const metadata = await parquetMetadataAsync(file);
+  const schemaColumns = parquetSchema(metadata).children.map((column) =>
+    column.element.name
+  );
+  const required = [
+    "connector_id",
+    "station_id",
+    "timeseries_id",
+    "pollutant_code",
+    "observed_at_utc",
+    "value",
+  ];
+  const missing = required.filter((column) => !schemaColumns.includes(column));
+  if (missing.length > 0) {
+    throw new Error(
+      `Observation Parquet is missing canonical columns: ${missing.join(",")}`,
+    );
+  }
+  const rowCount = Number(metadata.num_rows || 0);
+  const columnNames = [
+    ...required,
+    ...(schemaColumns.includes("verification_status")
+      ? ["verification_status"]
+      : schemaColumns.includes("status")
+      ? ["status"]
+      : []),
+  ];
+  const values = await Promise.all(
+    columnNames.map((column) =>
+      readParquetColumnValues(file, metadata, column, 0, rowCount)
+    ),
+  );
+  const byName = new Map(
+    columnNames.map((column, index) => [column, values[index]]),
+  );
+  const rows: Array<ReturnType<typeof normalizeCanonicalObservationRow>> = [];
+  for (let index = 0; index < rowCount; index += 1) {
+    const observedAtUtc = parseHistoryIsoTimestamp(
+      byName.get("observed_at_utc")?.[index],
+    );
+    const statusRow = schemaColumns.includes("verification_status")
+      ? {
+        verification_status:
+          byName.get("verification_status")?.[index] ?? null,
+      }
+      : schemaColumns.includes("status")
+      ? { status: byName.get("status")?.[index] ?? null }
+      : {};
+    rows.push(normalizeCanonicalObservationRow({
+      connector_id: byName.get("connector_id")?.[index],
+      station_id: byName.get("station_id")?.[index] ?? null,
+      timeseries_id: byName.get("timeseries_id")?.[index],
+      pollutant_code: byName.get("pollutant_code")?.[index],
+      observed_at_utc: observedAtUtc,
+      value: byName.get("value")?.[index],
+      verification_status: resolveLegacyVerificationStatus(
+        statusRow,
+        { isSos },
+      ),
+    }));
+  }
+  return rows;
 }
 
 function sortedTimeseriesIdsFromLookup(lookup: SourceConnectorLookup): number[] {
@@ -12763,124 +13487,44 @@ async function runSourceToAll(
   const sourceAcquisitionPendingDaySet = new Set<string>();
   const sourceProcessedDaySet = new Set<string>();
   const sourceFailedDaySet = new Set<string>();
-  const sourceAdapterByConnectorId = new Map<number, SourceAdapterKind>();
   let cachedBreatheLondonSensors: Record<string, unknown>[] | null = null;
-
-  if (BREATHELONDON_SOURCE_ENABLED) {
-    if (!BREATHELONDON_API_KEY) {
-      warnings.push(
-        "Breathe London source adapter enabled, but BREATHELONDON_API_KEY is missing; skipping Breathe London source adapter.",
-      );
-    } else {
-      const resolvedBreatheLondonConnectorId = await resolveConnectorIdByCode(
-        BREATHELONDON_CONNECTOR_CODE,
-      );
-      let breatheLondonConnectorId: number | null = null;
-      if (resolvedBreatheLondonConnectorId) {
-        breatheLondonConnectorId = resolvedBreatheLondonConnectorId;
-      } else if (
-        Number.isInteger(BREATHELONDON_CONNECTOR_ID_FALLBACK) &&
-        BREATHELONDON_CONNECTOR_ID_FALLBACK > 0
-      ) {
-        breatheLondonConnectorId = BREATHELONDON_CONNECTOR_ID_FALLBACK;
-        warnings.push(
-          `Could not resolve connector_code=${BREATHELONDON_CONNECTOR_CODE}; using fallback connector_id=${BREATHELONDON_CONNECTOR_ID_FALLBACK}.`,
-        );
-      } else {
-        warnings.push(
-          `Breathe London source adapter enabled, but connector_id could not be resolved from connector_code=${BREATHELONDON_CONNECTOR_CODE}; skipping Breathe London source adapter.`,
-        );
-      }
-      if (breatheLondonConnectorId) {
-        sourceAdapterByConnectorId.set(
-          breatheLondonConnectorId,
-          "breathelondon",
-        );
-      }
-    }
-  } else {
-    warnings.push(
-      "Breathe London source adapter is disabled by UK_AQ_BACKFILL_BREATHELONDON_SOURCE_ENABLED=false.",
-    );
-  }
-
-  if (SOS_SOURCE_ENABLED) {
-    const resolvedSosConnectorId = await resolveConnectorIdByCode(
-      SOS_CONNECTOR_CODE,
-    );
-    let sosConnectorId: number | null = null;
-    if (resolvedSosConnectorId) {
-      sosConnectorId = resolvedSosConnectorId;
-    } else if (
-      Number.isInteger(SOS_CONNECTOR_ID_FALLBACK) &&
-      SOS_CONNECTOR_ID_FALLBACK > 0
-    ) {
-      sosConnectorId = SOS_CONNECTOR_ID_FALLBACK;
-      warnings.push(
-        `Could not resolve connector_code=${SOS_CONNECTOR_CODE}; using fallback connector_id=${SOS_CONNECTOR_ID_FALLBACK}.`,
-      );
-    } else {
-      warnings.push(
-        `UK-AIR SOS source adapter enabled, but connector_id could not be resolved from connector_code=${SOS_CONNECTOR_CODE}; skipping UK-AIR SOS source adapter.`,
-      );
-    }
-    if (sosConnectorId) {
-      sourceAdapterByConnectorId.set(sosConnectorId, "sos");
-    }
-  } else {
-    warnings.push(
-      "UK-AIR SOS source adapter is disabled by UK_AQ_BACKFILL_SOS_SOURCE_ENABLED=false.",
-    );
-  }
-
-  if (SCOMM_SOURCE_ENABLED) {
-    const resolvedSensorcommunityConnectorId = await resolveConnectorIdByCode(
-      SCOMM_CONNECTOR_CODE,
-    );
-    const sensorcommunityConnectorId = resolvedSensorcommunityConnectorId || 7;
-    if (!resolvedSensorcommunityConnectorId) {
-      warnings.push(
-        `Could not resolve connector_code=${SCOMM_CONNECTOR_CODE} from core metadata; using fallback connector_id=7.`,
-      );
-    }
-    sourceAdapterByConnectorId.set(
-      sensorcommunityConnectorId,
-      "sensorcommunity",
-    );
-  } else {
-    warnings.push(
-      "Sensor.Community source adapter is disabled by UK_AQ_BACKFILL_SCOMM_SOURCE_ENABLED=false.",
-    );
-  }
-
-  if (OPENAQ_SOURCE_ENABLED) {
-    const resolvedOpenaqConnectorId = await resolveConnectorIdByCode(
-      OPENAQ_CONNECTOR_CODE,
-    );
-    let openaqConnectorId: number | null = null;
-    if (resolvedOpenaqConnectorId) {
-      openaqConnectorId = resolvedOpenaqConnectorId;
-    } else if (
-      Number.isInteger(OPENAQ_CONNECTOR_ID_FALLBACK) &&
-      OPENAQ_CONNECTOR_ID_FALLBACK > 0
-    ) {
-      openaqConnectorId = OPENAQ_CONNECTOR_ID_FALLBACK;
-      warnings.push(
-        `Could not resolve connector_code=${OPENAQ_CONNECTOR_CODE}; using fallback connector_id=${OPENAQ_CONNECTOR_ID_FALLBACK}.`,
-      );
-    } else {
-      warnings.push(
-        `OpenAQ source adapter enabled, but connector_id could not be resolved from connector_code=${OPENAQ_CONNECTOR_CODE}; skipping OpenAQ source adapter.`,
-      );
-    }
-    if (openaqConnectorId) {
-      sourceAdapterByConnectorId.set(openaqConnectorId, "openaq");
-    }
-  } else {
-    warnings.push(
-      "OpenAQ source adapter is disabled by UK_AQ_BACKFILL_OPENAQ_SOURCE_ENABLED=false.",
-    );
-  }
+  const resolvedSourceAdapters = await resolveSourceAdapterRegistry([
+    {
+      kind: "breathelondon", enabled: BREATHELONDON_SOURCE_ENABLED,
+      connectorCode: BREATHELONDON_CONNECTOR_CODE,
+      fallbackConnectorId: BREATHELONDON_CONNECTOR_ID_FALLBACK,
+      prerequisiteAvailable: Boolean(BREATHELONDON_API_KEY),
+      disabledWarning: "Breathe London source adapter is disabled by UK_AQ_BACKFILL_BREATHELONDON_SOURCE_ENABLED=false.",
+      missingPrerequisiteWarning: "Breathe London source adapter enabled, but BREATHELONDON_API_KEY is missing; skipping Breathe London source adapter.",
+      fallbackWarning: (id) => `Could not resolve connector_code=${BREATHELONDON_CONNECTOR_CODE}; using fallback connector_id=${id}.`,
+      unresolvedWarning: `Breathe London source adapter enabled, but connector_id could not be resolved from connector_code=${BREATHELONDON_CONNECTOR_CODE}; skipping Breathe London source adapter.`,
+    },
+    {
+      kind: "sos", enabled: SOS_SOURCE_ENABLED,
+      connectorCode: SOS_CONNECTOR_CODE,
+      fallbackConnectorId: SOS_CONNECTOR_ID_FALLBACK,
+      disabledWarning: "UK-AIR SOS source adapter is disabled by UK_AQ_BACKFILL_SOS_SOURCE_ENABLED=false.",
+      fallbackWarning: (id) => `Could not resolve connector_code=${SOS_CONNECTOR_CODE}; using fallback connector_id=${id}.`,
+      unresolvedWarning: `UK-AIR SOS source adapter enabled, but connector_id could not be resolved from connector_code=${SOS_CONNECTOR_CODE}; skipping UK-AIR SOS source adapter.`,
+    },
+    {
+      kind: "sensorcommunity", enabled: SCOMM_SOURCE_ENABLED,
+      connectorCode: SCOMM_CONNECTOR_CODE, fallbackConnectorId: 7,
+      disabledWarning: "Sensor.Community source adapter is disabled by UK_AQ_BACKFILL_SCOMM_SOURCE_ENABLED=false.",
+      fallbackWarning: (id) => `Could not resolve connector_code=${SCOMM_CONNECTOR_CODE} from core metadata; using fallback connector_id=${id}.`,
+      unresolvedWarning: `Sensor.Community source adapter enabled, but connector_id could not be resolved from connector_code=${SCOMM_CONNECTOR_CODE}.`,
+    },
+    {
+      kind: "openaq", enabled: OPENAQ_SOURCE_ENABLED,
+      connectorCode: OPENAQ_CONNECTOR_CODE,
+      fallbackConnectorId: OPENAQ_CONNECTOR_ID_FALLBACK,
+      disabledWarning: "OpenAQ source adapter is disabled by UK_AQ_BACKFILL_OPENAQ_SOURCE_ENABLED=false.",
+      fallbackWarning: (id) => `Could not resolve connector_code=${OPENAQ_CONNECTOR_CODE}; using fallback connector_id=${id}.`,
+      unresolvedWarning: `OpenAQ source adapter enabled, but connector_id could not be resolved from connector_code=${OPENAQ_CONNECTOR_CODE}; skipping OpenAQ source adapter.`,
+    },
+  ], resolveConnectorIdByCode);
+  const sourceAdapterByConnectorId = resolvedSourceAdapters.registry;
+  warnings.push(...resolvedSourceAdapters.warnings);
 
   const defaultConnectors = Array.from(sourceAdapterByConnectorId.keys()).sort((
     left,
@@ -12921,6 +13565,49 @@ async function runSourceToAll(
   let connectorDayComplete = 0;
   let connectorDaySkipped = 0;
   let connectorDayError = 0;
+  const firstValueAtReconciliationTotals = {
+    connector_day_count: 0,
+    failed_connector_day_count: 0,
+    candidate_timeseries_count: 0,
+    payload_chunk_count: 0,
+    ingestdb: {
+      submitted_count: 0,
+      rpc_call_count: 0,
+      matched_count: 0,
+      would_update_count: 0,
+      updated_count: 0,
+      unchanged_count: 0,
+    },
+    obs_aqidb: {
+      submitted_count: 0,
+      rpc_call_count: 0,
+      matched_count: 0,
+      would_update_count: 0,
+      updated_count: 0,
+      unchanged_count: 0,
+    },
+  };
+  const recordFirstValueAtReconciliation = (
+    result: FirstValueAtReconciliationSummary,
+  ) => {
+    firstValueAtReconciliationTotals.connector_day_count += 1;
+    firstValueAtReconciliationTotals.failed_connector_day_count +=
+      result.status === "failed" ? 1 : 0;
+    firstValueAtReconciliationTotals.candidate_timeseries_count +=
+      result.candidate_timeseries_count;
+    firstValueAtReconciliationTotals.payload_chunk_count +=
+      result.payload_chunk_count;
+    for (const databaseKind of ["ingestdb", "obs_aqidb"] as const) {
+      const totals = firstValueAtReconciliationTotals[databaseKind];
+      const databaseResult = result[databaseKind];
+      totals.submitted_count += databaseResult.submitted_count;
+      totals.rpc_call_count += databaseResult.rpc_call_count;
+      totals.matched_count += databaseResult.matched_count;
+      totals.would_update_count += databaseResult.would_update_count;
+      totals.updated_count += databaseResult.updated_count;
+      totals.unchanged_count += databaseResult.unchanged_count;
+    }
+  };
   const sensorcommunityArchiveIndexByDay = new Map<
     string,
     SensorcommunityArchiveIndexResult
@@ -12937,6 +13624,9 @@ async function runSourceToAll(
       if (!sourceAdapter) {
         continue;
       }
+      const sosRegistry = sourceAdapter === "sos"
+        ? loadSosSourceLabelRegistrySnapshot()
+        : null;
 
       try {
         const existingObsManifest = await loadExistingConnectorManifest(
@@ -12948,6 +13638,22 @@ async function runSourceToAll(
           connectorId,
         );
         if (!FORCE_REPLACE && existingObsManifest && existingAqiManifest) {
+          if (!INTEGRITY_PROPOSAL_MODE && HISTORY_R2_WRITE_VERSION === "v2") {
+            const verifiedRows =
+              await loadVerifiedR2ObservationRowsForConnectorDay(
+                dayUtc,
+                connectorId,
+                true,
+              );
+            const reconciliation = await reconcileTimeseriesFirstValueAt({
+              connector_id: connectorId,
+              rows: verifiedRows,
+              dry_run: DRY_RUN,
+              day_utc: dayUtc,
+              r2_verification: DRY_RUN ? "dry_run" : "unchanged_verified",
+            });
+            recordFirstValueAtReconciliation(reconciliation);
+          }
           connectorDaySkipped += 1;
           logStructured("info", "source_to_r2_connector_day_skipped_existing", {
             run_id: runId,
@@ -13709,10 +14415,14 @@ async function runSourceToAll(
             lookup.binding_by_timeseries_ref.values(),
           )
             .filter((binding) => candidateStationRefs.has(binding.station_ref))
-            .filter((binding) => INTEGRITY_COMPLETE_CONNECTOR_DAY ||
-              binding.pollutant_code === "no2" ||
-              binding.pollutant_code === "pm25" ||
-              binding.pollutant_code === "pm10")
+            .filter((binding) =>
+              INTEGRITY_POLLUTANT_SCOPED_REPAIR
+                ? INTEGRITY_REPAIR_POLLUTANTS.has(binding.pollutant_code)
+                : INTEGRITY_COMPLETE_CONNECTOR_DAY ||
+                  binding.pollutant_code === "no2" ||
+                  binding.pollutant_code === "pm25" ||
+                  binding.pollutant_code === "pm10"
+            )
             .sort((left, right) => {
               const stationCompare = left.station_ref.localeCompare(
                 right.station_ref,
@@ -13834,6 +14544,45 @@ async function runSourceToAll(
           }
           const observedPropertyMappings =
             await loadR2CoreObservedPropertyMappings();
+          const authoritativeMappingInput = validFlatFileMappings.map((row) => ({
+            site_ref: row.site_ref,
+            uk_air_ref: row.uk_air_ref,
+            station_id: row.station_id,
+            timeseries_id: row.timeseries_id,
+            station_ref: row.station_ref,
+            timeseries_ref: row.timeseries_ref,
+            pollutant_code: row.pollutant_code,
+            valid_from_day_utc: row.valid_from_day_utc,
+            valid_to_day_utc: row.valid_to_day_utc,
+          })).sort((left, right) =>
+            canonicalRegistryJson(left).localeCompare(canonicalRegistryJson(right))
+          );
+          const observedPropertyMappingInput = observedPropertyMappings
+            .filter((row) => row.connector_id === connectorId)
+            .map((row) => ({
+              connector_id: row.connector_id,
+              source_label: row.source_label,
+              source_uom: row.source_uom,
+              observed_property_id: row.observed_property_id,
+              observed_property_code: row.observed_property_code,
+              mapping_kind: row.mapping_kind,
+              is_aqi_eligible: row.is_aqi_eligible,
+              is_active: row.is_active,
+            }))
+            .sort((left, right) =>
+              canonicalRegistryJson(left).localeCompare(canonicalRegistryJson(right))
+            );
+          sourceCheckpointJson.authoritative_station_timeseries_mapping_sha256 =
+            deterministicSemanticHash(authoritativeMappingInput);
+          const importedSiteRefBridge = loadSosSiteRefBridgeSnapshot();
+          sourceCheckpointJson.sos_site_ref_bridge_mapping_identity =
+            importedSiteRefBridge?.mapping_identity || null;
+          sourceCheckpointJson.sos_site_ref_bridge_artifact_sha256 =
+            importedSiteRefBridge?.mapping_hash || null;
+          sourceCheckpointJson.sos_site_ref_bridge_content_sha256 =
+            importedSiteRefBridge?.content_hash || null;
+          sourceCheckpointJson.observed_property_mapping_sha256 =
+            deterministicSemanticHash(observedPropertyMappingInput);
 
           if (!SOS_FLAT_FILE_ROOT) {
             throw new Error(
@@ -13870,48 +14619,250 @@ async function runSourceToAll(
           const flatFileSiteRefs = Array.from(
             new Set(validFlatFileMappings.map((row) => row.site_ref.toUpperCase())),
           ).sort();
+          const flatFileSourceYearSelection =
+            requiredUkAirAnnualSourceYears([dayUtc]);
+          const flatFileSourceYears = flatFileSourceYearSelection.years;
+          logStructured("info", "source_to_r2_sos_flat_file_source_years", {
+            run_id: runId,
+            day_utc: dayUtc,
+            connector_id: connectorId,
+            source_adapter: "sos",
+            source_years: flatFileSourceYears,
+            source_dates: flatFileSourceYearSelection.source_dates,
+            reasons_by_year: flatFileSourceYearSelection.reasons_by_year,
+            previous_year_boundary_days:
+              flatFileSourceYearSelection.previous_year_boundary_days,
+          });
           let flatFileSourceRecords = 0;
           let flatFileSkippedOtherDays = 0;
           let flatFileSkippedInvalidRows = 0;
+          let flatFileSkippedUnselectedPollutantRows = 0;
+          let flatFileSelectedSourceRecordsExamined = 0;
+          let flatFileMissingBindingGroups = 0;
+          let flatFileMissingBindingRows = 0;
           let flatFileBlockedTargetDayRows = 0;
+          const flatFileSourceLabelClassifications: Array<Record<string, unknown>> = [];
           const flatFileBlockedTargetDayRowSamples: Record<string, unknown>[] = [];
           const flatFileUnits = new Set<string>();
           for (const siteRef of flatFileSiteRefs) {
-            const csvPath = ukAirFlatFilePath(
-              SOS_FLAT_FILE_ROOT,
-              siteRef,
-              Number(dayUtc.slice(0, 4)),
-            );
-            sourceFilesEnumerated.push(csvPath);
-            sourceFilesRequired.push(csvPath);
-            if (!fs.existsSync(csvPath) || fs.statSync(csvPath).size <= 0) {
-              throw new Error(`UK-AIR annual CSV cache is missing or empty: ${csvPath}`);
-            }
-            const csvText = fs.readFileSync(csvPath, "utf8");
-            sourceFilesRead.push(csvPath);
-            recordSourceFileRead(csvPath, csvText);
-            const parsed = parseUkAirFlatFileObservations({
-              dayUtc,
-              siteRef,
-              csvText,
-              mappings: validFlatFileMappings,
-              propertyMappings: observedPropertyMappings,
-            });
-            appendRowsSafe(flatFileRows, parsed.rows);
-            flatFileSourceRecords += parsed.source_records;
-            flatFileSkippedOtherDays += parsed.skipped_other_days;
-            flatFileSkippedInvalidRows += parsed.skipped_invalid_rows;
-            flatFileBlockedTargetDayRows += parsed.blocked_target_day_rows;
-            for (const sample of parsed.blocked_target_day_row_samples) {
-              if (
-                flatFileBlockedTargetDayRowSamples.length >=
-                  INTEGRITY_SOURCE_EVIDENCE_SAMPLE_LIMIT
-              ) {
-                break;
+            for (const sourceYear of flatFileSourceYears) {
+              const csvPath = ukAirFlatFilePath(
+                SOS_FLAT_FILE_ROOT,
+                siteRef,
+                sourceYear,
+              );
+              sourceFilesEnumerated.push(csvPath);
+              sourceFilesRequired.push(csvPath);
+              if (!fs.existsSync(csvPath) || fs.statSync(csvPath).size <= 0) {
+                throw new Error(
+                  `UK-AIR annual CSV cache is missing or empty: ${csvPath}`,
+                );
               }
-              flatFileBlockedTargetDayRowSamples.push(sample);
+              const csvText = fs.readFileSync(csvPath, "utf8");
+              sourceFilesRead.push(csvPath);
+              recordSourceFileRead(csvPath, csvText);
+              const parsed = parseUkAirFlatFileObservations({
+                dayUtc,
+                siteRef,
+                sourceFile: path.basename(csvPath),
+                csvText,
+                mappings: validFlatFileMappings,
+                propertyMappings: observedPropertyMappings,
+              });
+              appendRowsSafe(flatFileRows, parsed.rows);
+              flatFileSourceRecords += parsed.source_records;
+              flatFileSkippedOtherDays += parsed.skipped_other_days;
+              flatFileSkippedInvalidRows += parsed.skipped_invalid_rows;
+              flatFileSkippedUnselectedPollutantRows +=
+                parsed.skipped_unselected_pollutant_rows;
+              flatFileSelectedSourceRecordsExamined +=
+                parsed.selected_source_records_examined;
+              flatFileSourceLabelClassifications.push(
+                ...parsed.source_label_classifications,
+              );
+              flatFileBlockedTargetDayRows += parsed.blocked_target_day_rows;
+              for (const sample of parsed.blocked_target_day_row_samples) {
+                if (
+                  flatFileBlockedTargetDayRowSamples.length >=
+                    INTEGRITY_SOURCE_EVIDENCE_SAMPLE_LIMIT
+                ) {
+                  break;
+                }
+                flatFileBlockedTargetDayRowSamples.push(sample);
+              }
+              parsed.units.forEach((unit) => flatFileUnits.add(unit));
             }
-            parsed.units.forEach((unit) => flatFileUnits.add(unit));
+          }
+          const sourceLabelClassificationSummary = new Map<string, {
+            classification: string;
+            normalised_source_label: string;
+            raw_label_variants: Set<string>;
+            site_refs: Set<string>;
+            observed_units: Set<string>;
+            target_day_non_null_row_count: number;
+            target_day_blank_unit_row_count: number;
+            section_unit_evidence: Map<string, Record<string, unknown>>;
+            possible_supported_pollutant_label: boolean;
+            pollutant_codes: Set<string>;
+            header_section_indexes: Set<number>;
+          }>();
+          for (const entry of flatFileSourceLabelClassifications) {
+            const classification = String(entry.classification || "");
+            const normalised = String(entry.normalised_source_label || "");
+            const sourceFile = String(entry.source_file || "");
+            const key = classification === "no_authoritative_timeseries_binding"
+              ? `${classification}|${sourceFile}|${String(entry.site_ref || "")}|${normalised}|${String(entry.pollutant_code || "")}|${Number(entry.header_section_index || 0)}`
+              : `${classification}|${normalised}`;
+            const summary = sourceLabelClassificationSummary.get(key) || {
+              classification,
+              normalised_source_label: normalised,
+              raw_label_variants: new Set<string>(),
+              site_refs: new Set<string>(),
+              observed_units: new Set<string>(),
+              target_day_non_null_row_count: 0,
+              target_day_blank_unit_row_count: 0,
+              section_unit_evidence: new Map<string, Record<string, unknown>>(),
+              possible_supported_pollutant_label: false,
+              pollutant_codes: new Set<string>(),
+              header_section_indexes: new Set<number>(),
+            };
+            if (entry.source_label) summary.raw_label_variants.add(String(entry.source_label));
+            if (entry.site_ref) summary.site_refs.add(String(entry.site_ref));
+            for (const unit of Array.isArray(entry.observed_units) ? entry.observed_units : []) {
+              summary.observed_units.add(String(unit));
+            }
+            summary.target_day_non_null_row_count += Number(entry.target_day_non_null_row_count || 0);
+            summary.target_day_blank_unit_row_count += Number(entry.target_day_blank_unit_row_count || 0);
+            if (entry.pollutant_code) summary.pollutant_codes.add(String(entry.pollutant_code));
+            if (entry.header_section_index !== undefined) {
+              summary.header_section_indexes.add(Number(entry.header_section_index));
+            }
+            if (entry.header_section_index !== undefined) {
+              const section = {
+                source_file: sourceFile,
+                site_ref: String(entry.site_ref || ""),
+                header_section_index: Number(entry.header_section_index),
+                target_day_non_null_row_count: Number(entry.target_day_non_null_row_count || 0),
+                target_day_blank_unit_row_count: Number(entry.target_day_blank_unit_row_count || 0),
+                section_non_empty_units: Array.isArray(entry.observed_units) ? entry.observed_units : [],
+                section_normalised_units: Array.isArray(entry.section_normalised_units) ? entry.section_normalised_units : [],
+                expected_unit: entry.expected_unit || null,
+                expected_normalised_unit: entry.expected_normalised_unit || null,
+              };
+              summary.section_unit_evidence.set(
+                `${section.source_file}|${section.site_ref}|${section.header_section_index}`,
+                section,
+              );
+            }
+            summary.possible_supported_pollutant_label ||= Boolean(entry.possible_supported_pollutant_label);
+            sourceLabelClassificationSummary.set(key, summary);
+          }
+          const sourceLabelClassifications = Array.from(sourceLabelClassificationSummary.values())
+            .map((entry) => {
+              const base = {
+                classification: entry.classification,
+                normalised_source_label: entry.normalised_source_label,
+                raw_label_variants: Array.from(entry.raw_label_variants).sort(),
+                site_count: entry.site_refs.size,
+                site_refs: Array.from(entry.site_refs).sort().slice(0, INTEGRITY_SOURCE_EVIDENCE_SAMPLE_LIMIT),
+                observed_units: Array.from(entry.observed_units).sort(),
+                target_day_non_null_row_count: entry.target_day_non_null_row_count,
+                target_day_blank_unit_row_count: entry.target_day_blank_unit_row_count,
+                section_unit_evidence: Array.from(entry.section_unit_evidence.values()),
+                possible_supported_pollutant_label: entry.possible_supported_pollutant_label,
+              };
+              if (entry.classification !== "no_authoritative_timeseries_binding") {
+                return base;
+              }
+              return {
+                ...base,
+                reason: "no_authoritative_timeseries_binding",
+                source_label: Array.from(entry.raw_label_variants)[0] || "",
+                site_ref: Array.from(entry.site_refs)[0] || "",
+                pollutant_code: Array.from(entry.pollutant_codes)[0] || "",
+                header_section_index: Array.from(entry.header_section_indexes)[0] || 0,
+              };
+            })
+            .sort((left, right) => `${left.classification}|${left.normalised_source_label}`.localeCompare(`${right.classification}|${right.normalised_source_label}`));
+          const missingBindingSourceLabels = sourceLabelClassifications.filter(
+            (entry) => entry.classification === "no_authoritative_timeseries_binding",
+          );
+          flatFileMissingBindingGroups = missingBindingSourceLabels.length;
+          flatFileMissingBindingRows = missingBindingSourceLabels.reduce(
+            (total, entry) =>
+              total + Number(entry.target_day_non_null_row_count || 0),
+            0,
+          );
+          const sourceLabelClassificationCounts = Object.fromEntries(
+            ["mapped_selected", "mapped_out_of_scope", "ignore", "review", "unregistered"].map((classification) => [
+              classification,
+              sourceLabelClassifications.filter((entry) => entry.classification === classification).length,
+            ]),
+          );
+          const sourceLabelTargetDayRowCounts = Object.fromEntries(
+            ["mapped_selected", "mapped_out_of_scope", "ignore", "review", "unregistered"].map((classification) => [
+              classification,
+              sourceLabelClassifications
+                .filter((entry) => entry.classification === classification)
+                .reduce((total, entry) => total + Number(entry.target_day_non_null_row_count || 0), 0),
+            ]),
+          );
+          const sourceLabelSummary = {
+            mapped_selected_label_count: sourceLabelClassificationCounts.mapped_selected,
+            mapped_selected_target_day_row_count: sourceLabelTargetDayRowCounts.mapped_selected,
+            mapped_out_of_scope_label_count: sourceLabelClassificationCounts.mapped_out_of_scope,
+            mapped_out_of_scope_target_day_row_count: sourceLabelTargetDayRowCounts.mapped_out_of_scope,
+            known_ignored_source_label_count: sourceLabelClassificationCounts.ignore,
+            known_ignored_target_day_row_count: sourceLabelTargetDayRowCounts.ignore,
+            review_source_label_count: sourceLabelClassificationCounts.review,
+            review_target_day_row_count: sourceLabelTargetDayRowCounts.review,
+            unregistered_source_label_count: sourceLabelClassificationCounts.unregistered,
+            unregistered_target_day_row_count: sourceLabelTargetDayRowCounts.unregistered,
+          };
+          if (flatFileMissingBindingGroups > 0) {
+            sourceLabelClassificationCounts.no_authoritative_timeseries_binding =
+              flatFileMissingBindingGroups;
+            sourceLabelTargetDayRowCounts.no_authoritative_timeseries_binding =
+              flatFileMissingBindingRows;
+            Object.assign(sourceLabelSummary, {
+              missing_binding_groups: flatFileMissingBindingGroups,
+              missing_binding_rows: flatFileMissingBindingRows,
+            });
+          }
+          const reviewSourceLabels = sourceLabelClassifications.filter((entry) =>
+            entry.classification === "review" || entry.classification === "unregistered"
+          );
+          if (reviewSourceLabels.length) {
+            logStructured("warning", "source_to_r2_sos_source_labels_require_review", {
+              run_id: runId,
+              day_utc: dayUtc,
+              connector_id: connectorId,
+              source_adapter: "sos",
+              review_source_label_count: reviewSourceLabels.length,
+              review_target_day_row_count: reviewSourceLabels.reduce(
+                (total, entry) => total + Number(entry.target_day_non_null_row_count || 0),
+                0,
+              ),
+              samples: reviewSourceLabels.slice(0, INTEGRITY_SOURCE_EVIDENCE_SAMPLE_LIMIT),
+            });
+          }
+          if (missingBindingSourceLabels.length) {
+            logStructured(
+              "warning",
+              "source_to_r2_sos_no_authoritative_timeseries_binding",
+              {
+                run_id: runId,
+                day_utc: dayUtc,
+                connector_id: connectorId,
+                source_adapter: "sos",
+                missing_binding_groups: flatFileMissingBindingGroups,
+                missing_binding_rows: flatFileMissingBindingRows,
+                samples: missingBindingSourceLabels.slice(
+                  0,
+                  INTEGRITY_SOURCE_EVIDENCE_SAMPLE_LIMIT,
+                ),
+              },
+            );
           }
           const flatRowsByTimeseries = new Map<number, SourceObservationRow[]>();
           for (const row of flatFileRows) {
@@ -13948,9 +14899,17 @@ async function runSourceToAll(
             source_kind: "uk_air_flat_file",
             site_ref_count: flatFileSiteRefs.length,
             source_records: flatFileSourceRecords,
+            source_csv_records_scanned: flatFileSourceRecords,
+            source_records_examined: flatFileSelectedSourceRecordsExamined,
             mapped_records: flatFileRows.length,
             skipped_other_days: flatFileSkippedOtherDays,
             skipped_invalid_rows: flatFileSkippedInvalidRows,
+            skipped_unselected_pollutant_rows:
+              flatFileSkippedUnselectedPollutantRows,
+            missing_binding_groups: flatFileMissingBindingGroups,
+            missing_binding_rows: flatFileMissingBindingRows,
+            source_label_classifications: sourceLabelClassifications,
+            source_label_summary: sourceLabelSummary,
             units: Array.from(flatFileUnits).sort(),
           });
           let totalRawPoints = 0;
@@ -14033,6 +14992,13 @@ async function runSourceToAll(
           sourceCheckpointJson.flat_file_mapping_site_refs = Array.from(
             new Set(validFlatFileMappings.map((row) => row.site_ref)),
           ).sort();
+          sourceCheckpointJson.flat_file_source_years = flatFileSourceYears;
+          sourceCheckpointJson.flat_file_source_dates =
+            flatFileSourceYearSelection.source_dates;
+          sourceCheckpointJson.flat_file_source_year_reasons =
+            flatFileSourceYearSelection.reasons_by_year;
+          sourceCheckpointJson.flat_file_previous_year_boundary_days =
+            flatFileSourceYearSelection.previous_year_boundary_days;
           sourceCheckpointJson.candidate_station_ref_count =
             candidateStationRefs.size;
           sourceCheckpointJson.candidate_timeseries_count =
@@ -14052,6 +15018,29 @@ async function runSourceToAll(
           sourceCheckpointJson.total_skipped_null_value = totalSkippedNullValue;
           sourceCheckpointJson.total_skipped_invalid_rows =
             flatFileSkippedInvalidRows;
+          sourceCheckpointJson.total_skipped_unselected_pollutant_rows =
+            flatFileSkippedUnselectedPollutantRows;
+          sourceCheckpointJson.source_csv_records_scanned = flatFileSourceRecords;
+          sourceCheckpointJson.selected_source_records_examined =
+            flatFileSelectedSourceRecordsExamined;
+          sourceCheckpointJson.total_skipped_no_authoritative_timeseries_binding =
+            flatFileMissingBindingRows;
+          sourceCheckpointJson.missing_binding_groups =
+            flatFileMissingBindingGroups;
+          sourceCheckpointJson.missing_binding_rows = flatFileMissingBindingRows;
+          sourceCheckpointJson.sos_source_label_registry_file =
+            sosRegistry?.source_file || null;
+          sourceCheckpointJson.sos_source_label_registry_file_sha256 =
+            sosRegistry?.file_sha256 || null;
+          sourceCheckpointJson.sos_source_label_registry_content_sha256 =
+            sosRegistry?.content_sha256 || null;
+          sourceCheckpointJson.sos_source_label_classification_counts =
+            sourceLabelClassificationCounts;
+          sourceCheckpointJson.sos_source_label_target_day_row_counts =
+            sourceLabelTargetDayRowCounts;
+          sourceCheckpointJson.sos_source_label_summary = sourceLabelSummary;
+          sourceCheckpointJson.sos_source_label_classifications =
+            sourceLabelClassifications;
           sourceCheckpointJson.source_adapter_blocked_row_count =
             flatFileBlockedTargetDayRows;
           sourceCheckpointJson.source_adapter_blocked_row_samples =
@@ -14093,6 +15082,45 @@ async function runSourceToAll(
         let obsHistoryRows = sourceObservationsToObsHistoryRows(
           canonicalObservationRows,
         );
+        const observationContentHashes: Record<string, Record<string, unknown>> =
+          {};
+        if (INTEGRITY_COMPLETE_CONNECTOR_DAY && obsHistoryRows.length > 0) {
+          const canonicalRowsForEvidence: ObsHistoryRow[] = [];
+          const sourceGroups = groupObservationRowsByPollutant(obsHistoryRows);
+          for (
+            const [pollutantCode, pollutantRows] of Array.from(
+              sourceGroups.entries(),
+            ).sort(([left], [right]) => left.localeCompare(right))
+          ) {
+            const hashResult = computeObservationContentHash(
+              pollutantRows.map((row) => normalizeCanonicalObservationRow({
+                connector_id: connectorId,
+                station_id: row.station_id ?? null,
+                timeseries_id: row.timeseries_id,
+                pollutant_code: pollutantCode,
+                observed_at_utc: new Date(row.observed_at).toISOString(),
+                value: row.value,
+                verification_status: sourceAdapter === "sos"
+                  ? normalizeUkAirVerificationStatus(row.status ?? null)
+                  : null,
+              })),
+            );
+            const {
+              canonical_rows: canonicalRows,
+              ...hashEvidence
+            } = hashResult;
+            observationContentHashes[pollutantCode] = hashEvidence;
+            canonicalRowsForEvidence.push(...canonicalRows.map((row) => ({
+              timeseries_id: row.timeseries_id,
+              station_id: row.station_id,
+              pollutant_code: row.pollutant_code,
+              observed_at: row.observed_at_utc,
+              value: row.value,
+              verification_status: row.verification_status,
+            })));
+          }
+          obsHistoryRows = canonicalRowsForEvidence;
+        }
         let aqilevelRows: AqilevelsHistoryRow[] = [];
         let integrityProposalActiveForConnectorDay =
           INTEGRITY_COMPLETE_CONNECTOR_DAY;
@@ -14132,12 +15160,15 @@ async function runSourceToAll(
           const skippedRowCount = Object.entries(sourceCheckpointJson)
             .filter(([key, value]) => key.startsWith("total_skipped_") && Number.isFinite(Number(value)))
             .reduce((total, [, value]) => total + Number(value), 0);
-          const sourceAdapterBlockedRowCount = INTEGRITY_POLLUTANT_SCOPED_REPAIR
-            ? 0
-            : Number(sourceCheckpointJson.source_adapter_blocked_row_count || 0);
-          const outOfScopeSourceAdapterBlockedRowCount = INTEGRITY_POLLUTANT_SCOPED_REPAIR
-            ? Number(sourceCheckpointJson.source_adapter_blocked_row_count || 0)
-            : 0;
+          const reconciledSourceAdapterBlockedRows =
+            reconcileIntegritySourceAdapterBlockedRows({
+              raw: sourceCheckpointJson.source_adapter_blocked_row_count,
+              scoped: INTEGRITY_POLLUTANT_SCOPED_REPAIR,
+            });
+          const sourceAdapterBlockedRowCount =
+            reconciledSourceAdapterBlockedRows.selected;
+          const outOfScopeSourceAdapterBlockedRowCount =
+            reconciledSourceAdapterBlockedRows.outOfScope;
           const sourceAdapterBlockedRowSamples = Array.isArray(
             sourceCheckpointJson.source_adapter_blocked_row_samples,
           )
@@ -14149,7 +15180,7 @@ async function runSourceToAll(
           const blockedRowCount =
             duplicateSourceEvidence.duplicate_canonical_row_count +
             duplicateSourceEvidence.uncanonicalisable_source_row_count +
-            sourceAdapterBlockedRowCount;
+            reconciledSourceAdapterBlockedRows.blocking;
           const blockedRowSamples = [
             ...duplicateSourceEvidence.blocked_row_samples,
             ...sourceAdapterBlockedRowSamples,
@@ -14162,14 +15193,93 @@ async function runSourceToAll(
             );
           }
           const sourceFileIdentitiesJson = JSON.stringify(sourceFileIdentityList);
+          const sourceFileIdentitiesSha256 = sha256Hex(sourceFileIdentitiesJson);
+          const sourceEvidenceContract = INTEGRITY_POLLUTANT_SCOPED_REPAIR
+            ? "pollutant_scoped_authoritative_connector_day_source_rows"
+            : "complete_authoritative_connector_day_source_rows";
+          const requestedPollutantSet = INTEGRITY_POLLUTANT_SCOPED_REPAIR
+            ? Array.from(INTEGRITY_REPAIR_POLLUTANTS).sort()
+            : [];
+          const registryContentSha256 = sourceAdapter === "sos"
+            ? String(
+              sourceCheckpointJson.sos_source_label_registry_content_sha256 ||
+                "",
+            )
+            : null;
+          const authoritativeMappingSha256 = sourceAdapter === "sos"
+            ? String(
+              sourceCheckpointJson.authoritative_station_timeseries_mapping_sha256 ||
+                "",
+            )
+            : null;
+          const observedPropertyMappingSha256 = sourceAdapter === "sos"
+            ? String(
+              sourceCheckpointJson.observed_property_mapping_sha256 || "",
+            )
+            : null;
+          const siteRefBridgeArtifactSha256 = sourceAdapter === "sos"
+            ? String(
+              sourceCheckpointJson.sos_site_ref_bridge_artifact_sha256 || "",
+            )
+            : null;
+          if (sourceAdapter === "sos" &&
+            ![
+              registryContentSha256,
+              authoritativeMappingSha256,
+              observedPropertyMappingSha256,
+              siteRefBridgeArtifactSha256,
+            ]
+              .every((value) => /^[a-f0-9]{64}$/.test(String(value || "")))) {
+            throw new Error("complete_connector_day_semantic_mapping_identity_missing");
+          }
+          const sourceEvidenceInput = {
+            source_adapter: sourceAdapter,
+            day_utc: dayUtc,
+            connector_id: connectorId,
+            source_file_identities_sha256: sourceFileIdentitiesSha256,
+            requested_pollutant_set: requestedPollutantSet,
+            contract: sourceEvidenceContract,
+            evidence_contract_version: SOURCE_EVIDENCE_CONTRACT_VERSION,
+            source_label_registry_snapshot_content_sha256: registryContentSha256,
+            authoritative_station_timeseries_mapping_sha256:
+              authoritativeMappingSha256,
+            sos_site_ref_bridge_mapping_identity:
+              sourceCheckpointJson.sos_site_ref_bridge_mapping_identity || null,
+            sos_site_ref_bridge_artifact_sha256:
+              siteRefBridgeArtifactSha256,
+            observed_property_mapping_sha256: observedPropertyMappingSha256,
+          };
+          const sourceEvidenceInputSha256 = deterministicSemanticHash(
+            sourceEvidenceInput,
+          );
+          const missingBindingGroups = Number(
+            sourceCheckpointJson.missing_binding_groups || 0,
+          );
+          const missingBindingRows = Number(
+            sourceCheckpointJson.missing_binding_rows || 0,
+          );
+          const sourceRecordsExamined = sourceAdapter === "sos"
+            ? Number(
+              sourceCheckpointJson.selected_source_records_examined || 0,
+            )
+            : obsHistoryRows.length;
+          const sourceCsvRecordsScanned = sourceAdapter === "sos"
+            ? Number(sourceCheckpointJson.source_csv_records_scanned || 0)
+            : Number(sourceCheckpointJson.total_csv_records || obsHistoryRows.length);
+          if (
+            ![missingBindingGroups, missingBindingRows, sourceRecordsExamined,
+              sourceCsvRecordsScanned].every((value) =>
+              Number.isInteger(value) && value >= 0
+            ) || sourceRecordsExamined !== obsHistoryRows.length + missingBindingRows
+          ) {
+            throw new Error("complete_connector_day_selected_source_count_mismatch");
+          }
           writeIntegrityProposalStageJson(evidencePath, {
             schema_version: 1,
-            contract: INTEGRITY_POLLUTANT_SCOPED_REPAIR
-              ? "pollutant_scoped_authoritative_connector_day_source_rows"
-              : "complete_authoritative_connector_day_source_rows",
-            requested_pollutant_set: INTEGRITY_POLLUTANT_SCOPED_REPAIR
-              ? Array.from(INTEGRITY_REPAIR_POLLUTANTS).sort()
-              : [],
+            contract: sourceEvidenceContract,
+            evidence_contract_version: SOURCE_EVIDENCE_CONTRACT_VERSION,
+            source_evidence_input_sha256: sourceEvidenceInputSha256,
+            requested_pollutant_set: requestedPollutantSet,
             connector_id: connectorId,
             day_utc: dayUtc,
             source_adapter: sourceAdapter,
@@ -14181,7 +15291,35 @@ async function runSourceToAll(
               new Set(sourceFilesAuthoritativelyAbsent),
             ).sort(),
             source_file_identities: sourceFileIdentityList,
-            source_file_identities_sha256: sha256Hex(sourceFileIdentitiesJson),
+            source_file_identities_sha256: sourceFileIdentitiesSha256,
+            source_label_registry_snapshot_file:
+              sourceCheckpointJson.sos_source_label_registry_file || null,
+            source_label_registry_snapshot_file_sha256:
+              sourceCheckpointJson.sos_source_label_registry_file_sha256 || null,
+            source_label_registry_snapshot_content_sha256:
+              registryContentSha256,
+            authoritative_station_timeseries_mapping_sha256:
+              authoritativeMappingSha256,
+            sos_site_ref_bridge_mapping_identity:
+              sourceCheckpointJson.sos_site_ref_bridge_mapping_identity || null,
+            sos_site_ref_bridge_artifact_sha256:
+              siteRefBridgeArtifactSha256,
+            sos_site_ref_bridge_content_sha256:
+              sourceCheckpointJson.sos_site_ref_bridge_content_sha256 || null,
+            observed_property_mapping_sha256: observedPropertyMappingSha256,
+            source_label_classification_counts:
+              sourceCheckpointJson.sos_source_label_classification_counts || {},
+            source_label_target_day_row_counts:
+              sourceCheckpointJson.sos_source_label_target_day_row_counts || {},
+            source_label_summary:
+              sourceCheckpointJson.sos_source_label_summary || {},
+            source_label_classifications:
+              sourceCheckpointJson.sos_source_label_classifications || [],
+            source_records_examined: sourceRecordsExamined,
+            source_csv_records_scanned: sourceCsvRecordsScanned,
+            canonical_rows_mapped: obsHistoryRows.length,
+            missing_binding_groups: missingBindingGroups,
+            missing_binding_rows: missingBindingRows,
             canonical_rows_file: "obs_history_rows.json",
             canonical_rows_sha256: sha256Hex(rowsJson),
             canonical_rows_bytes: Buffer.byteLength(rowsJson, "utf8"),
@@ -14191,6 +15329,11 @@ async function runSourceToAll(
             ),
             per_pollutant_counts: Object.fromEntries(
               Object.entries(perPollutant).sort(([left], [right]) => left.localeCompare(right)),
+            ),
+            observation_content_hashes: Object.fromEntries(
+              Object.entries(observationContentHashes).sort(
+                ([left], [right]) => left.localeCompare(right),
+              ),
             ),
             pollutant_set: Object.keys(perPollutant).sort(),
             source_rows_before_canonical_dedupe: observationRowsRaw.length,
@@ -14507,6 +15650,16 @@ async function runSourceToAll(
         }
 
         if (DRY_RUN) {
+          if (!INTEGRITY_PROPOSAL_MODE && HISTORY_R2_WRITE_VERSION === "v2") {
+            const reconciliation = await reconcileTimeseriesFirstValueAt({
+              connector_id: connectorId,
+              rows: obsHistoryRows,
+              dry_run: true,
+              day_utc: dayUtc,
+              r2_verification: "dry_run",
+            });
+            recordFirstValueAtReconciliation(reconciliation);
+          }
           connectorDaySkipped += 1;
           logStructured("info", "source_to_r2_connector_day_dry_run_plan", {
             run_id: runId,
@@ -14607,6 +15760,29 @@ async function runSourceToAll(
           integrityProposalActiveForConnectorDay &&
           INTEGRITY_PROPOSAL_FINALIZE &&
           sourceObservationsOnly;
+        let firstValueAtReconciliation:
+          | FirstValueAtReconciliationSummary
+          | null = null;
+        if (
+          !integrityObservationProposalFinalisation &&
+          !INTEGRITY_PROPOSAL_MODE &&
+          HISTORY_R2_WRITE_VERSION === "v2"
+        ) {
+          const verifiedRows =
+            await loadVerifiedR2ObservationRowsForConnectorDay(
+              dayUtc,
+              connectorId,
+              false,
+            );
+          firstValueAtReconciliation = await reconcileTimeseriesFirstValueAt({
+            connector_id: connectorId,
+            rows: verifiedRows,
+            dry_run: false,
+            day_utc: dayUtc,
+            r2_verification: "newly_written_verified",
+          });
+          recordFirstValueAtReconciliation(firstValueAtReconciliation);
+        }
         let aqiExport:
           | { objects_written_r2: number; manifest_key: string }
           | null = null;
@@ -14698,6 +15874,7 @@ async function runSourceToAll(
             ? "canonical_local_proposal_built"
             : "canonical_metadata_published",
           rows_aqilevels: sourceObservationsOnly ? null : aqilevelRows.length,
+          first_value_at_reconciliation: firstValueAtReconciliation,
           objects_written_r2: sourceObservationsOnly
             ? obsExport.objects_written_r2 + (integrityObservationProposalFinalisation ? 0 : 1)
             : obsExport.objects_written_r2 +
@@ -14734,6 +15911,7 @@ async function runSourceToAll(
               ? null
               : buildAqiDayManifestKey(dayUtc),
             candidate_source_units: candidateSourceUnits,
+            first_value_at_reconciliation: firstValueAtReconciliation,
             ...sourceCheckpointJson,
           },
           started_at: startedAt,
@@ -14765,6 +15943,7 @@ async function runSourceToAll(
             updated_by_run_id: runId,
             completed_at: nowIso(),
             candidate_source_units: candidateSourceUnits,
+            first_value_at_reconciliation: firstValueAtReconciliation,
             ...sourceCheckpointJson,
           },
           updated_at: nowIso(),
@@ -14821,6 +16000,9 @@ async function runSourceToAll(
             error: message,
           });
           continue;
+        }
+        if (message.includes("first_value_at reconciliation failed")) {
+          firstValueAtReconciliationTotals.failed_connector_day_count += 1;
         }
         connectorDayError += 1;
         sourceFailedDaySet.add(dayUtc);
@@ -14904,14 +16086,42 @@ async function runSourceToAll(
     source_acquisition_pending_days: Array.from(sourceAcquisitionPendingDaySet)
       .sort(compareIsoDay),
     local_to_aqilevels_summary: null,
+    first_value_at_reconciliation: firstValueAtReconciliationTotals,
     warnings,
   };
+}
+
+const DIRECT_R2_MUTATION_MODES = new Set<RunMode>([
+  "source_to_r2",
+  "obs_aqi_to_r2",
+  "r2_history_obs_to_aqilevels",
+]);
+
+export function assertSharedCanonicalMutationRoute({
+  runMode,
+  dryRun,
+  integrityProposalMode,
+}: {
+  runMode: RunMode;
+  dryRun: boolean;
+  integrityProposalMode: boolean;
+}): void {
+  if (DIRECT_R2_MUTATION_MODES.has(runMode) && !dryRun && !integrityProposalMode) {
+    throw new Error(
+      `${runMode} direct live R2 mutation is retired; build an Integrity proposal and apply it through the shared advisory-lock lifecycle`,
+    );
+  }
 }
 
 async function main(): Promise<void> {
   const runId = crypto.randomUUID();
   const startedAtMs = Date.now();
   validateRunModeOutputScope();
+  assertSharedCanonicalMutationRoute({
+    runMode: RUN_MODE,
+    dryRun: DRY_RUN,
+    integrityProposalMode: INTEGRITY_PROPOSAL_MODE,
+  });
   resetRunCaches();
   const window = resolveRunWindow();
   await resolveRequestedStationFilters();

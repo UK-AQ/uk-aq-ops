@@ -8,25 +8,27 @@ import {
 } from "./core.mjs";
 import { runBackupWithDailyTaskHealth } from "./health.mjs";
 
-export const JOB_NAME = "uk-aq-supabase-db-dump-backup-job";
+export const JOB_NAME = "uk-aq-supabase-db-dump-backup";
 const DATABASE_ENV = "UK_AQ_SUPABASE_DB_DUMP_JOB_DATABASES";
+const TRIGGER_MODE_ENV = "UK_AQ_SUPABASE_DB_DUMP_TRIGGER_MODE";
+const ALLOWED_TRIGGER_MODES = new Set(["manual", "scheduler"]);
 
 export function resolveJobSelection(env = process.env) {
-  const rawSelection = String(env[DATABASE_ENV] || "").trim();
-  if (!rawSelection) {
-    return {
-      triggerMode: "scheduler",
-      requestedDatabases: resolveRequestedDatabases("scheduler"),
-    };
+  const triggerMode = String(env[TRIGGER_MODE_ENV] || "manual").trim();
+  if (!ALLOWED_TRIGGER_MODES.has(triggerMode)) {
+    throw new Error(`Unsupported trigger mode: ${triggerMode || "blank"}`);
   }
 
+  const rawSelection = String(env[DATABASE_ENV] || "").trim();
   const requested = rawSelection
-    .split(",")
-    .map((entry) => entry.trim())
-    .filter(Boolean);
+    ? rawSelection
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter(Boolean)
+    : null;
 
   return {
-    triggerMode: "manual",
+    triggerMode,
     requestedDatabases: resolveRequestedDatabases("manual", requested),
   };
 }
@@ -38,8 +40,9 @@ export async function main(env = process.env) {
     job: JOB_NAME,
     trigger_mode: triggerMode,
     requested_databases: requestedDatabases,
-    cloud_run_execution: env.CLOUD_RUN_EXECUTION || null,
-    cloud_run_task_index: env.CLOUD_RUN_TASK_INDEX || null,
+    github_run_id: env.GITHUB_RUN_ID || null,
+    github_run_attempt: env.GITHUB_RUN_ATTEMPT || null,
+    github_workflow: env.GITHUB_WORKFLOW || null,
   });
 
   try {

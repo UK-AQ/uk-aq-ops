@@ -1,4 +1,5 @@
 import { mkdir, writeFile } from "node:fs/promises";
+import { pathToFileURL } from "node:url";
 import {
   buildRunConfig,
   executePruneDaily,
@@ -31,32 +32,48 @@ function boundedValue(value, depth = 0) {
   return String(value);
 }
 
-async function writeReport(payload) {
+export async function writeReport(payload) {
   await mkdir("tmp", { recursive: true });
   await writeFile(REPORT_PATH, `${JSON.stringify(boundedValue(payload), null, 2)}\n`, "utf8");
 }
 
-async function main() {
+export async function runPruneDailyJob({
+  env = process.env,
+  buildRunConfigAdapter = buildRunConfig,
+  executePruneDailyAdapter = executePruneDaily,
+  reportPruneDailyErrorAdapter = reportPruneDailyError,
+  writeReportAdapter = writeReport,
+  setExitCode = (code) => {
+    process.exitCode = code;
+  },
+} = {}) {
   const url = new URL("http://localhost/");
-  if (process.env.INPUT_DRY_RUN === "true") {
+  if (env.INPUT_DRY_RUN === "true") {
     url.searchParams.set("dryRun", "true");
   }
 
   try {
-    const config = buildRunConfig(url);
-    const summary = await executePruneDaily(config);
-    await writeReport({ ok: true, summary });
+    const config = buildRunConfigAdapter(url);
+    const summary = await executePruneDailyAdapter(config);
+    const payload = { ok: true, summary };
+    await writeReportAdapter(payload);
+    return payload;
   } catch (error) {
-    const errorReport = await reportPruneDailyError(error, {
+    const errorReport = await reportPruneDailyErrorAdapter(error, {
       execution_mode: "github_actions",
     });
-    await writeReport({
+    const payload = {
       ok: false,
       error: error instanceof Error ? error.message : String(error),
       ...errorReport,
-    });
-    process.exitCode = 1;
+    };
+    await writeReportAdapter(payload);
+    setExitCode(1);
+    return payload;
   }
 }
 
-await main();
+const invokedPath = process.argv[1] ? pathToFileURL(process.argv[1]).href : null;
+if (invokedPath === import.meta.url) {
+  await runPruneDailyJob();
+}

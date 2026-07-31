@@ -214,6 +214,7 @@ const AQILEVELS_TIMESERIES_INDEX_SCHEMA_VERSION = 1;
 const HISTORY_V2_TIMESERIES_INDEX_SCHEMA_VERSION = 3;
 const HISTORY_V2_TIMESERIES_METADATA_SCHEMA_VERSION = 1;
 export const HISTORY_V2_TIMESERIES_BINDING_SCHEMA_VERSION = 1;
+export const HISTORY_V2_TIMESERIES_BINDING_CONTINUITY_SCHEMA_VERSION = 2;
 const SUPPORTED_DOMAINS = new Set(["observations", "aqilevels"]);
 const MISSING_TIMESERIES_COUNTS_PREFIX =
   "Missing usable timeseries_row_counts in v2 AQI pollutant manifest";
@@ -286,7 +287,7 @@ function parseIsoDay(value) {
     return null;
   }
   const ms = Date.parse(`${trimmed}T00:00:00.000Z`);
-  if (Number.isNaN(ms)) {
+  if (Number.isNaN(ms) || new Date(ms).toISOString().slice(0, 10) !== trimmed) {
     return null;
   }
   return trimmed;
@@ -1478,13 +1479,137 @@ function normalizeAuthoritativeTimeseriesBinding(binding) {
   return normalized;
 }
 
+function normalizeIsoDay(raw) {
+  const day = String(raw ?? "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return null;
+  const parsed = new Date(`${day}T00:00:00.000Z`);
+  return Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== day ? null : day;
+}
+
+function stableRef(raw) {
+  const value = String(raw ?? "").trim();
+  return value || null;
+}
+
+function normalizeContinuityRow(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const connectorId = parsePositiveId(raw.connector_id);
+  const stationId = parsePositiveId(raw.station_id);
+  const timeseriesId = parsePositiveId(raw.timeseries_id);
+  const pollutantCode = parsePollutantCode(raw.pollutant_code, "observations");
+  const ukAirRef = stableRef(raw.uk_air_ref)?.toUpperCase() || null;
+  const siteRef = stableRef(raw.site_ref)?.toUpperCase() || null;
+  const validFromDayUtc = normalizeIsoDay(raw.valid_from_day_utc);
+  const validToDayUtc = raw.valid_to_day_utc == null || String(raw.valid_to_day_utc).trim() === ""
+    ? null
+    : normalizeIsoDay(raw.valid_to_day_utc);
+  if (!connectorId || !stationId || !timeseriesId || !pollutantCode || !ukAirRef || !siteRef || !validFromDayUtc) return null;
+  if (validToDayUtc && validToDayUtc < validFromDayUtc) return null;
+  const continuityKey = `${connectorId}:${ukAirRef}:${pollutantCode}`;
+  if (stableRef(raw.continuity_key) !== continuityKey) return null;
+  return {
+    connector_id: connectorId,
+    continuity_key: continuityKey,
+    site_ref: siteRef,
+    uk_air_ref: ukAirRef,
+    pollutant_code: pollutantCode,
+    station_id: stationId,
+    station_ref: stableRef(raw.station_ref),
+    timeseries_id: timeseriesId,
+    timeseries_ref: stableRef(raw.timeseries_ref),
+    valid_from_day_utc: validFromDayUtc,
+    valid_to_day_utc: validToDayUtc,
+  };
+}
+
+export function buildHistoryV2TimeseriesContinuityFamilies({ continuityRows = [], authoritativeByTimeseriesId = new Map() } = {}) {
+  const authoritative = authoritativeByTimeseriesId instanceof Map
+    ? authoritativeByTimeseriesId
+    : new Map((Array.isArray(authoritativeByTimeseriesId) ? authoritativeByTimeseriesId : [])
+      .map((row) => normalizeAuthoritativeTimeseriesBinding(row))
+      .filter(Boolean)
+      .map((row) => [String(row.timeseries_id), row]));
+  const groups = new Map();
+  let invalidRowCount = 0;
+  for (const raw of Array.isArray(continuityRows) ? continuityRows : []) {
+    const row = normalizeContinuityRow(raw);
+    if (!row) { invalidRowCount += 1; continue; }
+    if (!groups.has(row.continuity_key)) groups.set(row.continuity_key, []);
+    groups.get(row.continuity_key).push(row);
+  }
+  const membership = new Map();
+  const invalidFamilyKeys = new Set();
+  const continuityConflictedTimeseriesIds = new Set();
+  for (const [familyKey, rows] of groups) {
+    for (const row of rows) {
+      const memberKey = String(row.timeseries_id);
+      const previous = membership.get(memberKey);
+      if (previous && previous !== familyKey) {
+        invalidFamilyKeys.add(previous);
+        invalidFamilyKeys.add(familyKey);
+        continuityConflictedTimeseriesIds.add(row.timeseries_id);
+      } else membership.set(memberKey, familyKey);
+    }
+  }
+  const continuityByTimeseriesId = new Map();
+  let singleMemberFamilyCount = 0;
+  for (const [familyKey, sourceRows] of groups) {
+    const rows = [...sourceRows].sort((left, right) => left.valid_from_day_utc.localeCompare(right.valid_from_day_utc) || left.timeseries_id - right.timeseries_id);
+    const sites = new Set(rows.map((row) => row.site_ref));
+    const ids = new Set();
+    let openEndedCount = 0;
+    let valid = !invalidFamilyKeys.has(familyKey) && sites.size === 1;
+    for (let index = 0; index < rows.length; index += 1) {
+      const row = rows[index];
+      const core = authoritative.get(String(row.timeseries_id));
+      if (!core || core.connector_id !== row.connector_id || core.station_id !== row.station_id || core.pollutant_code !== row.pollutant_code || ids.has(row.timeseries_id)) valid = false;
+      ids.add(row.timeseries_id);
+      if (row.valid_to_day_utc === null) openEndedCount += 1;
+      const previous = rows[index - 1];
+      if (previous && (previous.valid_to_day_utc === null || row.valid_from_day_utc <= previous.valid_to_day_utc)) valid = false;
+    }
+    if (openEndedCount > 1) valid = false;
+    if (!valid) { invalidFamilyKeys.add(familyKey); continue; }
+    if (rows.length < 2) { singleMemberFamilyCount += 1; continue; }
+    const first = rows[0];
+    const continuity = {
+      schema_version: 1,
+      source: "sos_station_timeseries_site_refs",
+      continuity_key: familyKey,
+      site_ref: first.site_ref,
+      uk_air_ref: first.uk_air_ref,
+      pollutant_code: first.pollutant_code,
+      members: rows.map((row) => ({
+        station_id: row.station_id,
+        station_ref: row.station_ref,
+        timeseries_id: row.timeseries_id,
+        timeseries_ref: row.timeseries_ref,
+        valid_from_day_utc: row.valid_from_day_utc,
+        valid_to_day_utc: row.valid_to_day_utc,
+      })),
+    };
+    for (const row of rows) continuityByTimeseriesId.set(String(row.timeseries_id), continuity);
+  }
+  return {
+    continuityByTimeseriesId,
+    multiMemberFamilyCount: new Set([...continuityByTimeseriesId.values()].map((family) => family.continuity_key)).size,
+    schemaV2CandidateCount: continuityByTimeseriesId.size,
+    singleMemberFamilyCount,
+    invalidFamilyCount: invalidFamilyKeys.size,
+    invalidFamilyKeys: [...invalidFamilyKeys].sort(),
+    invalidRowCount,
+    conflictedTimeseriesCount: continuityConflictedTimeseriesIds.size,
+  };
+}
+
 export function buildHistoryV2TimeseriesBindingPayload(binding) {
   const normalized = normalizeAuthoritativeTimeseriesBinding(binding);
   if (!normalized) {
     throw new Error("authoritative_timeseries_binding_invalid");
   }
+  const continuity = binding?.continuity && typeof binding.continuity === "object" ? binding.continuity : null;
   const payload = {
-    schema_version: HISTORY_V2_TIMESERIES_BINDING_SCHEMA_VERSION,
+    schema_version: continuity ? HISTORY_V2_TIMESERIES_BINDING_CONTINUITY_SCHEMA_VERSION : HISTORY_V2_TIMESERIES_BINDING_SCHEMA_VERSION,
     history_version: "v2",
     index_kind: "timeseries_binding",
     timeseries_id: normalized.timeseries_id,
@@ -1494,6 +1619,7 @@ export function buildHistoryV2TimeseriesBindingPayload(binding) {
   for (const field of ["station_id", "phenomenon_id", "observed_property_id"]) {
     if (normalized[field]) payload[field] = normalized[field];
   }
+  if (continuity) payload.continuity = continuity;
   return payload;
 }
 
@@ -1502,6 +1628,7 @@ export async function reconcileR2HistoryV2TimeseriesBindings({
   bucketName,
   timeseriesBindingIndexPrefix = DEFAULT_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX,
   authoritativeTimeseries = [],
+  continuityRows = [],
   writeR2 = true,
 } = {}) {
   if (!hasRequiredR2Config(r2)) {
@@ -1536,6 +1663,11 @@ export async function reconcileR2HistoryV2TimeseriesBindings({
     if (!existing) authoritativeByTimeseriesId.set(key, normalized);
   }
 
+  const continuityResult = buildHistoryV2TimeseriesContinuityFamilies({
+    continuityRows,
+    authoritativeByTimeseriesId,
+  });
+
   const existingEntries = await r2ListAllObjects({
     r2,
     prefix: `${bindingPrefix}/`,
@@ -1560,14 +1692,20 @@ export async function reconcileR2HistoryV2TimeseriesBindings({
   let plannedNewCount = 0;
   let headFallbackCount = 0;
   let bindingVerificationGetCount = 0;
+  const enrichedChangedFamilyKeys = new Set();
+  const enrichedUnchangedFamilyKeys = new Set();
+  const changedBindingTimeseriesIds = [];
+  const newBindingTimeseriesIds = [];
   for (const binding of [...authoritativeByTimeseriesId.values()]
     .sort((left, right) => left.timeseries_id - right.timeseries_id)) {
     const key = buildR2HistoryV2TimeseriesBindingKey(bindingPrefix, binding.timeseries_id);
-    const body = `${JSON.stringify(buildHistoryV2TimeseriesBindingPayload(binding), null, 2)}\n`;
     const id = String(binding.timeseries_id);
+    const continuity = continuityResult.continuityByTimeseriesId.get(id);
+    const body = `${JSON.stringify(buildHistoryV2TimeseriesBindingPayload({ ...binding, ...(continuity ? { continuity } : {}) }), null, 2)}\n`;
     const listedEtag = existingEtags.get(id);
     if (listedEtag && listedEtag === md5HexOfBody(body)) {
       bindingUnchangedCount += 1;
+      if (continuity) enrichedUnchangedFamilyKeys.add(continuity.continuity_key);
       continue;
     }
     let exists = existingIds.has(id);
@@ -1576,18 +1714,23 @@ export async function reconcileR2HistoryV2TimeseriesBindings({
       const head = await r2HeadObject({ r2, key });
       if (head.exists && stripEtagQuotes(head.etag) === md5HexOfBody(body)) {
         bindingUnchangedCount += 1;
+        if (continuity) enrichedUnchangedFamilyKeys.add(continuity.continuity_key);
         continue;
       }
       exists = Boolean(head.exists);
     }
     if (exists) {
+      changedBindingTimeseriesIds.push(binding.timeseries_id);
       if (writeR2) bindingChangedCount += 1;
       else plannedChangedCount += 1;
     } else if (writeR2) {
+      newBindingTimeseriesIds.push(binding.timeseries_id);
       bindingNewCount += 1;
     } else {
+      newBindingTimeseriesIds.push(binding.timeseries_id);
       plannedNewCount += 1;
     }
+    if (continuity) enrichedChangedFamilyKeys.add(continuity.continuity_key);
     if (writeR2) {
       await r2PutObject({ r2, key, body, content_type: "application/json; charset=utf-8" });
       const verified = await r2GetObject({ r2, key });
@@ -1607,6 +1750,19 @@ export async function reconcileR2HistoryV2TimeseriesBindings({
     bucket: bucketName || r2.bucket,
     timeseries_binding_index_prefix: bindingPrefix,
     authoritative_timeseries_count: authoritativeByTimeseriesId.size,
+    schema_version_1_candidate_count: authoritativeByTimeseriesId.size - continuityResult.schemaV2CandidateCount,
+    multi_member_continuity_family_count: continuityResult.multiMemberFamilyCount,
+    schema_version_2_candidate_count: continuityResult.schemaV2CandidateCount,
+    single_member_continuity_family_count: continuityResult.singleMemberFamilyCount,
+    invalid_continuity_family_count: continuityResult.invalidFamilyCount,
+    invalid_continuity_family_keys: continuityResult.invalidFamilyKeys,
+    invalid_continuity_row_count: continuityResult.invalidRowCount,
+    conflicted_timeseries_count: continuityResult.conflictedTimeseriesCount,
+    enriched_family_count: continuityResult.multiMemberFamilyCount,
+    enriched_changed_family_count: enrichedChangedFamilyKeys.size,
+    enriched_unchanged_family_count: enrichedUnchangedFamilyKeys.size,
+    enriched_changed_family_keys: [...enrichedChangedFamilyKeys].sort(),
+    skipped_single_member_family_count: continuityResult.singleMemberFamilyCount,
     binding_candidate_count: authoritativeByTimeseriesId.size,
     binding_written_count: bindingWrittenCount,
     binding_new_count: bindingNewCount,
@@ -1614,6 +1770,8 @@ export async function reconcileR2HistoryV2TimeseriesBindings({
     binding_unchanged_count: bindingUnchangedCount,
     planned_new_count: plannedNewCount,
     planned_changed_count: plannedChangedCount,
+    changed_binding_timeseries_ids: changedBindingTimeseriesIds,
+    new_binding_timeseries_ids: newBindingTimeseriesIds,
     unchanged_count: bindingUnchangedCount,
     etag_listing_optimization_used: true,
     listed_binding_count: existingIds.size,
@@ -1772,6 +1930,20 @@ function enumerateIsoDaysInclusive(fromDayUtc, toDayUtc) {
     out.push(new Date(cursorMs).toISOString().slice(0, 10));
   }
   return out;
+}
+
+export function resolveTargetedIsoDays({ fromDayUtc, toDayUtc, affectedDaysUtc = null } = {}) {
+  if (affectedDaysUtc !== null && affectedDaysUtc !== undefined) {
+    if (!Array.isArray(affectedDaysUtc) || affectedDaysUtc.length === 0) {
+      throw new Error("Targeted R2 history index update requires a non-empty affectedDaysUtc array");
+    }
+    const normalized = affectedDaysUtc.map((value) => parseIsoDay(value));
+    if (normalized.some((value) => !value)) {
+      throw new Error("Targeted R2 history index update received an invalid affectedDaysUtc value");
+    }
+    return Array.from(new Set(normalized)).sort();
+  }
+  return enumerateIsoDaysInclusive(fromDayUtc, toDayUtc);
 }
 
 function normalizeTimeseriesLatestDaySummary(entry) {
@@ -3036,7 +3208,11 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
   strictMissingTimeseriesCounts = false,
   fromDayUtc,
   toDayUtc,
+  affectedDaysUtc = null,
   connectorId = null,
+  connectorManifestKey = null,
+  updateLatestIndex = true,
+  writePollutantIndexes = true,
   additionalPollutantManifestTargets = [],
   writeR2 = true,
 }) {
@@ -3059,8 +3235,12 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
   if (connectorId != null && !normalizedConnectorId) {
     throw new Error(`Invalid targeted v2 timeseries connector_id: ${String(connectorId || "")}`);
   }
+  const normalizedConnectorManifestKey = String(connectorManifestKey || "").trim();
+  if (normalizedConnectorManifestKey && !normalizedConnectorId) {
+    throw new Error("A direct v2 connector manifest target requires connectorId");
+  }
 
-  const dayList = enumerateIsoDaysInclusive(fromDayUtc, toDayUtc);
+  const dayList = resolveTargetedIsoDays({ fromDayUtc, toDayUtc, affectedDaysUtc });
   const additionalTargets = (normalizedDomain === "observations" ? additionalPollutantManifestTargets : [])
     .map((target) => {
       const dayUtc = parseIsoDay(target?.day_utc);
@@ -3101,17 +3281,29 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
 
   for (const dayUtc of dayList) {
     const dayManifestKey = `${normalizedDataPrefix}/day_utc=${dayUtc}/manifest.json`;
-    const dayManifestResult = await fetchJsonObjectFromR2IfExists(r2, dayManifestKey);
-    if (!dayManifestResult.exists) {
-      throw new Error(`blocked_dependency|required_day_manifest_unreadable|${dayManifestKey}`);
+    let dayManifestObject = null;
+    let connectorTargets;
+    if (normalizedConnectorManifestKey) {
+      const expectedConnectorManifestKey = `${normalizedDataPrefix}/day_utc=${dayUtc}/connector_id=${normalizedConnectorId}/manifest.json`;
+      if (normalizedConnectorManifestKey !== expectedConnectorManifestKey) {
+        throw new Error(`Direct v2 connector manifest target is not canonical: ${normalizedConnectorManifestKey}`);
+      }
+      connectorTargets = [{
+        connector_id: normalizedConnectorId,
+        manifest_key: normalizedConnectorManifestKey,
+      }];
+    } else {
+      const dayManifestResult = await fetchJsonObjectFromR2IfExists(r2, dayManifestKey);
+      if (!dayManifestResult.exists) {
+        throw new Error(`blocked_dependency|required_day_manifest_unreadable|${dayManifestKey}`);
+      }
+      dayManifestObject = dayManifestResult.payload;
+      connectorTargets = resolveHistoryV2ConnectorManifestTargets(
+        dayManifestObject,
+        dayUtc,
+        normalizedDataPrefix,
+      );
     }
-    const dayManifestObject = dayManifestResult.payload;
-
-    const connectorTargets = resolveHistoryV2ConnectorManifestTargets(
-      dayManifestObject,
-      dayUtc,
-      normalizedDataPrefix,
-    );
 
     if (normalizedConnectorId && !connectorTargets.some(t => t.connector_id === normalizedConnectorId)) {
       warnings.push(
@@ -3165,7 +3357,8 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
               pollutantTarget.pollutant_code,
             )
         ));
-        const shouldWriteConnector = !normalizedConnectorId || connectorTarget.connector_id === normalizedConnectorId;
+        const shouldWriteConnector = writePollutantIndexes
+          && (!normalizedConnectorId || connectorTarget.connector_id === normalizedConnectorId);
         const stalePollutantIndexes = [];
         if (shouldWriteConnector) {
           const connectorIndexPrefix = `${normalizedTimeseriesPrefix}/day_utc=${dayUtc}/connector_id=${connectorTarget.connector_id}/`;
@@ -3202,7 +3395,8 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
                 r2,
                 pollutantTarget.manifest_key,
               );
-              const shouldWrite = !normalizedConnectorId || connectorTarget.connector_id === normalizedConnectorId;
+              const shouldWrite = writePollutantIndexes
+                && (!normalizedConnectorId || connectorTarget.connector_id === normalizedConnectorId);
               if (computeMissingTimeseriesCounts && shouldWrite) {
                 pollutantManifestObject = await maybePatchHistoryV2PollutantManifestWithCounts({
                   r2,
@@ -3352,30 +3546,38 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
         toIsoOrNull(dayManifestObject?.backed_up_at_utc)
         || pickMaxIsoTimestamp(connectorResults.map((entry) => entry.backed_up_at_utc)),
     };
-    daySummaryMap.set(dayUtc, normalizeHistoryV2TimeseriesLatestDaySummary(daySummary, normalizedDomain));
+    if (updateLatestIndex) {
+      daySummaryMap.set(dayUtc, normalizeHistoryV2TimeseriesLatestDaySummary(daySummary, normalizedDomain));
+    }
   }
 
-  const latestPayload = buildHistoryV2TimeseriesLatestPayload({
-    domain: normalizedDomain,
-    grain: normalizedDomain === "aqilevels" ? "hourly" : null,
-    profile: normalizedDomain === "aqilevels" ? "data" : null,
-    bucket: bucketName || r2.bucket,
-    generatedAt,
-    existingGeneratedAt: existingLatestPayload?.generated_at,
-    indexPrefix: normalizedIndexPrefix,
-    dataPrefix: normalizedDataPrefix,
-    timeseriesIndexPrefix: normalizedTimeseriesPrefix,
-    daySummaries: Array.from(daySummaryMap.values()),
-  });
+  const latestPayload = updateLatestIndex
+    ? buildHistoryV2TimeseriesLatestPayload({
+      domain: normalizedDomain,
+      grain: normalizedDomain === "aqilevels" ? "hourly" : null,
+      profile: normalizedDomain === "aqilevels" ? "data" : null,
+      bucket: bucketName || r2.bucket,
+      generatedAt,
+      existingGeneratedAt: existingLatestPayload?.generated_at,
+      indexPrefix: normalizedIndexPrefix,
+      dataPrefix: normalizedDataPrefix,
+      timeseriesIndexPrefix: normalizedTimeseriesPrefix,
+      daySummaries: Array.from(daySummaryMap.values()),
+    })
+    : existingLatestPayload;
 
-  const latestBody = `${JSON.stringify(latestPayload, null, 2)}\n`;
-  const latestPut = await r2PutObjectIfChanged({
-    r2,
-    key: latestKey,
-    body: latestBody,
-    content_type: "application/json; charset=utf-8",
-    writeR2,
-  });
+  const latestBody = updateLatestIndex
+    ? `${JSON.stringify(latestPayload, null, 2)}\n`
+    : null;
+  const latestPut = updateLatestIndex
+    ? await r2PutObjectIfChanged({
+      r2,
+      key: latestKey,
+      body: latestBody,
+      content_type: "application/json; charset=utf-8",
+      writeR2,
+    })
+    : { bytes: null, skipped: true };
 
   return {
     history_version: "v2",
@@ -3394,13 +3596,18 @@ async function updateR2HistoryV2TimeseriesIndexesTargeted({
     latest_index_key: latestKey,
     latest_index_bytes: latestPut.bytes,
     latest_index_put_skipped: Boolean(latestPut.skipped),
+    latest_index_status: latestPut.status,
+    latest_index_verified: Boolean(latestPut.verified),
+    latest_index_sha256: latestBody == null ? null : sha256Hex(latestBody),
+    wrote_pollutant_indexes: Boolean(writePollutantIndexes),
     data_prefix: normalizedDataPrefix,
     timeseries_index_prefix: normalizedTimeseriesPrefix,
-    indexed_day_count: latestPayload.day_count,
-    connector_index_count: latestPayload.connector_index_count,
-    pollutant_index_count: latestPayload.pollutant_index_count,
-    file_count: latestPayload.file_count,
-    indexed_file_count: latestPayload.indexed_file_count,
+    updated_latest_index: Boolean(updateLatestIndex),
+    indexed_day_count: latestPayload?.day_count ?? null,
+    connector_index_count: latestPayload?.connector_index_count ?? null,
+    pollutant_index_count: latestPayload?.pollutant_index_count ?? null,
+    file_count: latestPayload?.file_count ?? null,
+    indexed_file_count: latestPayload?.indexed_file_count ?? null,
     warning_count: warnings.length,
     warnings,
     stale_pollutant_index_cleanup_count: stalePollutantIndexCleanupCount,
@@ -3417,6 +3624,7 @@ async function updateR2HistoryIndexForDomainTargeted({
   generatedAt = new Date().toISOString(),
   fromDayUtc,
   toDayUtc,
+  affectedDaysUtc = null,
   writeR2 = true,
 }) {
   const normalizedDomain = String(domain || "").trim().toLowerCase();
@@ -3428,7 +3636,7 @@ async function updateR2HistoryIndexForDomainTargeted({
   }
 
   const normalizedPrefix = normalizePrefix(domainPrefix);
-  const dayList = enumerateIsoDaysInclusive(fromDayUtc, toDayUtc);
+  const dayList = resolveTargetedIsoDays({ fromDayUtc, toDayUtc, affectedDaysUtc });
   const warnings = [];
   const indexKey = buildR2HistoryIndexKey(indexPrefix, normalizedDomain);
   const existingIndex = await fetchJsonObjectFromR2IfExists(r2, indexKey);
@@ -3503,6 +3711,7 @@ async function updateR2HistoryObservationsTimeseriesIndexesTargeted({
   computeMissingTimeseriesCounts = false,
   fromDayUtc,
   toDayUtc,
+  affectedDaysUtc = null,
   connectorId = null,
   writeR2 = true,
 }) {
@@ -3517,7 +3726,7 @@ async function updateR2HistoryObservationsTimeseriesIndexesTargeted({
     throw new Error(`Invalid targeted observations connector_id: ${String(connectorId || "")}`);
   }
 
-  const dayList = enumerateIsoDaysInclusive(fromDayUtc, toDayUtc);
+  const dayList = resolveTargetedIsoDays({ fromDayUtc, toDayUtc, affectedDaysUtc });
   const warnings = [];
   const latestKey = buildR2HistoryObservationsTimeseriesLatestKey(indexPrefix);
   const existingLatest = await fetchJsonObjectFromR2IfExists(r2, latestKey);
@@ -3683,6 +3892,7 @@ async function updateR2HistoryAqilevelsTimeseriesIndexesTargeted({
   fetchConcurrency = DEFAULT_FETCH_CONCURRENCY,
   fromDayUtc,
   toDayUtc,
+  affectedDaysUtc = null,
   connectorId = null,
   writeR2 = true,
 }) {
@@ -3697,7 +3907,7 @@ async function updateR2HistoryAqilevelsTimeseriesIndexesTargeted({
     throw new Error(`Invalid targeted aqilevels connector_id: ${String(connectorId || "")}`);
   }
 
-  const dayList = enumerateIsoDaysInclusive(fromDayUtc, toDayUtc);
+  const dayList = resolveTargetedIsoDays({ fromDayUtc, toDayUtc, affectedDaysUtc });
   const warnings = [];
   const latestKey = buildR2HistoryAqilevelsTimeseriesLatestKey(indexPrefix);
   const existingLatest = await fetchJsonObjectFromR2IfExists(r2, latestKey);
@@ -3848,7 +4058,11 @@ export async function updateR2HistoryIndexesTargeted({
   domains = ["observations"],
   fromDayUtc,
   toDayUtc,
+  affectedDaysUtc = null,
   connectorId = null,
+  connectorManifestKey = null,
+  updateLatestIndex = true,
+  writePollutantIndexes = true,
   generatedAt = new Date().toISOString(),
   fetchConcurrency,
   computeMissingTimeseriesCounts = false,
@@ -3898,7 +4112,11 @@ export async function updateR2HistoryIndexesTargeted({
         strictMissingTimeseriesCounts: strictMissingTimeseriesCounts ?? config.strict_missing_timeseries_counts,
         fromDayUtc,
         toDayUtc,
+        affectedDaysUtc,
         connectorId,
+        connectorManifestKey,
+        updateLatestIndex,
+        writePollutantIndexes,
         additionalPollutantManifestTargets,
         writeR2,
       });
@@ -3921,6 +4139,7 @@ export async function updateR2HistoryIndexesTargeted({
         generatedAt,
         fromDayUtc,
         toDayUtc,
+        affectedDaysUtc,
         writeR2,
       }));
 
@@ -3936,6 +4155,7 @@ export async function updateR2HistoryIndexesTargeted({
           computeMissingTimeseriesCounts,
           fromDayUtc,
           toDayUtc,
+          affectedDaysUtc,
           connectorId,
           writeR2,
         });
@@ -3951,6 +4171,7 @@ export async function updateR2HistoryIndexesTargeted({
           fetchConcurrency: fetchConcurrency || config.fetch_concurrency,
           fromDayUtc,
           toDayUtc,
+          affectedDaysUtc,
           connectorId,
           writeR2,
         });
@@ -3974,6 +4195,7 @@ export async function updateR2HistoryIndexesTargeted({
     ? config.aqilevels_hourly_data_prefix_v2
     : config.aqilevels_prefix;
 
+  const targetedDays = resolveTargetedIsoDays({ fromDayUtc, toDayUtc, affectedDaysUtc });
   return {
     mode: "targeted",
     history_version: normalizedHistoryVersion,
@@ -3984,8 +4206,9 @@ export async function updateR2HistoryIndexesTargeted({
     aqilevels_timeseries_index_prefix: responseAqilevelsTimeseriesIndexPrefix,
     observations_prefix: responseObservationsPrefix,
     aqilevels_prefix: responseAqilevelsPrefix,
-    from_day_utc: parseIsoDay(fromDayUtc),
-    to_day_utc: parseIsoDay(toDayUtc),
+    from_day_utc: targetedDays[0],
+    to_day_utc: targetedDays[targetedDays.length - 1],
+    affected_days_utc: targetedDays,
     connector_id: connectorId == null ? null : parsePositiveId(connectorId),
     results,
     observations_timeseries: observationsTimeseries,

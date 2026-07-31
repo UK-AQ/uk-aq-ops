@@ -15,6 +15,7 @@ const DEFAULT_CACHE_SECONDS = 300;
 const DEFAULT_IMMUTABLE_CACHE_SECONDS = 86400;
 const MAX_CACHE_SECONDS = 604800;
 const OBSERVATIONS_CACHE_GENERATION = "2";
+const TIMESERIES_BINDING_CACHE_GENERATION = "3";
 const MAX_LIMIT = 20000;
 const UPSTREAM_AUTH_HEADER = "x-uk-aq-upstream-auth";
 const HOUR_MS = 60 * 60 * 1000;
@@ -110,13 +111,19 @@ function normalizePollutant(raw) {
 function isValidTimeseriesBinding(binding, requestedTimeseriesId) {
   if (!binding || typeof binding !== "object" || Array.isArray(binding)) return false;
   const pollutantCode = String(binding.pollutant_code || "").trim();
-  return binding.schema_version === 1
+  const baseValid = (binding.schema_version === 1 || binding.schema_version === 2)
     && binding.history_version === "v2"
     && binding.index_kind === "timeseries_binding"
     && parseRequiredPositiveInt(binding.timeseries_id) === requestedTimeseriesId
     && parseRequiredPositiveInt(binding.connector_id) !== null
     && /^[a-z0-9_]+$/.test(pollutantCode)
     && pollutantCode === binding.pollutant_code;
+  if (!baseValid) return false;
+  if (binding.schema_version === 1) return binding.continuity === undefined;
+  const continuity = binding.continuity;
+  if (!continuity || continuity.schema_version !== 1 || !Array.isArray(continuity.members) || continuity.members.length < 2 || continuity.pollutant_code !== pollutantCode) return false;
+  const members = continuity.members.filter((member) => parseRequiredPositiveInt(member?.timeseries_id) === requestedTimeseriesId);
+  return members.length === 1;
 }
 
 function toIsoOrNull(raw) {
@@ -491,11 +498,18 @@ async function fetchFilteredParquetRowsFromR2(
         chunkStart,
         chunkEnd,
       );
-      const statusValues = schemaColumns.includes("status")
+      const verificationStatusColumn = schemaColumns.includes(
+        "verification_status",
+      )
+        ? "verification_status"
+        : schemaColumns.includes("status")
+        ? "status"
+        : null;
+      const verificationStatusValues = verificationStatusColumn
         ? await readParquetColumnValues(
           arrayBuffer,
           metadata,
-          "status",
+          verificationStatusColumn,
           chunkStart,
           chunkEnd,
         )
@@ -507,8 +521,10 @@ async function fetchFilteredParquetRowsFromR2(
         outRows.push({
           observed_at: observedAtValues[idx],
           value: valueValues[idx],
-          status: idx < statusValues.length && statusValues[idx] != null
-            ? String(statusValues[idx])
+          verification_status:
+            idx < verificationStatusValues.length &&
+              verificationStatusValues[idx] != null
+            ? String(verificationStatusValues[idx])
             : null,
         });
       }
@@ -753,7 +769,7 @@ function buildTimeseriesBindingCacheKey(requestUrl, requestParams) {
   cacheUrl.hash = "";
   cacheUrl.searchParams.set("timeseries_id", String(requestParams.timeseriesId));
   cacheUrl.searchParams.set("__ukaq_observs_history_read_v", "v2");
-  cacheUrl.searchParams.set("__ukaq_observs_history_cache_gen", OBSERVATIONS_CACHE_GENERATION);
+  cacheUrl.searchParams.set("__ukaq_observs_history_cache_gen", TIMESERIES_BINDING_CACHE_GENERATION);
   return new Request(cacheUrl.toString(), { method: "GET" });
 }
 

@@ -1,186 +1,141 @@
-# UK AQ Supabase DB dump backup Job and service
+# UK AQ Supabase DB dump backup
 
-Cloud Run Job for daily logical backups of:
-
-- `ingestdb`
-- `obs_aqidb`
-
-Each run creates `roles.sql.gz`, `schema.sql.gz`, `data.sql.gz` and
-`cron_jobs.sql.gz` for each database, uploads them to Dropbox, and prunes dated
-Dropbox folders older than the configured retention window.
+This worker creates daily logical backups of `ingestdb` and `obs_aqidb` in
+Dropbox. The implementation directory retains its `_service` suffix for path
+continuity; there is no active HTTP service.
 
 ## Runtime model
 
 Scheduled production execution uses:
 
 ```text
-Cloud Scheduler: uk-aq-supabase-db-dump-backup-job-trigger
-  -> Cloud Run Jobs API
-  -> Cloud Run Job: uk-aq-supabase-db-dump-backup-job
+Cloudflare cron scheduler
+  -> D1 job: uk_aq_supabase_db_dump_backup
+  -> GitHub workflow_dispatch
+  -> .github/workflows/uk_aq_supabase_db_dump_backup.yml
   -> job.mjs
-  -> daily task health lifecycle
-  -> core.mjs backup workflow
+  -> one daily task health lifecycle
+  -> core.mjs
+  -> concurrent per-database branches
+  -> Dropbox
 ```
 
-The Job runs one task with parallelism one, an explicit 30-minute task timeout,
-and zero automatic task retries. It exits successfully only when every requested
-database backup succeeds.
-
-The previous Scheduler target held one HTTP request open for the whole backup.
-That request could produce a Scheduler 502 even when the container subsequently
-completed successfully. The old Scheduler job
-`uk-aq-supabase-db-dump-backup-trigger` must remain paused.
-
-The existing private Cloud Run Service remains deployed for manual comparison:
-
-- `GET /` or `GET /healthz`
-- `POST /run-backup`
-
-Do not schedule the Service endpoint. Scheduled execution must use the Cloud Run Job.
-
-Scheduled Job executions back up both databases in order:
+The scheduler entry in `cloudflare/scheduler/jobs.toml` runs at `00:55 UTC`,
+provides `trigger_mode=scheduler`, and does not provide a database input. The
+workflow defaults `trigger_mode` to `manual` for UI dispatches. Trigger source
+is resolved independently of database selection, and a blank selection backs up
+both databases in this order:
 
 1. `ingestdb`
 2. `obs_aqidb`
 
-A manual Job execution may set `UK_AQ_SUPABASE_DB_DUMP_JOB_DATABASES` to
-`ingestdb`, `obs_aqidb`, or a comma-separated list through execution overrides.
-Scheduled executions must leave this variable unset.
+Normal two-database runs start both database branches concurrently in the same
+Node.js process and GitHub Actions job. Combined results remain in the canonical
+order above regardless of which database finishes first. A one-database manual
+run starts only the selected branch. Each branch has its own temporary working
+directory, Dropbox client, and database-specific Dropbox root.
 
-## Daily task health
+Manual workflow dispatch keeps the default trigger mode and accepts `ingestdb`,
+`obs_aqidb`, `ingestdb,obs_aqidb`, or a blank value for both. GitHub Actions
+concurrency queues overlapping scheduled or manual runs rather than cancelling
+either run.
 
-Both the Job and retained Service use the same health wrapper and preserve:
+The retired GCP scheduler and compute runtimes are not a fallback. If the
+GitHub path fails, disable the Cloudflare scheduler job, fix and manually rerun
+the workflow, then re-enable the scheduler after successful TEST operation.
 
-- task key `ops.supabase_db_dump_backup`
-- source worker `uk_aq_supabase_db_dump_backup_service`
-- started, finished and failed lifecycle calls
-- requested databases
-- dump counts
-- bytes written
-- elapsed time
-- errors and warnings
+## Backup contents
 
-For Job executions, the shared health client records the Cloud Run execution
-identifier from `CLOUD_RUN_EXECUTION`.
+Each successful database backup writes these four gzip files:
 
-## Required environment variables and secrets
+- `roles.sql.gz`
+- `schema.sql.gz`
+- `data.sql.gz`
+- `cron_jobs.sql.gz`
 
-Secrets:
+Within each database branch, roles, schema, data, cron jobs, and retention remain
+strictly sequential. The two branches may interleave, but retention is scoped to
+that database's own Dropbox root.
 
-- `UK_AQ_INGESTDB_DB_URL`
+The Dropbox layout is:
+
+```text
+/<UK_AQ_DROPBOX_ROOT>/<UK_AQ_SUPABASE_DB_DUMP_BACKUP_DIR>/<database>/YYYY-MM-DD/<file>
+```
+
+Same-day reruns safely overwrite the dated files. Restore order is roles, schema,
+data, then cron jobs. The implementation retains `cron` in dump scope, enables
+`pg_cron` in schema output, preserves the `obs_aqidb` `authenticator` PostgREST
+schemas, and serializes `cron.job` separately.
+
+Large multi-row data INSERTs are streamed through bounded temporary spools.
+Statements over the configured threshold are replayed as restore-safe chunks;
+smaller, single-line, and unrecognized statements are replayed unchanged.
+Temporary output replaces the source atomically only after a successful rewrite.
+
+Retention runs independently after each successfully completed database. With
+the default value `7`, the current UTC date and preceding six dated folders are
+kept; non-date folders are ignored.
+
+## GitHub configuration
+
+Required secrets:
+
+- `SUPABASE_DB_URL` (mapped to worker environment variable `UK_AQ_INGESTDB_DB_URL`)
 - `OBS_AQIDB_SUPABASE_DB_URL`
 - `OBS_AQIDB_SECRET_KEY`
 - `DROPBOX_APP_KEY`
 - `DROPBOX_APP_SECRET`
 - `DROPBOX_REFRESH_TOKEN`
 
-Plain environment:
+Required repository variables:
 
 - `UK_AQ_DROPBOX_ROOT`
 - `OBS_AQIDB_SUPABASE_URL`
 
-Optional plain environment:
+Optional repository variables and workflow defaults:
 
 - `UK_AQ_SUPABASE_DB_DUMP_BACKUP_DIR`, default `Supabase_Backup_db_dump`
 - `UK_AQ_SUPABASE_DB_DUMP_RETENTION_DAYS`, default `7`
 - `UK_AQ_DB_DUMP_SPLIT_LARGE_INSERTS`, default `true`
 - `UK_AQ_DB_DUMP_INSERT_SPLIT_THRESHOLD_ROWS`, default `10000`
 - `UK_AQ_DB_DUMP_INSERT_CHUNK_ROWS`, default `5000`
-- `SUPABASE_BIN`, default `supabase`
-- `GZIP_BIN`, default `gzip`
-- `BASH_BIN`, default `bash`
 
-## Data dump behaviour
+Local command overrides remain available for `SUPABASE_BIN`, `GZIP_BIN`, and
+`BASH_BIN`. The GitHub runner installs Node.js 20, PostgreSQL client 17, and
+Supabase CLI 2.79.0.
 
-The worker uses `supabase db dump --dry-run` to emit the Supabase CLI dump
-script, then executes it locally with PostgreSQL client 17.
+The GitHub Actions job timeout is 150 minutes. Workflow-level concurrency still
+queues overlapping workflow runs with `cancel-in-progress: false`.
 
-Data dumps are post-processed before compression and upload:
+## Task health and failure behavior
 
-- large multi-row inserts are split into smaller statements
-- cron is retained in dump scope
-- `schema.sql` enables `pg_cron` when needed
-- the `obs_aqidb` schema sets the required PostgREST schemas for `authenticator`
-- `cron_jobs.sql` is generated separately from `cron.job`
+The stable task identity is:
 
-Output filenames and Dropbox paths are unchanged.
+- task key `ops.supabase_db_dump_backup`
+- source repo `uk-aq-ops`
+- source worker `uk_aq_supabase_db_dump_backup_service`
 
-Restore order:
+One combined health lifecycle covers both concurrent database branches. Its
+started and final success/failure states include the trigger mode, requested
+databases, dump and database counts, bytes, elapsed time, destination, errors,
+and warnings. Database results remain in canonical order. The process exits
+non-zero if any requested database fails, after both branches have settled. A
+same-date manual rerun safely overwrites files already uploaded by a partial run.
 
-1. `roles.sql.gz`
-2. `schema.sql.gz`
-3. `data.sql.gz`
-4. `cron_jobs.sql.gz`
+## Manual TEST operation
 
-## Deployment and IAM
+From GitHub Actions, dispatch **UK AQ Supabase DB Dump Backup**. Leave
+`databases` blank to exercise the normal two-database path, or enter one of the
+accepted values for a targeted rerun.
 
-The workflow builds one image and deploys it in two forms:
+After deployment, verify:
 
-- Service Docker command:
-  `node workers/uk_aq_supabase_db_dump_backup_service/server.mjs`
-- Job command override:
-  `node workers/uk_aq_supabase_db_dump_backup_service/job.mjs`
-
-Service account responsibilities:
-
-- The GitHub Actions deployment account deploys the image, Service, Job and Scheduler configuration.
-- The Job runtime account reads Secret Manager values and performs the backup.
-- The Scheduler account has `roles/run.invoker` on the Job and uses OAuth to call the Cloud Run Jobs API.
-- The Cloud Scheduler service agent can mint a token for the Scheduler account.
-
-The workflow rejects the default compute service account.
-
-## Manual operations
-
-Describe the Job:
-
-```bash
-gcloud run jobs describe uk-aq-supabase-db-dump-backup-job \
-  --region europe-west2
-```
-
-Execute and wait:
-
-```bash
-gcloud run jobs execute uk-aq-supabase-db-dump-backup-job \
-  --region europe-west2 \
-  --wait
-```
-
-Describe the Scheduler:
-
-```bash
-gcloud scheduler jobs describe uk-aq-supabase-db-dump-backup-job-trigger \
-  --location europe-west2
-```
-
-Read Job logs:
-
-```bash
-gcloud logging read \
-  'resource.type="cloud_run_job" AND resource.labels.job_name="uk-aq-supabase-db-dump-backup-job"' \
-  --project "$GCP_PROJECT_ID" \
-  --limit 100 \
-  --order desc \
-  --format json
-```
-
-After execution, verify:
-
-1. The Cloud Run Job execution succeeded.
-2. Daily task health shows `ops.supabase_db_dump_backup` as successful.
-3. Both database summaries show four dumps.
-4. Dropbox contains all four dated files for both databases.
-
-## Rollback
-
-Never leave both Scheduler jobs active.
-
-1. Pause `uk-aq-supabase-db-dump-backup-job-trigger`.
-2. Confirm there is no running Cloud Run Job execution.
-3. Manually test the retained Service.
-4. Resume `uk-aq-supabase-db-dump-backup-trigger` only after confirming the
-   Job Scheduler is paused.
-
-The deployment workflow refuses to proceed if the old Service Scheduler exists
-and is not paused.
+1. logs show both database branches start before either finishes;
+2. the workflow succeeds within 150 minutes;
+3. task health records one successful `ops.supabase_db_dump_backup` run;
+4. both database summaries contain four dumps in canonical order;
+5. all eight dated Dropbox files exist and have non-zero compressed sizes;
+6. decompressed data SQL has valid INSERT chunk delimiters;
+7. the D1 job is enabled at `55 0 * * *`, has `dry_run = false`, and dispatches
+   exactly one workflow on the next scheduled operation.

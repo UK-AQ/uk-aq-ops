@@ -8,6 +8,8 @@ import { Client } from "pg";
 import Cursor from "pg-cursor";
 import * as arrow from "apache-arrow";
 import * as parquetWasm from "parquet-wasm/esm";
+import { parquetMetadataAsync, parquetRead, parquetSchema } from "hyparquet";
+import { compressors } from "hyparquet-compressors";
 import {
   hasRequiredR2Config,
   normalizePrefix,
@@ -18,15 +20,64 @@ import {
   r2PutObject,
   sha256Hex,
 } from "../shared/r2_sigv4.mjs";
+import {
+  classifyManifestFileIdentity,
+  verifyManifestFileIdentity,
+} from "../shared/uk_aq_r2_file_identity.mjs";
 import { resolveR2HistoryVersion } from "../shared/uk_aq_r2_history_version.mjs";
 import {
   normalizeObservationPropertyCode,
   OBSERVATION_PROPERTY_CODE_SQL_PATTERN,
 } from "../shared/uk_aq_observation_property_code.mjs";
 import {
+  computeObservationContentHash,
+  normalizeCanonicalObservationRow,
+  normalizeUkAirVerificationStatus,
+  validateObservationContentHashMetadata,
+} from "../shared/uk_aq_observation_content_hash.mjs";
+import {
+  OBSERVATION_HISTORY_COLUMNS_V3,
+  OBSERVATION_HISTORY_WRITER_VERSION_V3,
+} from "../shared/uk_aq_observation_history_schema.mjs";
+import {
   buildR2HistoryV2AqilevelsHourlyDataTimeseriesPollutantIndexKey,
+  buildR2HistoryV2ObservationsTimeseriesPollutantIndexKey,
   updateR2HistoryIndexesTargeted,
 } from "../shared/uk_aq_r2_history_index.mjs";
+import {
+  canonicalObservationConnectorManifestKey,
+  connectorDayGateKey,
+  isValidConnectorHistoryGateEvidence,
+  setConnectorDayGateComplete,
+  setConnectorDayGateIncomplete,
+} from "../shared/uk_aq_connector_day_gate.mjs";
+import {
+  comparePruneConnectorSourceIdentities,
+  computePruneConnectorSourceIdentity,
+  normalizePruneConnectorSourceIdentity,
+  pruneConnectorSourceIdentityFailureReason,
+} from "../shared/uk_aq_prune_connector_source_identity.mjs";
+import {
+  mergeConnectorManifestReferences,
+  readParentManifestForBoundedRecovery,
+  runCanonicalDayFinalizer,
+  runCanonicalConnectorDayWriter,
+  runCanonicalGlobalIndexFinalizer,
+  withConnectorDayHistoryLock,
+} from "../shared/uk_aq_r2_history_writer.mjs";
+import { validateCanonicalHistoryV2Manifest } from "../shared/uk_aq_r2_history_manifest_validation.mjs";
+import {
+  buildHistoryV2ConnectorManifest as buildCanonicalHistoryV2ConnectorManifest,
+  buildHistoryV2ConnectorManifestKey as buildCanonicalHistoryV2ConnectorManifestKey,
+  buildHistoryV2DayManifest as buildCanonicalHistoryV2DayManifest,
+  buildHistoryV2DayManifestKey as buildCanonicalHistoryV2DayManifestKey,
+  buildHistoryV2PartKey as buildCanonicalHistoryV2PartKey,
+  buildHistoryV2PollutantManifest as buildCanonicalHistoryV2PollutantManifest,
+  buildHistoryV2PollutantManifestKey as buildCanonicalHistoryV2PollutantManifestKey,
+  serializeCanonicalAqilevelDataV2Parquet as serializeSharedAqilevelDataV2Parquet,
+  serializeCanonicalAqilevelDebugV2Parquet as serializeSharedAqilevelDebugV2Parquet,
+  serializeCanonicalObservationV2Parquet as serializeSharedObservationV2Parquet,
+} from "../shared/uk_aq_r2_history_canonical.mjs";
 import {
   AQI_SUPPORTED_POLLUTANTS,
   buildAqilevelHistoryRowsForDayFromHourlyRows,
@@ -45,25 +96,33 @@ const DEFAULT_ROW_GROUP_SIZE = 100_000;
 const DEFAULT_OBSERVATIONS_ROW_GROUP_SIZE = 50_000;
 const DEFAULT_AQILEVELS_ROW_GROUP_SIZE = DEFAULT_ROW_GROUP_SIZE;
 const DEFAULT_MAX_CANDIDATES_PER_RUN = 500;
-const DEFAULT_MAX_SECONDS_PER_RUN = 840;
+const DEFAULT_MAX_SECONDS_PER_RUN = 1_740;
 const DEFAULT_STOP_BEFORE_TIMEOUT_SECONDS = 60;
-const DEFAULT_AQILEVELS_SOURCE_MAX_PAGES = 50_000;
+const PHASE_B_PG_STATEMENT_TIMEOUT_MAX_MS = 600_000;
+const PHASE_B_PG_CONNECTION_TIMEOUT_MAX_MS = 15_000;
+const PHASE_B_PG_DEADLINE_GUARD_MS = 1_000;
+const PHASE_B_STAGE_MIN_MS = Object.freeze({
+  candidate_start: 300_000,
+  observation_segment: 60_000,
+  aqi_calculation: 180_000,
+  aqi_object_write: 120_000,
+  observation_index: 120_000,
+  aqi_index: 120_000,
+  day_finalization: 120_000,
+  dropbox_comparison: 180_000,
+});
 const DEFAULT_STAGING_RETENTION_DAYS = 7;
 const DEFAULT_STAGING_PREFIX = "history/v1/_ops/observations/staging";
-const DEFAULT_COMMITTED_PREFIX = "history/v1/observations";
-const DEFAULT_AQILEVELS_PREFIX = "history/v1/aqilevels/hourly";
-const DEFAULT_RUNS_PREFIX = "history/v1/_ops/observations/runs";
 const DEFAULT_RUNS_PREFIX_V2 = "history/v2/_ops/observations/runs";
 const DEFAULT_INGESTDB_RETENTION_DAYS = 5;
 const DEFAULT_OBSAQIDB_OBSERVS_RETENTION_DAYS = 14;
-const DEFAULT_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED = false;
-const DEFAULT_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED = true;
 const DEFAULT_PHASE_B_OBSERVATION_SNAPSHOT_MAX_ROWS = 250_000;
 const DEFAULT_PHASE_B_OBSERVATION_SNAPSHOT_MAX_BYTES = 256 * 1024 * 1024;
 const DEFAULT_PHASE_B_PM_CONTEXT_RPC = "uk_aq_rpc_observs_aqi_pm_hourly_context";
 const DEFAULT_PHASE_B_PM_CONTEXT_PAGE_SIZE = 1_000;
 const DEFAULT_PHASE_B_PM_CONTEXT_MAX_PAGES = 100;
 const DEFAULT_PHASE_B_PM_CONTEXT_MAX_ROWS = 50_000;
+const DEFAULT_PHASE_B_SOS_CONNECTOR_ID = 1;
 const DEFAULT_PRUNE_CHECK_DROPBOX_DIR = "prune_r2_check";
 const DROPBOX_TOKEN_URL = "https://api.dropbox.com/oauth2/token";
 const DROPBOX_UPLOAD_URL = "https://content.dropboxapi.com/2/files/upload";
@@ -71,12 +130,7 @@ const DROPBOX_UPLOAD_URL = "https://content.dropboxapi.com/2/files/upload";
 const HISTORY_SCHEMA_NAME = "observations";
 const HISTORY_SCHEMA_VERSION = 2;
 const WRITER_VERSION = "parquet-wasm-zstd-v2";
-const HISTORY_AQILEVELS_SCHEMA_NAME = "aqilevels_hourly";
-const HISTORY_AQILEVELS_SCHEMA_VERSION = 1;
-const HISTORY_AQILEVELS_WRITER_VERSION = "parquet-wasm-zstd-v1";
 const HISTORY_AQILEVELS_GRAIN = "hourly";
-const AQILEVELS_CONNECTOR_COUNTS_RPC = "uk_aq_rpc_aqilevels_history_day_connector_counts";
-const AQILEVELS_ROWS_RPC = "uk_aq_rpc_aqilevels_history_day_rows";
 const DEFAULT_RPC_SCHEMA = "uk_aq_public";
 
 export const HISTORY_OBSERVATIONS_COLUMNS_V1 = Object.freeze([
@@ -94,52 +148,8 @@ export const HISTORY_OBSERVATIONS_COLUMNS_V2 = Object.freeze([
   "value",
 ]);
 const HISTORY_OBSERVATIONS_COLUMNS = HISTORY_OBSERVATIONS_COLUMNS_V2;
-export const HISTORY_OBSERVATIONS_COLUMNS_R2_V2 = Object.freeze([
-  "connector_id",
-  "station_id",
-  "timeseries_id",
-  "pollutant_code",
-  "observed_at_utc",
-  "value",
-]);
-export const HISTORY_AQILEVELS_COLUMNS = Object.freeze([
-  "connector_id",
-  "station_id",
-  "timeseries_id",
-  "pollutant_code",
-  "timestamp_hour_utc",
-  "daqi_input_value_ugm3",
-  "daqi_input_averaging_code",
-  "daqi_index_level",
-  "daqi_source_observation_count",
-  "daqi_required_observation_count",
-  "daqi_calculation_status",
-  "daqi_missing_reason",
-  "eaqi_input_value_ugm3",
-  "eaqi_input_averaging_code",
-  "eaqi_index_level",
-  "eaqi_source_observation_count",
-  "eaqi_required_observation_count",
-  "eaqi_calculation_status",
-  "eaqi_missing_reason",
-  "hourly_sample_count",
-  "algorithm_version",
-  "computed_at_utc",
-  "hourly_mean_ugm3",
-  "rolling24h_mean_ugm3",
-  "no2_hourly_mean_ugm3",
-  "pm25_hourly_mean_ugm3",
-  "pm10_hourly_mean_ugm3",
-  "pm25_rolling24h_mean_ugm3",
-  "pm10_rolling24h_mean_ugm3",
-  "daqi_no2_index_level",
-  "daqi_pm25_rolling24h_index_level",
-  "daqi_pm10_rolling24h_index_level",
-  "eaqi_no2_index_level",
-  "eaqi_pm25_index_level",
-  "eaqi_pm10_index_level",
-  "updated_at",
-]);
+export const HISTORY_OBSERVATIONS_COLUMNS_R2_V2 =
+  OBSERVATION_HISTORY_COLUMNS_V3;
 export const HISTORY_AQILEVELS_HOURLY_DATA_COLUMNS_R2_V2 = Object.freeze([
   "connector_id",
   "station_id",
@@ -181,7 +191,10 @@ const HISTORY_R2_V2_OBSERVATIONS_PREFIX = "history/v2/observations";
 const HISTORY_R2_V2_AQILEVELS_HOURLY_DATA_PREFIX = "history/v2/aqilevels/hourly/data";
 const HISTORY_R2_V2_AQILEVELS_HOURLY_DEBUG_PREFIX = "history/v2/aqilevels/hourly/debug";
 const HISTORY_R2_V2_SCHEMA_VERSION = 2;
+const HISTORY_R2_V2_OBSERVATIONS_MANIFEST_SCHEMA_VERSION = 3;
 const HISTORY_R2_V2_WRITER_VERSION = "parquet-wasm-zstd-v2";
+const HISTORY_R2_V2_OBSERVATIONS_WRITER_VERSION =
+  OBSERVATION_HISTORY_WRITER_VERSION_V3;
 export const PRUNE_HISTORY_DAY_MANIFEST_KEY_REGEX_SOURCE = "^history/(v1/(observations|aqilevels/hourly)|v2/observations)/day_utc=[0-9]{4}-[0-9]{2}-[0-9]{2}/manifest\\.json$";
 const PRUNE_HISTORY_DAY_MANIFEST_KEY_REGEX = new RegExp(PRUNE_HISTORY_DAY_MANIFEST_KEY_REGEX_SOURCE);
 
@@ -243,7 +256,8 @@ function errorLogFields(error) {
 }
 
 export function createPhaseBRunBudgetForTest({
-  startedAtMs = Date.now(),
+  nowMs = Date.now,
+  startedAtMs = nowMs(),
   maxSecondsPerRun = DEFAULT_MAX_SECONDS_PER_RUN,
   stopBeforeTimeoutSeconds = DEFAULT_STOP_BEFORE_TIMEOUT_SECONDS,
 } = {}) {
@@ -255,7 +269,13 @@ export function createPhaseBRunBudgetForTest({
     max_ms: maxMs,
     stop_before_timeout_ms: stopBeforeMs,
     deadline_ms: startedAtMs + usableMs,
+    now_ms: nowMs,
   };
+}
+
+function budgetNowMs(runtime) {
+  const now = runtime?.run_budget?.now_ms;
+  return typeof now === "function" ? Number(now()) : Date.now();
 }
 
 function budgetSnapshot(runtime) {
@@ -266,7 +286,7 @@ function budgetSnapshot(runtime) {
       remaining_budget_ms: null,
     };
   }
-  const now = Date.now();
+  const now = budgetNowMs(runtime);
   return {
     elapsed_run_ms: Math.max(0, now - budget.started_at_ms),
     remaining_budget_ms: Math.max(0, budget.deadline_ms - now),
@@ -278,7 +298,12 @@ function hasBudgetFor(runtime, minMs = 0) {
   if (!budget) {
     return true;
   }
-  return Date.now() + Math.max(0, minMs) < budget.deadline_ms;
+  return budgetNowMs(runtime) + Math.max(0, minMs) < budget.deadline_ms;
+}
+
+function remainingBudgetMs(runtime) {
+  const budget = runtime?.run_budget;
+  return budget ? Math.max(0, budget.deadline_ms - budgetNowMs(runtime)) : null;
 }
 
 function logPhaseB(runtime, severity, event, fields = {}) {
@@ -296,10 +321,11 @@ function logPhaseB(runtime, severity, event, fields = {}) {
 }
 
 class PhaseBHistoryBudgetExhaustedError extends Error {
-  constructor(message = "Phase B history run budget exhausted") {
+  constructor(message = "Phase B history run budget exhausted", operation = null) {
     super(message);
     this.name = "PhaseBHistoryBudgetExhaustedError";
     this.code = "PHASE_B_HISTORY_BUDGET_EXHAUSTED";
+    this.operation = operation;
   }
 }
 
@@ -311,7 +337,54 @@ function assertBudget(runtime, operation, fields = {}, minMs = 0) {
     operation,
     ...fields,
   });
-  throw new PhaseBHistoryBudgetExhaustedError();
+  throw new PhaseBHistoryBudgetExhaustedError(undefined, operation);
+}
+
+function rethrowIfBudgetDeadlineReached(runtime, error, operation, fields = {}) {
+  if (error instanceof PhaseBHistoryBudgetExhaustedError) throw error;
+  if (!hasBudgetFor(runtime, 2_000)) {
+    logPhaseB(runtime, "WARNING", "phase_b_history_budget_exhausted", {
+      operation,
+      ...fields,
+    });
+    throw new PhaseBHistoryBudgetExhaustedError(undefined, operation);
+  }
+}
+
+async function runBudgetedPhaseBStage({ runtime, operation, fields = {}, minMs, adapter }) {
+  assertBudget(runtime, operation, fields, minMs);
+  return await adapter({
+    deadline_ms: runtime?.run_budget?.deadline_ms ?? null,
+    remaining_ms: remainingBudgetMs(runtime),
+  });
+}
+
+export async function runBudgetedPhaseBStageForTest(args) {
+  try {
+    const value = await runBudgetedPhaseBStage(args);
+    return { status: "completed", value };
+  } catch (error) {
+    if (error instanceof PhaseBHistoryBudgetExhaustedError) {
+      return { status: "stopped_budget", value: null };
+    }
+    throw error;
+  }
+}
+
+function stopPhaseBForBudget(summary, runtime, { operation, candidate = null } = {}) {
+  summary.status = "stopped_budget";
+  summary.stopped_for_budget = true;
+  summary.budget_stop = {
+    operation: operation || "unknown",
+    day_utc: candidate?.day_utc || null,
+    connector_id: candidate?.connector_id ?? null,
+    ...budgetSnapshot(runtime),
+  };
+  return summary;
+}
+
+export function stopPhaseBForBudgetForTest({ summary, runtime, operation, candidate = null }) {
+  return stopPhaseBForBudget(summary, runtime, { operation, candidate });
 }
 
 export function isAcceptedPruneHistoryDayManifestKey(value) {
@@ -324,14 +397,11 @@ export function isAcceptedPruneHistoryDayManifestKey(value) {
 
 export function resolvePhaseBHistoryWritePrefixes(env = process.env) {
   const historyWriteVersion = resolveR2HistoryVersion(env, { context: "R2 prune Phase B history writes" });
-  const observationsPrefixV1 = normalizePrefix(
-    env.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX || DEFAULT_COMMITTED_PREFIX,
-  );
+  if (historyWriteVersion !== "v2") {
+    throw new Error("R2 prune Phase B history writes require canonical history version v2");
+  }
   const observationsPrefixV2 = normalizePrefix(
     env.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX || HISTORY_R2_V2_OBSERVATIONS_PREFIX,
-  );
-  const aqilevelsPrefixV1 = normalizePrefix(
-    env.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX || DEFAULT_AQILEVELS_PREFIX,
   );
   const aqilevelsDataPrefixV2 = normalizePrefix(
     env.UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX || HISTORY_R2_V2_AQILEVELS_HOURLY_DATA_PREFIX,
@@ -339,24 +409,18 @@ export function resolvePhaseBHistoryWritePrefixes(env = process.env) {
   const aqilevelsDebugPrefixV2 = normalizePrefix(
     env.UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DEBUG_PREFIX || HISTORY_R2_V2_AQILEVELS_HOURLY_DEBUG_PREFIX,
   );
-  const runsPrefixV1 = normalizePrefix(
-    env.UK_AQ_R2_HISTORY_RUNS_PREFIX || DEFAULT_RUNS_PREFIX,
-  );
   const runsPrefixV2 = normalizePrefix(
     env.UK_AQ_R2_HISTORY_V2_RUNS_PREFIX || DEFAULT_RUNS_PREFIX_V2,
   );
 
   return Object.freeze({
     history_write_version: historyWriteVersion,
-    observations_prefix: historyWriteVersion === "v2" ? observationsPrefixV2 : observationsPrefixV1,
-    observations_prefix_v1: observationsPrefixV1,
+    observations_prefix: observationsPrefixV2,
     observations_prefix_v2: observationsPrefixV2,
-    aqilevels_prefix: historyWriteVersion === "v2" ? aqilevelsDataPrefixV2 : aqilevelsPrefixV1,
-    aqilevels_prefix_v1: aqilevelsPrefixV1,
+    aqilevels_prefix: aqilevelsDataPrefixV2,
     aqilevels_hourly_data_prefix_v2: aqilevelsDataPrefixV2,
     aqilevels_hourly_debug_prefix_v2: aqilevelsDebugPrefixV2,
-    runs_prefix: historyWriteVersion === "v2" ? runsPrefixV2 : runsPrefixV1,
-    runs_prefix_v1: runsPrefixV1,
+    runs_prefix: runsPrefixV2,
     runs_prefix_v2: runsPrefixV2,
   });
 }
@@ -730,19 +794,19 @@ function pollutantPrefix(basePrefix, dayUtc, connectorId, pollutantCode) {
 }
 
 export function buildHistoryV2PollutantManifestKey(basePrefix, dayUtc, connectorId, pollutantCode) {
-  return `${pollutantPrefix(basePrefix, dayUtc, connectorId, pollutantCode)}/manifest.json`;
+  return buildCanonicalHistoryV2PollutantManifestKey(basePrefix, dayUtc, connectorId, pollutantCode);
 }
 
 export function buildHistoryV2PartKey(basePrefix, dayUtc, connectorId, pollutantCode, partIndex) {
-  return `${pollutantPrefix(basePrefix, dayUtc, connectorId, pollutantCode)}/part-${String(partIndex).padStart(5, "0")}.parquet`;
+  return buildCanonicalHistoryV2PartKey(basePrefix, dayUtc, connectorId, pollutantCode, partIndex);
 }
 
 export function buildHistoryV2ConnectorManifestKey(basePrefix, dayUtc, connectorId) {
-  return buildConnectorManifestKey(basePrefix, dayUtc, connectorId);
+  return buildCanonicalHistoryV2ConnectorManifestKey(basePrefix, dayUtc, connectorId);
 }
 
 export function buildHistoryV2DayManifestKey(basePrefix, dayUtc) {
-  return buildDayManifestKey(basePrefix, dayUtc);
+  return buildCanonicalHistoryV2DayManifestKey(basePrefix, dayUtc);
 }
 
 export function defaultHistoryV2PrefixesForTest() {
@@ -753,28 +817,69 @@ export function defaultHistoryV2PrefixesForTest() {
   };
 }
 
-function toPgConnectionConfig(connectionString) {
+function toPgConnectionConfig(connectionString, connectionTimeoutMs) {
   return {
     connectionString,
     statement_timeout: 0,
     query_timeout: 0,
+    connectionTimeoutMillis: connectionTimeoutMs,
     application_name: "uk_aq_prune_daily_phase_b_history",
   };
 }
 
-async function withPgClient(connectionString, fn) {
-  const client = new Client(toPgConnectionConfig(connectionString));
+export function derivePhaseBPgTimeoutsForTest(runtime) {
+  const remainingMs = remainingBudgetMs(runtime);
+  const usableMs = remainingMs === null
+    ? PHASE_B_PG_STATEMENT_TIMEOUT_MAX_MS
+    : Math.trunc(remainingMs) - PHASE_B_PG_DEADLINE_GUARD_MS;
+  if (usableMs < 1) {
+    throw new PhaseBHistoryBudgetExhaustedError(
+      "Phase B history run budget exhausted before PostgreSQL control work",
+      "control_database_connection",
+    );
+  }
+  return {
+    remaining_budget_ms: remainingMs,
+    statement_timeout_ms: Math.max(1, Math.min(PHASE_B_PG_STATEMENT_TIMEOUT_MAX_MS, usableMs)),
+    connection_timeout_ms: Math.max(1, Math.min(PHASE_B_PG_CONNECTION_TIMEOUT_MAX_MS, usableMs)),
+  };
+}
+
+function isPgStatementTimeoutError(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return error?.code === "57014"
+    && /statement timeout|canceling statement due to statement timeout/i.test(message);
+}
+
+async function withPgClient(
+  connectionString,
+  fn,
+  {
+    statementTimeoutMs = PHASE_B_PG_STATEMENT_TIMEOUT_MAX_MS,
+    connectionTimeoutMs = PHASE_B_PG_CONNECTION_TIMEOUT_MAX_MS,
+    createClient = (config) => new Client(config),
+  } = {},
+) {
+  const boundedConnectionTimeoutMs = Math.max(
+    1,
+    Math.min(PHASE_B_PG_CONNECTION_TIMEOUT_MAX_MS, Math.trunc(Number(connectionTimeoutMs) || PHASE_B_PG_CONNECTION_TIMEOUT_MAX_MS)),
+  );
+  const client = createClient(toPgConnectionConfig(connectionString, boundedConnectionTimeoutMs));
   await client.connect();
   try {
     await client.query("set timezone = 'UTC'");
-    await client.query("set statement_timeout = '10min'");
+    const boundedStatementTimeoutMs = Math.max(
+      1,
+      Math.min(PHASE_B_PG_STATEMENT_TIMEOUT_MAX_MS, Math.trunc(Number(statementTimeoutMs) || PHASE_B_PG_STATEMENT_TIMEOUT_MAX_MS)),
+    );
+    await client.query(`set statement_timeout = '${boundedStatementTimeoutMs}ms'`);
     return await fn(client);
   } finally {
     await client.end();
   }
 }
 
-async function postgrestRpc({ baseUrl, privilegedKey, rpcSchema, rpcName, payload }) {
+async function postgrestRpc({ baseUrl, privilegedKey, rpcSchema, rpcName, payload, signal = undefined }) {
   const endpoint = `${normalizeBaseUrl(baseUrl)}/rest/v1/rpc/${encodeURIComponent(rpcName)}`;
   const response = await fetch(endpoint, {
     method: "POST",
@@ -787,6 +892,7 @@ async function postgrestRpc({ baseUrl, privilegedKey, rpcSchema, rpcName, payloa
       "Content-Profile": rpcSchema,
     },
     body: JSON.stringify(payload ?? {}),
+    signal,
   });
 
   const text = await response.text();
@@ -945,7 +1051,7 @@ async function fetchPmHourlyContext({ runtime, dayUtc, connectorId, targetPmTime
         day_utc: dayUtc,
         connector_id: connectorId,
         ...diagnostics,
-      }, 30_000);
+      }, PHASE_B_STAGE_MIN_MS.observation_segment);
       if (diagnostics.pm_context_page_count >= runtime.pm_context_max_pages) {
         throw new Error(`PM context RPC exceeded max pages (${runtime.pm_context_max_pages}) before completion`);
       }
@@ -962,6 +1068,7 @@ async function fetchPmHourlyContext({ runtime, dayUtc, connectorId, targetPmTime
           p_after_timestamp_hour_utc: afterTimestampHourUtc,
           p_limit: runtime.pm_context_page_size,
         },
+        signal: AbortSignal.timeout(Math.max(1, (remainingBudgetMs(runtime) ?? 60_000) - 1_000)),
       });
       if (!Array.isArray(payload)) {
         throw new Error("PM context RPC returned a non-array response");
@@ -1014,6 +1121,10 @@ async function fetchPmHourlyContext({ runtime, dayUtc, connectorId, targetPmTime
       }
     }
   } catch (error) {
+    rethrowIfBudgetDeadlineReached(runtime, error, "pm_context_fetch", {
+      day_utc: dayUtc,
+      connector_id: connectorId,
+    });
     if (error instanceof PhaseBPmContextError) throw error;
     throw new PhaseBPmContextError(
       error instanceof Error ? error.message : String(error),
@@ -1125,6 +1236,15 @@ function toConnectorDayRow(row) {
     history_total_bytes: row.history_total_bytes === null || row.history_total_bytes === undefined
       ? null
       : parseBigInt(row.history_total_bytes, "history_total_bytes"),
+    source_content_hash: row.source_content_hash ? String(row.source_content_hash) : null,
+    source_content_hash_contract_version:
+      row.source_content_hash_contract_version === null || row.source_content_hash_contract_version === undefined
+        ? null
+        : Number(row.source_content_hash_contract_version),
+    source_content_hash_row_count:
+      row.source_content_hash_row_count === null || row.source_content_hash_row_count === undefined
+        ? null
+        : parseBigInt(row.source_content_hash_row_count, "source_content_hash_row_count"),
     resume_last_timeseries_id: row.resume_last_timeseries_id === null || row.resume_last_timeseries_id === undefined
       ? null
       : Number(row.resume_last_timeseries_id),
@@ -1139,6 +1259,170 @@ function toConnectorDayRow(row) {
       : parseBigInt(row.resume_exported_row_count, "resume_exported_row_count"),
     resume_parts: parseResumeParts(row.resume_parts_json),
   };
+}
+
+async function readCanonicalConnectorDaySourceRows(client, dayUtc, connectorId) {
+  const dayStart = `${dayUtc}T00:00:00.000Z`;
+  const dayEnd = `${shiftIsoDay(dayUtc, 1)}T00:00:00.000Z`;
+  const result = await client.query(
+    `
+select
+  connector_id,
+  station_id,
+  timeseries_id,
+  pollutant_code,
+  observed_at_utc,
+  value,
+  status
+from uk_aq_ops.uk_aq_phase_b_history_rows_v2(
+  $1::integer,
+  $2::timestamptz,
+  $3::timestamptz,
+  null::integer,
+  null::timestamptz
+)
+`,
+    [connectorId, dayStart, dayEnd],
+  );
+  return result.rows;
+}
+
+async function invalidateCandidateAndConnectorGateSourceIdentity(
+  client,
+  candidate,
+  failureReason,
+) {
+  await client.query(
+    `
+update uk_aq_ops.history_candidates
+set
+  status = 'pending',
+  run_id = null,
+  last_error = $3,
+  manifest_key = null,
+  history_row_count = null,
+  history_file_count = null,
+  history_total_bytes = null,
+  history_completed_at = null,
+  source_content_hash = null,
+  source_content_hash_contract_version = null,
+  source_content_hash_row_count = null,
+  resume_last_timeseries_id = null,
+  resume_last_observed_at = null,
+  resume_part_index = 0,
+  resume_exported_row_count = 0,
+  resume_parts_json = '[]'::jsonb,
+  updated_at = now()
+where day_utc = $1::date
+  and connector_id = $2::integer
+  and status = 'complete'
+`,
+    [candidate.day_utc, candidate.connector_id, failureReason],
+  );
+  await setConnectorDayGateIncomplete(client, {
+    day_utc: candidate.day_utc,
+    connector_id: candidate.connector_id,
+  });
+}
+
+async function revalidateCompleteCandidateSourceIdentity(client, candidate) {
+  if (candidate.status !== "complete") return candidate;
+  await client.query("begin isolation level repeatable read");
+  try {
+    const locked = await client.query(
+      `
+select *
+from uk_aq_ops.history_candidates
+where day_utc = $1::date
+  and connector_id = $2::integer
+for update
+`,
+      [candidate.day_utc, candidate.connector_id],
+    );
+    const currentCandidate = locked.rows[0] ? toConnectorDayRow(locked.rows[0]) : candidate;
+    if (currentCandidate.status !== "complete") {
+      await client.query("commit");
+      return currentCandidate;
+    }
+    let currentIdentity;
+    let failureReason = null;
+    try {
+      currentIdentity = computePruneConnectorSourceIdentity(
+        await readCanonicalConnectorDaySourceRows(
+          client,
+          currentCandidate.day_utc,
+          currentCandidate.connector_id,
+        ),
+      );
+    } catch (error) {
+      failureReason = pruneConnectorSourceIdentityFailureReason(error);
+    }
+    if (!failureReason) {
+      try {
+        const persistedIdentity = normalizePruneConnectorSourceIdentity(currentCandidate);
+        const comparison = comparePruneConnectorSourceIdentities(
+          persistedIdentity,
+          currentIdentity,
+        );
+        if (!comparison.match) failureReason = comparison.failure_reason;
+      } catch (error) {
+        failureReason = pruneConnectorSourceIdentityFailureReason(error);
+      }
+    }
+    if (failureReason) {
+      await invalidateCandidateAndConnectorGateSourceIdentity(
+        client,
+        currentCandidate,
+        failureReason,
+      );
+      await client.query("commit");
+      return {
+        ...currentCandidate,
+        status: "pending",
+        run_id: null,
+        manifest_key: null,
+        history_row_count: null,
+        history_file_count: null,
+        history_total_bytes: null,
+        source_content_hash: null,
+        source_content_hash_contract_version: null,
+        source_content_hash_row_count: null,
+        source_changed_connector_gate_invalidated: true,
+        source_identity_match: false,
+        source_identity_failure_reason: failureReason,
+        source_identity_rows: currentIdentity?.source_content_hash_row_count ?? null,
+        candidate_source_identity_present: Boolean(
+          currentCandidate.source_content_hash
+          && currentCandidate.source_content_hash_contract_version !== null
+          && currentCandidate.source_content_hash_row_count !== null
+        ),
+        gate_source_identity_present: null,
+        source_identity_invalidated_connector_days: 1,
+        source_change_invalidation: {
+          day_utc: currentCandidate.day_utc,
+          connector_id: currentCandidate.connector_id,
+          source_identity_failure_reason: failureReason,
+        },
+      };
+    }
+    await client.query("commit");
+    return {
+      ...currentCandidate,
+      source_identity_match: true,
+      source_identity_failure_reason: null,
+      source_identity_rows: currentIdentity.source_content_hash_row_count,
+      candidate_source_identity_present: true,
+      gate_source_identity_present: null,
+      source_identity_invalidated_connector_days: 0,
+    };
+  } catch (error) {
+    await client.query("rollback");
+    throw error;
+  }
+}
+
+export async function revalidateCompleteCandidateSourceIdentityForTest(client, candidate) {
+  return revalidateCompleteCandidateSourceIdentity(client, candidate);
 }
 
 
@@ -1178,6 +1462,27 @@ with source_aggregates as (
     and op.code ~ '${OBSERVATION_PROPERTY_CODE_SQL_PATTERN}'
   group by 1, 2
 ),
+source_changes as materialized (
+  select
+    sa.day_utc,
+    sa.connector_id,
+    hc.expected_row_count as previous_expected_row_count,
+    sa.expected_row_count as current_expected_row_count,
+    hc.min_observed_at as previous_min_observed_at,
+    sa.min_observed_at as current_min_observed_at,
+    hc.max_observed_at as previous_max_observed_at,
+    sa.max_observed_at as current_max_observed_at
+  from source_aggregates sa
+  join uk_aq_ops.history_candidates hc
+    on hc.day_utc = sa.day_utc
+   and hc.connector_id = sa.connector_id
+  where hc.status = 'complete'
+    and (
+      hc.expected_row_count is distinct from sa.expected_row_count
+      or hc.min_observed_at is distinct from sa.min_observed_at
+      or hc.max_observed_at is distinct from sa.max_observed_at
+    )
+),
 upserted as (
   insert into uk_aq_ops.history_candidates (
     day_utc,
@@ -1193,6 +1498,9 @@ upserted as (
     history_file_count,
     history_total_bytes,
     history_completed_at,
+    source_content_hash,
+    source_content_hash_contract_version,
+    source_content_hash_row_count,
     resume_last_timeseries_id,
     resume_last_observed_at,
     resume_part_index,
@@ -1206,6 +1514,9 @@ upserted as (
     sa.min_observed_at,
     sa.max_observed_at,
     'pending'::text,
+    null,
+    null,
+    null,
     null,
     null,
     null,
@@ -1288,6 +1599,30 @@ upserted as (
       then uk_aq_ops.history_candidates.history_completed_at
       else null
     end,
+    source_content_hash = case
+      when uk_aq_ops.history_candidates.status = 'complete'
+       and uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
+       and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
+       and uk_aq_ops.history_candidates.max_observed_at is not distinct from excluded.max_observed_at
+      then uk_aq_ops.history_candidates.source_content_hash
+      else null
+    end,
+    source_content_hash_contract_version = case
+      when uk_aq_ops.history_candidates.status = 'complete'
+       and uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
+       and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
+       and uk_aq_ops.history_candidates.max_observed_at is not distinct from excluded.max_observed_at
+      then uk_aq_ops.history_candidates.source_content_hash_contract_version
+      else null
+    end,
+    source_content_hash_row_count = case
+      when uk_aq_ops.history_candidates.status = 'complete'
+       and uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
+       and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
+       and uk_aq_ops.history_candidates.max_observed_at is not distinct from excluded.max_observed_at
+      then uk_aq_ops.history_candidates.source_content_hash_row_count
+      else null
+    end,
     resume_last_timeseries_id = case
       when uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
        and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
@@ -1336,23 +1671,108 @@ upserted as (
     history_row_count,
     history_file_count,
     history_total_bytes,
+    source_content_hash,
+    source_content_hash_contract_version,
+    source_content_hash_row_count,
     resume_last_timeseries_id,
     resume_last_observed_at,
     resume_part_index,
     resume_exported_row_count,
     resume_parts_json
+),
+invalidated_connector_gates as (
+  insert into uk_aq_ops.prune_connector_day_gates (
+    day_utc,
+    connector_id,
+    history_done,
+    updated_at
+  )
+  select
+    sc.day_utc,
+    sc.connector_id,
+    false,
+    now()
+  from source_changes sc
+  on conflict (day_utc, connector_id)
+  do update set
+    history_done = false,
+    history_run_id = null,
+    history_manifest_key = null,
+    history_manifest_hash = null,
+    history_row_count = null,
+    history_file_count = null,
+    history_total_bytes = null,
+    history_completed_at = null,
+    source_content_hash = null,
+    source_content_hash_contract_version = null,
+    source_content_hash_row_count = null,
+    completion_source = null,
+    updated_at = now()
+  returning day_utc, connector_id
 )
 select
   u.*,
   u.expected_row_count::bigint as source_row_count,
   0::bigint as excluded_row_count,
-  '{}'::jsonb as excluded_pollutant_counts
+  '{}'::jsonb as excluded_pollutant_counts,
+  (ig.day_utc is not null) as source_changed_connector_gate_invalidated,
+  sc.previous_expected_row_count,
+  sc.current_expected_row_count,
+  sc.previous_min_observed_at,
+  sc.current_min_observed_at,
+  sc.previous_max_observed_at,
+  sc.current_max_observed_at
 from upserted u
+left join source_changes sc
+  on sc.day_utc = u.day_utc
+ and sc.connector_id = u.connector_id
+left join invalidated_connector_gates ig
+  on ig.day_utc = u.day_utc
+ and ig.connector_id = u.connector_id
 order by u.day_utc, u.connector_id
 `;
 
     const result = await client.query(sql, [latestEligibleWindowEndIso]);
-    return result.rows.map(toConnectorDayRow);
+    const candidates = result.rows.map((row) => {
+      const candidate = toConnectorDayRow(row);
+      const invalidated = row.source_changed_connector_gate_invalidated === true;
+      return {
+        ...candidate,
+        source_changed_connector_gate_invalidated: invalidated,
+        source_change_invalidation: invalidated
+          ? {
+            day_utc: candidate.day_utc,
+            connector_id: candidate.connector_id,
+            previous_expected_row_count: String(row.previous_expected_row_count),
+            current_expected_row_count: String(row.current_expected_row_count),
+            previous_min_observed_at: row.previous_min_observed_at
+              ? new Date(row.previous_min_observed_at).toISOString()
+              : null,
+            current_min_observed_at: row.current_min_observed_at
+              ? new Date(row.current_min_observed_at).toISOString()
+              : null,
+            previous_max_observed_at: row.previous_max_observed_at
+              ? new Date(row.previous_max_observed_at).toISOString()
+              : null,
+            current_max_observed_at: row.current_max_observed_at
+              ? new Date(row.current_max_observed_at).toISOString()
+              : null,
+          }
+          : null,
+      };
+    });
+    const revalidated = [];
+    for (const candidate of candidates) {
+      const checked = await revalidateCompleteCandidateSourceIdentity(client, candidate);
+      revalidated.push({
+        ...candidate,
+        ...checked,
+        source_changed_connector_gate_invalidated:
+          candidate.source_changed_connector_gate_invalidated === true
+          || checked.source_changed_connector_gate_invalidated === true,
+      });
+    }
+    return revalidated;
   }
 
   const sql = `
@@ -1426,6 +1846,9 @@ upserted as (
     history_file_count = null,
     history_total_bytes = null,
     history_completed_at = null,
+    source_content_hash = null,
+    source_content_hash_contract_version = null,
+    source_content_hash_row_count = null,
     resume_last_timeseries_id = case
       when uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
        and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
@@ -1497,13 +1920,24 @@ export async function populateBackupCandidatesForTest({
   return populateBackupCandidates(client, latestEligibleWindowEndIso, runtime);
 }
 
-async function markIncompleteDaysAsBackupBlocked(client) {
+async function markActiveIncompleteDaysAsBackupBlocked(client, activeCandidates) {
+  const activeScope = activeCandidateScopeJson(activeCandidates);
+  if (activeScope === "[]") return;
   const sql = `
-with day_status as (
+with active_scope as (
+  select
+    s.day_utc::date as day_utc,
+    s.connector_id::integer as connector_id
+  from jsonb_to_recordset($1::jsonb) as s(day_utc text, connector_id integer)
+),
+day_status as (
   select
     c.day_utc,
     bool_and(c.status = 'complete') as all_complete
   from uk_aq_ops.history_candidates c
+  join active_scope s
+    on s.day_utc = c.day_utc
+   and s.connector_id = c.connector_id
   group by c.day_utc
 )
 insert into uk_aq_ops.prune_day_gates (
@@ -1540,11 +1974,30 @@ do update set
   history_completed_at = null,
   updated_at = now()
 `;
-  await client.query(sql);
+  await client.query(sql, [activeScope]);
 }
 
-async function fetchPendingCandidates(client, maxCandidatesPerRun) {
+function activeCandidateScopeJson(candidates) {
+  const distinct = new Map();
+  for (const candidate of candidates || []) {
+    const dayUtc = String(candidate?.day_utc || "").slice(0, 10);
+    const connectorId = Number(candidate?.connector_id);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dayUtc) || !Number.isInteger(connectorId) || connectorId <= 0) {
+      continue;
+    }
+    distinct.set(`${dayUtc}:${connectorId}`, { day_utc: dayUtc, connector_id: connectorId });
+  }
+  return JSON.stringify(Array.from(distinct.values()));
+}
+
+async function fetchPendingCandidates(client, activeCandidates, maxCandidatesPerRun) {
   const sql = `
+with active_scope as (
+  select
+    s.day_utc::date as day_utc,
+    s.connector_id::integer as connector_id
+  from jsonb_to_recordset($1::jsonb) as s(day_utc text, connector_id integer)
+)
 select
   c.day_utc,
   c.connector_id,
@@ -1563,12 +2016,15 @@ select
   c.resume_exported_row_count,
   c.resume_parts_json
 from uk_aq_ops.history_candidates c
+join active_scope s
+  on s.day_utc = c.day_utc
+ and s.connector_id = c.connector_id
 where c.status = 'pending'
 order by c.day_utc, c.connector_id
-limit $1
+limit $2
 `;
 
-  const result = await client.query(sql, [maxCandidatesPerRun]);
+  const result = await client.query(sql, [activeCandidateScopeJson(activeCandidates), maxCandidatesPerRun]);
   return result.rows.map(toConnectorDayRow);
 }
 
@@ -1580,6 +2036,9 @@ set
   status = 'in_progress',
   run_id = $3,
   last_error = null,
+  source_content_hash = null,
+  source_content_hash_contract_version = null,
+  source_content_hash_row_count = null,
   updated_at = now()
 where day_utc = $1::date
   and connector_id = $2::integer
@@ -1599,6 +2058,7 @@ async function markCandidateComplete(client, {
   historyRowCount,
   historyFileCount,
   historyTotalBytes,
+  sourceIdentity,
 }) {
   await client.query(
     `
@@ -1611,6 +2071,9 @@ set
   history_row_count = $5,
   history_file_count = $6,
   history_total_bytes = $7,
+  source_content_hash = $8,
+  source_content_hash_contract_version = $9,
+  source_content_hash_row_count = $10,
   resume_last_timeseries_id = null,
   resume_last_observed_at = null,
   resume_part_index = 0,
@@ -1629,8 +2092,57 @@ where day_utc = $1::date
       historyRowCount.toString(),
       historyFileCount,
       historyTotalBytes.toString(),
+      sourceIdentity.source_content_hash,
+      sourceIdentity.source_content_hash_contract_version,
+      sourceIdentity.source_content_hash_row_count,
     ],
   );
+}
+
+async function markCandidateAndConnectorGateComplete(client, {
+  dayUtc,
+  connectorId,
+  runId,
+  manifestKey,
+  manifestHash,
+  historyRowCount,
+  historyFileCount,
+  historyTotalBytes,
+  sourceIdentity,
+}) {
+  await client.query("begin");
+  try {
+    await markCandidateComplete(client, {
+      dayUtc,
+      connectorId,
+      runId,
+      manifestKey,
+      historyRowCount,
+      historyFileCount,
+      historyTotalBytes,
+      sourceIdentity,
+    });
+    await setConnectorDayGateComplete(client, {
+      day_utc: dayUtc,
+      connector_id: connectorId,
+      history_run_id: runId,
+      history_manifest_key: manifestKey,
+      history_manifest_hash: manifestHash,
+      history_row_count: historyRowCount,
+      history_file_count: historyFileCount,
+      history_total_bytes: historyTotalBytes,
+      ...sourceIdentity,
+      completion_source: "prune_daily_phase_b",
+    });
+    await client.query("commit");
+  } catch (error) {
+    await client.query("rollback");
+    throw error;
+  }
+}
+
+export async function markCandidateAndConnectorGateCompleteForTest(client, evidence) {
+  return markCandidateAndConnectorGateComplete(client, evidence);
 }
 
 async function updateCandidateResumeCheckpoint(client, {
@@ -1678,11 +2190,44 @@ set
   status = 'failed',
   run_id = $3,
   last_error = left($4, 4000),
+  source_content_hash = null,
+  source_content_hash_contract_version = null,
+  source_content_hash_row_count = null,
   updated_at = now()
 where day_utc = $1::date
   and connector_id = $2::integer
 `,
     [dayUtc, connectorId, runId, errorText],
+  );
+}
+
+async function markCandidateStoppedForBudget(client, {
+  dayUtc,
+  connectorId,
+  runId,
+  errorText,
+  clearCheckpoint = false,
+}) {
+  await client.query(
+    `
+update uk_aq_ops.history_candidates
+set
+  status = 'pending',
+  run_id = $3,
+  last_error = left($4, 4000),
+  source_content_hash = null,
+  source_content_hash_contract_version = null,
+  source_content_hash_row_count = null,
+  resume_last_timeseries_id = case when $5::boolean then null else resume_last_timeseries_id end,
+  resume_last_observed_at = case when $5::boolean then null else resume_last_observed_at end,
+  resume_part_index = case when $5::boolean then 0 else resume_part_index end,
+  resume_exported_row_count = case when $5::boolean then 0 else resume_exported_row_count end,
+  resume_parts_json = case when $5::boolean then '[]'::jsonb else resume_parts_json end,
+  updated_at = now()
+where day_utc = $1::date
+  and connector_id = $2::integer
+`,
+    [dayUtc, connectorId, runId, errorText, clearCheckpoint],
   );
 }
 
@@ -1881,521 +2426,16 @@ export function buildConnectorManifestForTest(args) {
   return createConnectorManifest(args);
 }
 
-function createDayManifest({ dayUtc, runId, connectorManifests, writerGitSha, backedUpAtUtc }) {
-  const files = connectorManifests.flatMap((manifest) =>
-    (Array.isArray(manifest.files) ? manifest.files : []).map((entry) => ({
-      connector_id: manifest.connector_id,
-      key: entry.key,
-      bytes: entry.bytes,
-      row_count: entry.row_count,
-      etag_or_hash: entry.etag_or_hash,
-      min_timeseries_id: entry.min_timeseries_id ?? null,
-      max_timeseries_id: entry.max_timeseries_id ?? null,
-      min_observed_at: entry.min_observed_at ?? null,
-      max_observed_at: entry.max_observed_at ?? null,
-    }))
-  );
-
-  const parquetObjectKeys = uniqueSorted(files.map((entry) => entry.key));
-  const totalRows = connectorManifests.reduce((sum, manifest) => sum + Number(manifest.source_row_count || 0), 0);
-  const totalBytes = files.reduce((sum, file) => sum + Number(file.bytes || 0), 0);
-  const connectorIds = connectorManifests.map((manifest) => Number(manifest.connector_id));
-
-  const minObservedAt = connectorManifests.reduce(
-    (current, manifest) => minIso(current, manifest.min_observed_at || null),
-    null,
-  );
-  const maxObservedAt = connectorManifests.reduce(
-    (current, manifest) => maxIso(current, manifest.max_observed_at || null),
-    null,
-  );
-
-  const stats = statsFromFileEntries(files, totalRows);
-
-  return withManifestHash({
-    day_utc: dayUtc,
-    connector_id: null,
-    connector_ids: connectorIds,
-    run_id: runId,
-    source_row_count: totalRows,
-    min_observed_at: minObservedAt,
-    max_observed_at: maxObservedAt,
-    parquet_object_keys: parquetObjectKeys,
-    file_count: files.length,
-    total_bytes: totalBytes,
-    files,
-    connector_manifests: connectorManifests.map((manifest) => ({
-      connector_id: manifest.connector_id,
-      manifest_key: manifest.manifest_key,
-      source_row_count: manifest.source_row_count,
-      file_count: manifest.file_count,
-      total_bytes: manifest.total_bytes,
-    })),
-    history_schema_name: HISTORY_SCHEMA_NAME,
-    history_schema_version: HISTORY_SCHEMA_VERSION,
-    columns: HISTORY_OBSERVATIONS_COLUMNS,
-    writer_version: WRITER_VERSION,
-    writer_git_sha: writerGitSha,
-    ...stats,
-    backed_up_at_utc: backedUpAtUtc,
-  });
-}
-
-function createAqilevelConnectorManifest({
-  dayUtc,
-  connectorId,
-  runId,
-  sourceRowCount,
-  minTimeseriesId,
-  maxTimeseriesId,
-  minTimestampHourUtc,
-  maxTimestampHourUtc,
-  fileEntries,
-  writerGitSha,
-  backedUpAtUtc,
-}) {
-  const parquetObjectKeys = fileEntries.map((entry) => entry.key);
-  const totalBytes = fileEntries.reduce((sum, entry) => sum + Number(entry.bytes || 0), 0);
-  const resolvedMinTimeseriesId = Number.isFinite(Number(minTimeseriesId))
-    && Number(minTimeseriesId) > 0
-    ? Math.trunc(Number(minTimeseriesId))
-    : fileEntries.reduce((current, entry) => {
-      const value = Number(entry.min_timeseries_id);
-      if (!Number.isFinite(value) || value <= 0) {
-        return current;
-      }
-      const normalized = Math.trunc(value);
-      return current === null ? normalized : Math.min(current, normalized);
-    }, null);
-  const resolvedMaxTimeseriesId = Number.isFinite(Number(maxTimeseriesId))
-    && Number(maxTimeseriesId) > 0
-    ? Math.trunc(Number(maxTimeseriesId))
-    : fileEntries.reduce((current, entry) => {
-      const value = Number(entry.max_timeseries_id);
-      if (!Number.isFinite(value) || value <= 0) {
-        return current;
-      }
-      const normalized = Math.trunc(value);
-      return current === null ? normalized : Math.max(current, normalized);
-    }, null);
-  const stats = statsFromFileEntries(fileEntries, sourceRowCount);
-  const availablePollutants = uniqueSorted(
-    fileEntries.flatMap((entry) =>
-      Array.isArray(entry.pollutant_codes)
-        ? entry.pollutant_codes.map((pollutantCode) => String(pollutantCode || "").trim().toLowerCase()).filter(Boolean)
-        : []
-    ),
-  );
-
-  return withManifestHash({
-    day_utc: dayUtc,
-    connector_id: connectorId,
-    run_id: runId,
-    source_row_count: Number(sourceRowCount),
-    min_timeseries_id: resolvedMinTimeseriesId,
-    max_timeseries_id: resolvedMaxTimeseriesId,
-    min_timestamp_hour_utc: minTimestampHourUtc,
-    max_timestamp_hour_utc: maxTimestampHourUtc,
-    parquet_object_keys: parquetObjectKeys,
-    file_count: fileEntries.length,
-    total_bytes: totalBytes,
-    files: fileEntries,
-    grain: HISTORY_AQILEVELS_GRAIN,
-    history_schema_name: HISTORY_AQILEVELS_SCHEMA_NAME,
-    history_schema_version: HISTORY_AQILEVELS_SCHEMA_VERSION,
-    columns: HISTORY_AQILEVELS_COLUMNS,
-    writer_version: HISTORY_AQILEVELS_WRITER_VERSION,
-    writer_git_sha: writerGitSha,
-    available_pollutants: availablePollutants,
-    ...stats,
-    backed_up_at_utc: backedUpAtUtc,
-  });
-}
-
-export function buildAqilevelConnectorManifestForTest(args) {
-  return createAqilevelConnectorManifest(args);
-}
-
-function createAqilevelDayManifest({ dayUtc, runId, connectorManifests, writerGitSha, backedUpAtUtc }) {
-  const files = connectorManifests.flatMap((manifest) =>
-    (Array.isArray(manifest.files) ? manifest.files : []).map((entry) => ({
-      connector_id: manifest.connector_id,
-      key: entry.key,
-      bytes: entry.bytes,
-      row_count: entry.row_count,
-      etag_or_hash: entry.etag_or_hash,
-      min_timeseries_id: entry.min_timeseries_id ?? null,
-      max_timeseries_id: entry.max_timeseries_id ?? null,
-      min_timestamp_hour_utc: entry.min_timestamp_hour_utc ?? null,
-      max_timestamp_hour_utc: entry.max_timestamp_hour_utc ?? null,
-      pollutant_codes: Array.isArray(entry.pollutant_codes) ? entry.pollutant_codes : [],
-    }))
-  );
-
-  const parquetObjectKeys = uniqueSorted(files.map((entry) => entry.key));
-  const totalRows = connectorManifests.reduce((sum, manifest) => sum + Number(manifest.source_row_count || 0), 0);
-  const totalBytes = files.reduce((sum, file) => sum + Number(file.bytes || 0), 0);
-  const connectorIds = connectorManifests.map((manifest) => Number(manifest.connector_id));
-  const minTimeseriesId = connectorManifests.reduce((current, manifest) => {
-    const value = Number(manifest.min_timeseries_id);
-    if (!Number.isFinite(value) || value <= 0) {
-      return current;
-    }
-    const normalized = Math.trunc(value);
-    return current === null ? normalized : Math.min(current, normalized);
-  }, null);
-  const maxTimeseriesId = connectorManifests.reduce((current, manifest) => {
-    const value = Number(manifest.max_timeseries_id);
-    if (!Number.isFinite(value) || value <= 0) {
-      return current;
-    }
-    const normalized = Math.trunc(value);
-    return current === null ? normalized : Math.max(current, normalized);
-  }, null);
-
-  const minTimestampHourUtc = connectorManifests.reduce(
-    (current, manifest) => minIso(current, manifest.min_timestamp_hour_utc || null),
-    null,
-  );
-  const maxTimestampHourUtc = connectorManifests.reduce(
-    (current, manifest) => maxIso(current, manifest.max_timestamp_hour_utc || null),
-    null,
-  );
-  const availablePollutants = uniqueSorted(
-    connectorManifests.flatMap((manifest) =>
-      Array.isArray(manifest.available_pollutants)
-        ? manifest.available_pollutants.map((pollutantCode) => String(pollutantCode || "").trim().toLowerCase()).filter(Boolean)
-        : []
-    ),
-  );
-
-  const stats = statsFromFileEntries(files, totalRows);
-
-  return withManifestHash({
-    day_utc: dayUtc,
-    connector_id: null,
-    connector_ids: connectorIds,
-    run_id: runId,
-    source_row_count: totalRows,
-    min_timeseries_id: minTimeseriesId,
-    max_timeseries_id: maxTimeseriesId,
-    min_timestamp_hour_utc: minTimestampHourUtc,
-    max_timestamp_hour_utc: maxTimestampHourUtc,
-    parquet_object_keys: parquetObjectKeys,
-    file_count: files.length,
-    total_bytes: totalBytes,
-    files,
-    grain: HISTORY_AQILEVELS_GRAIN,
-    connector_manifests: connectorManifests.map((manifest) => ({
-      connector_id: manifest.connector_id,
-      manifest_key: manifest.manifest_key,
-      source_row_count: manifest.source_row_count,
-      min_timeseries_id: manifest.min_timeseries_id ?? null,
-      max_timeseries_id: manifest.max_timeseries_id ?? null,
-      file_count: manifest.file_count,
-      total_bytes: manifest.total_bytes,
-      available_pollutants: Array.isArray(manifest.available_pollutants) ? manifest.available_pollutants : [],
-    })),
-    history_schema_name: HISTORY_AQILEVELS_SCHEMA_NAME,
-    history_schema_version: HISTORY_AQILEVELS_SCHEMA_VERSION,
-    columns: HISTORY_AQILEVELS_COLUMNS,
-    writer_version: HISTORY_AQILEVELS_WRITER_VERSION,
-    writer_git_sha: writerGitSha,
-    available_pollutants: availablePollutants,
-    ...stats,
-    backed_up_at_utc: backedUpAtUtc,
-  });
-}
-
-export function buildAqilevelDayManifestForTest(args) {
-  return createAqilevelDayManifest(args);
-}
-
-function historyV2ColumnsFor(domain, profile = null) {
-  if (domain === "observations") {
-    return HISTORY_OBSERVATIONS_COLUMNS_R2_V2;
-  }
-  if (domain === "aqilevels" && profile === "data") {
-    return HISTORY_AQILEVELS_HOURLY_DATA_COLUMNS_R2_V2;
-  }
-  if (domain === "aqilevels" && profile === "debug") {
-    return HISTORY_AQILEVELS_HOURLY_DEBUG_COLUMNS_R2_V2;
-  }
-  throw new Error(`Unsupported R2 history v2 schema: domain=${domain} profile=${profile || "null"}`);
-}
-
-function minEntryValue(entries, fieldName) {
-  return entries.reduce((current, entry) => minIso(current, entry?.[fieldName] || null), null);
-}
-
-function maxEntryValue(entries, fieldName) {
-  return entries.reduce((current, entry) => maxIso(current, entry?.[fieldName] || null), null);
-}
-
-function minNumericEntryValue(entries, fieldName) {
-  return entries.reduce((current, entry) => {
-    const value = Number(entry?.[fieldName]);
-    if (!Number.isFinite(value) || value <= 0) return current;
-    const normalized = Math.trunc(value);
-    return current === null ? normalized : Math.min(current, normalized);
-  }, null);
-}
-
-function maxNumericEntryValue(entries, fieldName) {
-  return entries.reduce((current, entry) => {
-    const value = Number(entry?.[fieldName]);
-    if (!Number.isFinite(value) || value <= 0) return current;
-    const normalized = Math.trunc(value);
-    return current === null ? normalized : Math.max(current, normalized);
-  }, null);
-}
-
-function sortHistoryV2FileEntries(fileEntries) {
-  return Array.from(Array.isArray(fileEntries) ? fileEntries : [])
-    .sort((left, right) => String(left?.key || "").localeCompare(String(right?.key || "")));
-}
-
-function sortHistoryV2PollutantManifests(pollutantManifests) {
-  return Array.from(Array.isArray(pollutantManifests) ? pollutantManifests : [])
-    .sort((left, right) => {
-      const leftCode = String(left?.pollutant_code || "").trim().toLowerCase();
-      const rightCode = String(right?.pollutant_code || "").trim().toLowerCase();
-      if (leftCode !== rightCode) {
-        return leftCode.localeCompare(rightCode);
-      }
-      return String(left?.manifest_key || "").localeCompare(String(right?.manifest_key || ""));
-    });
-}
-
-function sortHistoryV2ConnectorManifests(connectorManifests) {
-  return Array.from(Array.isArray(connectorManifests) ? connectorManifests : [])
-    .sort((left, right) => {
-      const leftId = Number(left?.connector_id);
-      const rightId = Number(right?.connector_id);
-      if (Number.isFinite(leftId) && Number.isFinite(rightId) && leftId !== rightId) {
-        return leftId - rightId;
-      }
-      return String(left?.manifest_key || "").localeCompare(String(right?.manifest_key || ""));
-    });
-}
-
-function createHistoryV2PollutantManifest({
-  domain,
-  grain = null,
-  profile = null,
-  dayUtc,
-  connectorId,
-  pollutantCode,
-  runId = null,
-  manifestKey,
-  sourceRowCount,
-  fileEntries,
-  writerGitSha,
-  backedUpAtUtc,
-}) {
-  const normalizedPollutantCode = normalizePollutantCodeForPath(pollutantCode);
-  const files = sortHistoryV2FileEntries(fileEntries).map((entry) => ({
-    ...entry,
-    pollutant_code: normalizedPollutantCode,
-  }));
-  const totalBytes = files.reduce((sum, entry) => sum + Number(entry.bytes || 0), 0);
-  const minObservedAtUtc = minEntryValue(files, "min_observed_at_utc") || minEntryValue(files, "min_observed_at");
-  const maxObservedAtUtc = maxEntryValue(files, "max_observed_at_utc") || maxEntryValue(files, "max_observed_at");
-  const minTimestampHourUtc = minEntryValue(files, "min_timestamp_hour_utc");
-  const maxTimestampHourUtc = maxEntryValue(files, "max_timestamp_hour_utc");
-  const payload = {
-    manifest_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
-    history_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
-    history_version: "v2",
-    manifest_kind: "pollutant",
-    domain,
-    grain,
-    profile,
-    day_utc: dayUtc,
-    connector_id: connectorId,
-    pollutant_code: normalizedPollutantCode,
-    pollutant_codes: [normalizedPollutantCode],
-    run_id: runId,
-    manifest_key: manifestKey,
-    source_row_count: Number(sourceRowCount),
-    row_count: Number(sourceRowCount),
-    min_timeseries_id: minNumericEntryValue(files, "min_timeseries_id"),
-    max_timeseries_id: maxNumericEntryValue(files, "max_timeseries_id"),
-    min_observed_at_utc: minObservedAtUtc,
-    max_observed_at_utc: maxObservedAtUtc,
-    min_timestamp_hour_utc: minTimestampHourUtc,
-    max_timestamp_hour_utc: maxTimestampHourUtc,
-    parquet_object_keys: uniqueSorted(files.map((entry) => entry.key)),
-    file_count: files.length,
-    total_bytes: totalBytes,
-    files,
-    child_manifests: [],
-    columns: historyV2ColumnsFor(domain, profile),
-    writer_version: HISTORY_R2_V2_WRITER_VERSION,
-    writer_git_sha: writerGitSha,
-    timeseries_row_counts: aggregateTimeseriesRowCounts(files),
-    ...statsFromFileEntries(files, Number(sourceRowCount)),
-    backed_up_at_utc: backedUpAtUtc,
-  };
-  return withManifestHash(payload);
-}
-
-function createHistoryV2ConnectorManifest({
-  domain,
-  grain = null,
-  profile = null,
-  dayUtc,
-  connectorId,
-  runId = null,
-  manifestKey,
-  pollutantManifests,
-  writerGitSha,
-  backedUpAtUtc,
-}) {
-  const manifests = sortHistoryV2PollutantManifests(pollutantManifests);
-  const childManifests = manifests
-    .map((manifest) => ({
-      pollutant_code: manifest.pollutant_code,
-      manifest_key: manifest.manifest_key,
-      manifest_hash: manifest.manifest_hash,
-      source_row_count: manifest.source_row_count,
-      row_count: manifest.row_count,
-      file_count: manifest.file_count,
-      total_bytes: manifest.total_bytes,
-      min_timeseries_id: manifest.min_timeseries_id ?? null,
-      max_timeseries_id: manifest.max_timeseries_id ?? null,
-      min_observed_at_utc: manifest.min_observed_at_utc ?? null,
-      max_observed_at_utc: manifest.max_observed_at_utc ?? null,
-      min_timestamp_hour_utc: manifest.min_timestamp_hour_utc ?? null,
-      max_timestamp_hour_utc: manifest.max_timestamp_hour_utc ?? null,
-    }));
-  const files = manifests.flatMap((manifest) => Array.isArray(manifest.files) ? manifest.files : []);
-  const totalRows = manifests.reduce((sum, manifest) => sum + Number(manifest.source_row_count || 0), 0);
-  const totalBytes = files.reduce((sum, file) => sum + Number(file.bytes || 0), 0);
-  const pollutantCodes = uniqueSorted(manifests.map((manifest) => manifest.pollutant_code).filter(Boolean));
-  return withManifestHash({
-    manifest_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
-    history_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
-    history_version: "v2",
-    manifest_kind: "connector",
-    domain,
-    grain,
-    profile,
-    day_utc: dayUtc,
-    connector_id: connectorId,
-    pollutant_code: null,
-    pollutant_codes: pollutantCodes,
-    run_id: runId,
-    manifest_key: manifestKey,
-    source_row_count: totalRows,
-    row_count: totalRows,
-    min_timeseries_id: minNumericEntryValue(manifests, "min_timeseries_id"),
-    max_timeseries_id: maxNumericEntryValue(manifests, "max_timeseries_id"),
-    min_observed_at_utc: minEntryValue(manifests, "min_observed_at_utc"),
-    max_observed_at_utc: maxEntryValue(manifests, "max_observed_at_utc"),
-    min_timestamp_hour_utc: minEntryValue(manifests, "min_timestamp_hour_utc"),
-    max_timestamp_hour_utc: maxEntryValue(manifests, "max_timestamp_hour_utc"),
-    parquet_object_keys: uniqueSorted(files.map((entry) => entry.key)),
-    file_count: files.length,
-    total_bytes: totalBytes,
-    files,
-    child_manifests: childManifests,
-    pollutant_manifests: childManifests,
-    columns: historyV2ColumnsFor(domain, profile),
-    writer_version: HISTORY_R2_V2_WRITER_VERSION,
-    writer_git_sha: writerGitSha,
-    timeseries_row_counts: aggregateTimeseriesRowCounts(manifests),
-    ...statsFromFileEntries(files, totalRows),
-    backed_up_at_utc: backedUpAtUtc,
-  });
-}
-
-function createHistoryV2DayManifest({
-  domain,
-  grain = null,
-  profile = null,
-  dayUtc,
-  runId = null,
-    manifestKey,
-    connectorManifests,
-    writerGitSha,
-    backedUpAtUtc,
-}) {
-  const manifests = sortHistoryV2ConnectorManifests(connectorManifests);
-  const childManifests = manifests
-    .map((manifest) => ({
-      connector_id: manifest.connector_id,
-      manifest_key: manifest.manifest_key,
-      manifest_hash: manifest.manifest_hash,
-      source_row_count: manifest.source_row_count,
-      row_count: manifest.row_count,
-      file_count: manifest.file_count,
-      total_bytes: manifest.total_bytes,
-      pollutant_codes: Array.isArray(manifest.pollutant_codes) ? manifest.pollutant_codes : [],
-      min_timeseries_id: manifest.min_timeseries_id ?? null,
-      max_timeseries_id: manifest.max_timeseries_id ?? null,
-      min_observed_at_utc: manifest.min_observed_at_utc ?? null,
-      max_observed_at_utc: manifest.max_observed_at_utc ?? null,
-      min_timestamp_hour_utc: manifest.min_timestamp_hour_utc ?? null,
-      max_timestamp_hour_utc: manifest.max_timestamp_hour_utc ?? null,
-    }));
-  const files = manifests.flatMap((manifest) => Array.isArray(manifest.files) ? manifest.files : []);
-  const totalRows = manifests.reduce((sum, manifest) => sum + Number(manifest.source_row_count || 0), 0);
-  const totalBytes = files.reduce((sum, file) => sum + Number(file.bytes || 0), 0);
-  const connectorIds = manifests.map((manifest) => Number(manifest.connector_id)).filter((value) => Number.isInteger(value));
-  const pollutantCodes = uniqueSorted(manifests.flatMap((manifest) => (
-    Array.isArray(manifest.pollutant_codes) ? manifest.pollutant_codes : []
-  )));
-  return withManifestHash({
-    manifest_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
-    history_schema_version: HISTORY_R2_V2_SCHEMA_VERSION,
-    history_version: "v2",
-    manifest_kind: "day",
-    domain,
-    grain,
-    profile,
-    day_utc: dayUtc,
-    connector_id: null,
-    connector_ids: connectorIds,
-    pollutant_code: null,
-    pollutant_codes: pollutantCodes,
-    run_id: runId,
-    manifest_key: manifestKey,
-    source_row_count: totalRows,
-    row_count: totalRows,
-    min_timeseries_id: minNumericEntryValue(manifests, "min_timeseries_id"),
-    max_timeseries_id: maxNumericEntryValue(manifests, "max_timeseries_id"),
-    min_observed_at_utc: minEntryValue(manifests, "min_observed_at_utc"),
-    max_observed_at_utc: maxEntryValue(manifests, "max_observed_at_utc"),
-    min_timestamp_hour_utc: minEntryValue(manifests, "min_timestamp_hour_utc"),
-    max_timestamp_hour_utc: maxEntryValue(manifests, "max_timestamp_hour_utc"),
-    parquet_object_keys: uniqueSorted(files.map((entry) => entry.key)),
-    file_count: files.length,
-    total_bytes: totalBytes,
-    files,
-    child_manifests: childManifests,
-    connector_manifests: childManifests,
-    columns: historyV2ColumnsFor(domain, profile),
-    writer_version: HISTORY_R2_V2_WRITER_VERSION,
-    writer_git_sha: writerGitSha,
-    ...statsFromFileEntries(files, totalRows),
-    backed_up_at_utc: backedUpAtUtc,
-  });
-}
-
-// These pure builders are the single v2 manifest contract for both the
-// writer and metadata-only repair tooling. Keep the test aliases below for
-// existing callers, but do not duplicate this schema in repair scripts.
 export function buildHistoryV2PollutantManifest(args) {
-  return createHistoryV2PollutantManifest(args);
+  return buildCanonicalHistoryV2PollutantManifest(args);
 }
 
 export function buildHistoryV2ConnectorManifest(args) {
-  return createHistoryV2ConnectorManifest(args);
+  return buildCanonicalHistoryV2ConnectorManifest(args);
 }
 
 export function buildHistoryV2DayManifest(args) {
-  return createHistoryV2DayManifest(args);
+  return buildCanonicalHistoryV2DayManifest(args);
 }
 
 export const buildHistoryV2PollutantManifestForTest = buildHistoryV2PollutantManifest;
@@ -2436,177 +2476,139 @@ function rowsToParquetBuffer(rows, writerProperties) {
   return Buffer.from(parquetBytes);
 }
 
-function rowsToAqilevelParquetBuffer(rows, writerProperties) {
-  ensureParquetWasmInitialized();
-  const int32Vector = (values) => arrow.vectorFromArray(values, new arrow.Int32());
-  const float64Vector = (values) => arrow.vectorFromArray(values, new arrow.Float64());
-  const textVector = (values) => arrow.vectorFromArray(values, new arrow.Utf8());
-  const timestampVector = (values) => arrow.vectorFromArray(values, new arrow.TimestampMillisecond());
-  const table = arrow.tableFromArrays({
-    connector_id: int32Vector(rows.map((row) => Number(row.connector_id))),
-    station_id: int32Vector(rows.map((row) => (
-      row.station_id === null || row.station_id === undefined
-        ? null
-        : Number(row.station_id)
-    ))),
-    timeseries_id: int32Vector(rows.map((row) => Number(row.timeseries_id))),
-    pollutant_code: textVector(rows.map((row) => String(row.pollutant_code || ""))),
-    timestamp_hour_utc: timestampVector(rows.map((row) => new Date(row.timestamp_hour_utc))),
-    daqi_input_value_ugm3: float64Vector(rows.map((row) => toNullableNumber(row.daqi_input_value_ugm3))),
-    daqi_input_averaging_code: textVector(rows.map((row) => toNullableText(row.daqi_input_averaging_code))),
-    daqi_index_level: int32Vector(rows.map((row) => toNullableInteger(row.daqi_index_level))),
-    daqi_source_observation_count: int32Vector(rows.map((row) => toNullableInteger(row.daqi_source_observation_count))),
-    daqi_required_observation_count: int32Vector(rows.map((row) => toNullableInteger(row.daqi_required_observation_count))),
-    daqi_calculation_status: textVector(rows.map((row) => toNullableText(row.daqi_calculation_status))),
-    daqi_missing_reason: textVector(rows.map((row) => toNullableText(row.daqi_missing_reason))),
-    eaqi_input_value_ugm3: float64Vector(rows.map((row) => toNullableNumber(row.eaqi_input_value_ugm3))),
-    eaqi_input_averaging_code: textVector(rows.map((row) => toNullableText(row.eaqi_input_averaging_code))),
-    eaqi_index_level: int32Vector(rows.map((row) => toNullableInteger(row.eaqi_index_level))),
-    eaqi_source_observation_count: int32Vector(rows.map((row) => toNullableInteger(row.eaqi_source_observation_count))),
-    eaqi_required_observation_count: int32Vector(rows.map((row) => toNullableInteger(row.eaqi_required_observation_count))),
-    eaqi_calculation_status: textVector(rows.map((row) => toNullableText(row.eaqi_calculation_status))),
-    eaqi_missing_reason: textVector(rows.map((row) => toNullableText(row.eaqi_missing_reason))),
-    hourly_sample_count: int32Vector(rows.map((row) => toNullableInteger(row.hourly_sample_count))),
-    algorithm_version: textVector(rows.map((row) => toNullableText(row.algorithm_version))),
-    computed_at_utc: timestampVector(rows.map((row) => (row.computed_at_utc ? new Date(row.computed_at_utc) : null))),
-    hourly_mean_ugm3: float64Vector(rows.map((row) => toNullableNumber(row.hourly_mean_ugm3))),
-    rolling24h_mean_ugm3: float64Vector(rows.map((row) => toNullableNumber(row.rolling24h_mean_ugm3))),
-    no2_hourly_mean_ugm3: float64Vector(rows.map((row) => toNullableNumber(row.no2_hourly_mean_ugm3))),
-    pm25_hourly_mean_ugm3: float64Vector(rows.map((row) => toNullableNumber(row.pm25_hourly_mean_ugm3))),
-    pm10_hourly_mean_ugm3: float64Vector(rows.map((row) => toNullableNumber(row.pm10_hourly_mean_ugm3))),
-    pm25_rolling24h_mean_ugm3: float64Vector(rows.map((row) => toNullableNumber(row.pm25_rolling24h_mean_ugm3))),
-    pm10_rolling24h_mean_ugm3: float64Vector(rows.map((row) => toNullableNumber(row.pm10_rolling24h_mean_ugm3))),
-    daqi_no2_index_level: int32Vector(rows.map((row) => toNullableInteger(row.daqi_no2_index_level))),
-    daqi_pm25_rolling24h_index_level: int32Vector(rows.map((row) => toNullableInteger(row.daqi_pm25_rolling24h_index_level))),
-    daqi_pm10_rolling24h_index_level: int32Vector(rows.map((row) => toNullableInteger(row.daqi_pm10_rolling24h_index_level))),
-    eaqi_no2_index_level: int32Vector(rows.map((row) => toNullableInteger(row.eaqi_no2_index_level))),
-    eaqi_pm25_index_level: int32Vector(rows.map((row) => toNullableInteger(row.eaqi_pm25_index_level))),
-    eaqi_pm10_index_level: int32Vector(rows.map((row) => toNullableInteger(row.eaqi_pm10_index_level))),
-    updated_at: timestampVector(rows.map((row) => (row.updated_at ? new Date(row.updated_at) : null))),
-  });
 
-  const wasmTable = parquetWasm.Table.fromIPCStream(arrow.tableToIPC(table, "stream"));
-  const parquetBytes = parquetWasm.writeParquet(wasmTable, writerProperties);
-  return Buffer.from(parquetBytes);
+function rowsToObservationV2ParquetBuffer(rows, writerProperties, { includeVerificationStatus = true } = {}) {
+  return serializeSharedObservationV2Parquet(rows, { writerProperties, includeVerificationStatus });
 }
 
-export function rowsToAqilevelParquetBufferForTest(rows) {
-  return rowsToAqilevelParquetBuffer(
-    rows,
-    parquetWriterProperties(DEFAULT_AQILEVELS_ROW_GROUP_SIZE, HISTORY_AQILEVELS_WRITER_VERSION),
+async function canonicalObservationRowsFromParquet(bytes, { isSos }) {
+  const file = new Uint8Array(bytes).slice().buffer;
+  const metadata = await parquetMetadataAsync(file);
+  const rowCount = Number(metadata.num_rows || 0);
+  if (!Number.isSafeInteger(rowCount) || rowCount <= 0) {
+    throw new Error("Committed observation Parquet must contain rows");
+  }
+  const schemaColumns = new Set(
+    parquetSchema(metadata).children.map((column) => String(column.element.name)),
   );
-}
-
-function rowsToObservationV2ParquetBuffer(rows, writerProperties) {
-  ensureParquetWasmInitialized();
-  const int32Vector = (values) => arrow.vectorFromArray(values, new arrow.Int32());
-  const textVector = (values) => arrow.vectorFromArray(values, new arrow.Utf8());
-  const timestampVector = (values) => arrow.vectorFromArray(values, new arrow.TimestampMillisecond());
-  const table = arrow.tableFromArrays({
-    connector_id: int32Vector(rows.map((row) => Number(row.connector_id))),
-    station_id: int32Vector(rows.map((row) => (
-      row.station_id === null || row.station_id === undefined
-        ? null
-        : Number(row.station_id)
-    ))),
-    timeseries_id: int32Vector(rows.map((row) => Number(row.timeseries_id))),
-    pollutant_code: textVector(rows.map((row) => String(row.pollutant_code || ""))),
-    observed_at_utc: timestampVector(rows.map((row) => new Date(row.observed_at_utc || row.observed_at))),
-    value: rows.map((row) => (row.value === null || row.value === undefined ? null : Number(row.value))),
+  const requiredColumns = [
+    "connector_id",
+    "station_id",
+    "timeseries_id",
+    "pollutant_code",
+    "observed_at_utc",
+    "value",
+  ];
+  const missingColumns = requiredColumns.filter((column) =>
+    !schemaColumns.has(column)
+  );
+  if (missingColumns.length) {
+    throw new Error(
+      `Committed observation Parquet is missing canonical columns: ${missingColumns.join(",")}`,
+    );
+  }
+  const statusColumn = schemaColumns.has("verification_status")
+    ? "verification_status"
+    : schemaColumns.has("status")
+    ? "status"
+    : null;
+  const columns = [
+    ...requiredColumns,
+    ...(statusColumn ? [statusColumn] : []),
+  ];
+  let decodedRows = [];
+  await parquetRead({
+    file,
+    metadata,
+    columns,
+    rowStart: 0,
+    rowEnd: rowCount,
+    compressors,
+    onComplete: (rows) => {
+      decodedRows = Array.isArray(rows) ? rows : [];
+    },
   });
-
-  const wasmTable = parquetWasm.Table.fromIPCStream(arrow.tableToIPC(table, "stream"));
-  const parquetBytes = parquetWasm.writeParquet(wasmTable, writerProperties);
-  return Buffer.from(parquetBytes);
+  if (decodedRows.length !== rowCount) {
+    throw new Error("Committed observation Parquet row count changed while reading");
+  }
+  return decodedRows.map((values) => {
+    if (!Array.isArray(values)) {
+      throw new Error("Committed observation Parquet contains an invalid row");
+    }
+    const rawStatus = statusColumn
+      ? values[requiredColumns.length] ?? null
+      : null;
+    return normalizeCanonicalObservationRow({
+      connector_id: Number(values[0]),
+      station_id: values[1] === null || values[1] === undefined
+        ? null
+        : Number(values[1]),
+      timeseries_id: Number(values[2]),
+      pollutant_code: values[3],
+      observed_at_utc: new Date(values[4]).toISOString(),
+      value: Number(values[5]),
+      verification_status: isSos
+        ? normalizeUkAirVerificationStatus(rawStatus)
+        : statusColumn === "verification_status"
+        ? rawStatus
+        : null,
+    });
+  });
 }
 
 function rowsToAqilevelDataV2ParquetBuffer(rows, writerProperties) {
-  ensureParquetWasmInitialized();
-  const int32Vector = (values) => arrow.vectorFromArray(values, new arrow.Int32());
-  const textVector = (values) => arrow.vectorFromArray(values, new arrow.Utf8());
-  const timestampVector = (values) => arrow.vectorFromArray(values, new arrow.TimestampMillisecond());
-  const table = arrow.tableFromArrays({
-    connector_id: int32Vector(rows.map((row) => Number(row.connector_id))),
-    station_id: int32Vector(rows.map((row) => (
-      row.station_id === null || row.station_id === undefined
-        ? null
-        : Number(row.station_id)
-    ))),
-    timeseries_id: int32Vector(rows.map((row) => Number(row.timeseries_id))),
-    pollutant_code: textVector(rows.map((row) => String(row.pollutant_code || ""))),
-    timestamp_hour_utc: timestampVector(rows.map((row) => new Date(row.timestamp_hour_utc))),
-    daqi_index_level: int32Vector(rows.map((row) => toNullableInteger(row.daqi_index_level))),
-    eaqi_index_level: int32Vector(rows.map((row) => toNullableInteger(row.eaqi_index_level))),
-    daqi_calculation_status: textVector(rows.map((row) => toNullableText(row.daqi_calculation_status))),
-    daqi_missing_reason: textVector(rows.map((row) => toNullableText(row.daqi_missing_reason))),
-    eaqi_calculation_status: textVector(rows.map((row) => toNullableText(row.eaqi_calculation_status))),
-    eaqi_missing_reason: textVector(rows.map((row) => toNullableText(row.eaqi_missing_reason))),
-  });
-
-  const wasmTable = parquetWasm.Table.fromIPCStream(arrow.tableToIPC(table, "stream"));
-  const parquetBytes = parquetWasm.writeParquet(wasmTable, writerProperties);
-  return Buffer.from(parquetBytes);
+  return serializeSharedAqilevelDataV2Parquet(rows, { writerProperties });
 }
 
 function rowsToAqilevelDebugV2ParquetBuffer(rows, writerProperties) {
-  ensureParquetWasmInitialized();
-  const int32Vector = (values) => arrow.vectorFromArray(values, new arrow.Int32());
-  const float64Vector = (values) => arrow.vectorFromArray(values, new arrow.Float64());
-  const textVector = (values) => arrow.vectorFromArray(values, new arrow.Utf8());
-  const timestampVector = (values) => arrow.vectorFromArray(values, new arrow.TimestampMillisecond());
-  const table = arrow.tableFromArrays({
-    connector_id: int32Vector(rows.map((row) => Number(row.connector_id))),
-    station_id: int32Vector(rows.map((row) => (
-      row.station_id === null || row.station_id === undefined
-        ? null
-        : Number(row.station_id)
-    ))),
-    timeseries_id: int32Vector(rows.map((row) => Number(row.timeseries_id))),
-    pollutant_code: textVector(rows.map((row) => String(row.pollutant_code || ""))),
-    timestamp_hour_utc: timestampVector(rows.map((row) => new Date(row.timestamp_hour_utc))),
-    daqi_input_value_ugm3: float64Vector(rows.map((row) => toNullableNumber(row.daqi_input_value_ugm3))),
-    daqi_input_averaging_code: textVector(rows.map((row) => toNullableText(row.daqi_input_averaging_code))),
-    daqi_index_level: int32Vector(rows.map((row) => toNullableInteger(row.daqi_index_level))),
-    daqi_source_observation_count: int32Vector(rows.map((row) => toNullableInteger(row.daqi_source_observation_count))),
-    daqi_required_observation_count: int32Vector(rows.map((row) => toNullableInteger(row.daqi_required_observation_count))),
-    daqi_calculation_status: textVector(rows.map((row) => toNullableText(row.daqi_calculation_status))),
-    daqi_missing_reason: textVector(rows.map((row) => toNullableText(row.daqi_missing_reason))),
-    eaqi_input_value_ugm3: float64Vector(rows.map((row) => toNullableNumber(row.eaqi_input_value_ugm3))),
-    eaqi_input_averaging_code: textVector(rows.map((row) => toNullableText(row.eaqi_input_averaging_code))),
-    eaqi_index_level: int32Vector(rows.map((row) => toNullableInteger(row.eaqi_index_level))),
-    eaqi_source_observation_count: int32Vector(rows.map((row) => toNullableInteger(row.eaqi_source_observation_count))),
-    eaqi_required_observation_count: int32Vector(rows.map((row) => toNullableInteger(row.eaqi_required_observation_count))),
-    eaqi_calculation_status: textVector(rows.map((row) => toNullableText(row.eaqi_calculation_status))),
-    eaqi_missing_reason: textVector(rows.map((row) => toNullableText(row.eaqi_missing_reason))),
-    hourly_sample_count: int32Vector(rows.map((row) => toNullableInteger(row.hourly_sample_count))),
-    algorithm_version: textVector(rows.map((row) => toNullableText(row.algorithm_version))),
-    computed_at_utc: timestampVector(rows.map((row) => (row.computed_at_utc ? new Date(row.computed_at_utc) : null))),
-  });
+  return serializeSharedAqilevelDebugV2Parquet(rows, { writerProperties });
+}
 
-  const wasmTable = parquetWasm.Table.fromIPCStream(arrow.tableToIPC(table, "stream"));
-  const parquetBytes = parquetWasm.writeParquet(wasmTable, writerProperties);
-  return Buffer.from(parquetBytes);
+export function serializeCanonicalObservationV2Parquet(rows, { rowGroupSize = DEFAULT_OBSERVATIONS_ROW_GROUP_SIZE } = {}) {
+  return rowsToObservationV2ParquetBuffer(
+    rows,
+    parquetWriterProperties(
+      rowGroupSize,
+      HISTORY_R2_V2_OBSERVATIONS_WRITER_VERSION,
+    ),
+  );
 }
 
 export function rowsToObservationV2ParquetBufferForTest(rows) {
+  return serializeCanonicalObservationV2Parquet(rows);
+}
+
+export function rowsToObservationV2LegacyParquetBufferForTest(rows) {
   return rowsToObservationV2ParquetBuffer(
     rows,
-    parquetWriterProperties(DEFAULT_OBSERVATIONS_ROW_GROUP_SIZE, HISTORY_R2_V2_WRITER_VERSION),
+    parquetWriterProperties(
+      DEFAULT_OBSERVATIONS_ROW_GROUP_SIZE,
+      HISTORY_R2_V2_WRITER_VERSION,
+    ),
+    { includeVerificationStatus: false },
+  );
+}
+
+export function serializeCanonicalAqilevelDataV2Parquet(rows, { rowGroupSize = DEFAULT_AQILEVELS_ROW_GROUP_SIZE } = {}) {
+  return rowsToAqilevelDataV2ParquetBuffer(
+    rows,
+    parquetWriterProperties(rowGroupSize, HISTORY_R2_V2_WRITER_VERSION),
+  );
+}
+
+export function serializeCanonicalAqilevelDebugV2Parquet(rows, { rowGroupSize = DEFAULT_AQILEVELS_ROW_GROUP_SIZE } = {}) {
+  return rowsToAqilevelDebugV2ParquetBuffer(
+    rows,
+    parquetWriterProperties(rowGroupSize, HISTORY_R2_V2_WRITER_VERSION),
   );
 }
 
 export function rowsToAqilevelDataV2ParquetBufferForTest(rows) {
-  return rowsToAqilevelDataV2ParquetBuffer(
-    rows,
-    parquetWriterProperties(DEFAULT_AQILEVELS_ROW_GROUP_SIZE, HISTORY_R2_V2_WRITER_VERSION),
-  );
+  return serializeCanonicalAqilevelDataV2Parquet(rows);
 }
 
 export function rowsToAqilevelDebugV2ParquetBufferForTest(rows) {
-  return rowsToAqilevelDebugV2ParquetBuffer(
-    rows,
-    parquetWriterProperties(DEFAULT_AQILEVELS_ROW_GROUP_SIZE, HISTORY_R2_V2_WRITER_VERSION),
-  );
+  return serializeCanonicalAqilevelDebugV2Parquet(rows);
 }
 
 async function closeCursor(cursor) {
@@ -2643,6 +2645,7 @@ async function writeCommittedPartAndCheckpoint({
   committedParts,
   observedRows,
   totalBytes,
+  canonicalRowsByPollutant = null,
 }) {
   if (runtime.history_write_version === "v2") {
     return await writeCommittedV2PartAndCheckpoint({
@@ -2655,6 +2658,7 @@ async function writeCommittedPartAndCheckpoint({
       committedParts,
       observedRows,
       totalBytes,
+      canonicalRowsByPollutant,
     });
   }
 
@@ -2725,8 +2729,28 @@ async function writeCommittedV2PartAndCheckpoint({
   committedParts,
   observedRows,
   totalBytes,
+  canonicalRowsByPollutant,
 }) {
-  const groupedRows = groupRowsByPollutant(rows);
+  if (!(canonicalRowsByPollutant instanceof Map)) {
+    throw new Error("V2 observation writer requires a canonical pollutant-row accumulator");
+  }
+  const canonicalRows = rows.map((row) => normalizeCanonicalObservationRow({
+    connector_id: row.connector_id,
+    station_id: row.station_id,
+    timeseries_id: row.timeseries_id,
+    pollutant_code: normalizePollutantCodeForPath(row.pollutant_code),
+    observed_at_utc: new Date(
+      row.observed_at_utc || row.observed_at,
+    ).toISOString(),
+    value: row.value,
+    verification_status: Number(row.connector_id) ===
+        Number(runtime.sos_connector_id)
+      ? normalizeUkAirVerificationStatus(
+        row.verification_status ?? row.status ?? null,
+      )
+      : null,
+  }));
+  const groupedRows = groupRowsByPollutant(canonicalRows);
   const sourcePollutantCodes = groupedRows.map(([pollutantCode]) => pollutantCode);
   const writeGroups = groupedRows;
   const writePollutantCodes = writeGroups.map(([pollutantCode]) => pollutantCode);
@@ -2754,7 +2778,10 @@ async function writeCommittedV2PartAndCheckpoint({
 
   for (let pollutantIndex = 0; pollutantIndex < writeGroups.length; pollutantIndex += 1) {
     const [pollutantCode, pollutantRows] = writeGroups[pollutantIndex];
-    assertBudget(runtime, "pollutant_part", { day_utc: dayUtc, connector_id: connectorId, pollutant_code: pollutantCode }, 15_000);
+    const accumulatedRows = canonicalRowsByPollutant.get(pollutantCode) || [];
+    accumulatedRows.push(...pollutantRows);
+    canonicalRowsByPollutant.set(pollutantCode, accumulatedRows);
+    assertBudget(runtime, "pollutant_part", { day_utc: dayUtc, connector_id: connectorId, pollutant_code: pollutantCode }, PHASE_B_STAGE_MIN_MS.observation_segment);
     const pollutantStartedAtMs = Date.now();
     logPhaseB(runtime, "INFO", "phase_b_history_pollutant_start", {
       day_utc: dayUtc,
@@ -2773,7 +2800,10 @@ async function writeCommittedV2PartAndCheckpoint({
     const parquetStartedAtMs = Date.now();
     const parquetBuffer = rowsToObservationV2ParquetBuffer(
       pollutantRows,
-      parquetWriterProperties(runtime.observations_row_group_size, HISTORY_R2_V2_WRITER_VERSION),
+      parquetWriterProperties(
+        runtime.observations_row_group_size,
+        HISTORY_R2_V2_OBSERVATIONS_WRITER_VERSION,
+      ),
     );
     logPhaseB(runtime, "INFO", "phase_b_history_parquet_build_complete", {
       day_utc: dayUtc,
@@ -2789,7 +2819,7 @@ async function writeCommittedV2PartAndCheckpoint({
       pollutantCode,
       partIndex,
     );
-    assertBudget(runtime, "r2_put", { day_utc: dayUtc, connector_id: connectorId, pollutant_code: pollutantCode, prefix: committedKey }, 15_000);
+    assertBudget(runtime, "r2_put", { day_utc: dayUtc, connector_id: connectorId, pollutant_code: pollutantCode, prefix: committedKey }, PHASE_B_STAGE_MIN_MS.observation_segment);
     logPhaseB(runtime, "INFO", "phase_b_history_r2_put_start", {
       day_utc: dayUtc,
       connector_id: connectorId,
@@ -2856,7 +2886,7 @@ async function writeCommittedV2PartAndCheckpoint({
       connector_id: connectorId,
       pollutant_code: pollutantCode,
       next_pollutant_code: groupedRows[pollutantIndex + 1]?.[0] || null,
-    }, 15_000);
+    }, PHASE_B_STAGE_MIN_MS.observation_segment);
   }
 
   const nextObservedRows = observedRows + BigInt(writtenRowCount);
@@ -2933,7 +2963,11 @@ async function writeCommittedV2PartAndCheckpoint({
 }
 
 export async function writeCommittedV2PartAndCheckpointForTest(args) {
-  return await writeCommittedV2PartAndCheckpoint(args);
+  return await writeCommittedV2PartAndCheckpoint({
+    ...args,
+    canonicalRowsByPollutant:
+      args.canonicalRowsByPollutant || new Map(),
+  });
 }
 
 async function writeObservationV2ConnectorManifest({
@@ -2942,8 +2976,12 @@ async function writeObservationV2ConnectorManifest({
   connectorId,
   committedParts,
   backedUpAtUtc,
+  canonicalRowsByPollutant,
 }) {
-  assertBudget(runtime, "connector_manifest_prepare", { day_utc: dayUtc, connector_id: connectorId }, 15_000);
+  if (!(canonicalRowsByPollutant instanceof Map)) {
+    throw new Error("V2 observation manifest requires canonical pollutant rows");
+  }
+  assertBudget(runtime, "connector_manifest_prepare", { day_utc: dayUtc, connector_id: connectorId }, PHASE_B_STAGE_MIN_MS.observation_segment);
   const prepareStartedAtMs = Date.now();
   logPhaseB(runtime, "INFO", "phase_b_history_connector_manifest_prepare_start", {
     day_utc: dayUtc,
@@ -2969,7 +3007,7 @@ async function writeObservationV2ConnectorManifest({
     duration_ms: Math.max(0, Date.now() - prepareStartedAtMs),
   });
   for (const [pollutantCode, pollutantParts] of Array.from(partsByPollutant.entries()).sort(([left], [right]) => left.localeCompare(right))) {
-    assertBudget(runtime, "manifest_write", { day_utc: dayUtc, connector_id: connectorId, pollutant_code: pollutantCode }, 10_000);
+    assertBudget(runtime, "manifest_write", { day_utc: dayUtc, connector_id: connectorId, pollutant_code: pollutantCode }, PHASE_B_STAGE_MIN_MS.observation_segment);
     const pollutantManifestKey = buildHistoryV2PollutantManifestKey(
       runtime.committed_prefix,
       dayUtc,
@@ -2977,7 +3015,14 @@ async function writeObservationV2ConnectorManifest({
       pollutantCode,
     );
     const sourceRowCount = pollutantParts.reduce((sum, part) => sum + Number(part.row_count || 0), 0);
-    const pollutantManifest = createHistoryV2PollutantManifest({
+    const hashResult = computeObservationContentHash(
+      canonicalRowsByPollutant.get(pollutantCode) || [],
+    );
+    const {
+      canonical_rows: _canonicalRows,
+      ...observationContentHash
+    } = hashResult;
+    const pollutantManifest = buildHistoryV2PollutantManifest({
       domain: "observations",
       dayUtc,
       connectorId,
@@ -2988,6 +3033,7 @@ async function writeObservationV2ConnectorManifest({
       fileEntries: pollutantParts,
       writerGitSha: runtime.writer_git_sha,
       backedUpAtUtc,
+      observationContentHash,
     });
     logPhaseB(runtime, "INFO", "phase_b_history_manifest_write_start", {
       day_utc: dayUtc,
@@ -3019,7 +3065,7 @@ async function writeObservationV2ConnectorManifest({
   }
 
   const connectorManifestKey = buildHistoryV2ConnectorManifestKey(runtime.committed_prefix, dayUtc, connectorId);
-  const connectorManifest = createHistoryV2ConnectorManifest({
+  const connectorManifest = buildHistoryV2ConnectorManifest({
     domain: "observations",
     dayUtc,
     connectorId,
@@ -3121,6 +3167,7 @@ function normalizeFrozenObservationRow(row) {
     observed_at: observedAt,
     observed_at_utc: observedAt,
     value: row.value,
+    status: row.status ?? null,
   };
 }
 
@@ -3160,6 +3207,8 @@ async function stageFrozenSourceAndWriteObservations({ streamClient, candidate, 
   let totalBytes = 0n;
   let partIndex = 0;
   let pendingDayRows = [];
+  const frozenSourceIdentityRows = [];
+  const canonicalRowsByPollutant = new Map();
 
   const flushObservationRows = async () => {
     if (!pendingDayRows.length) return;
@@ -3173,6 +3222,7 @@ async function stageFrozenSourceAndWriteObservations({ streamClient, candidate, 
       committedParts,
       observedRows,
       totalBytes,
+      canonicalRowsByPollutant,
     });
     partIndex = flushed.partIndex;
     committedParts = flushed.committedParts;
@@ -3188,7 +3238,8 @@ select
   timeseries_id,
   pollutant_code,
   observed_at_utc,
-  value
+  value,
+  status
 from uk_aq_ops.uk_aq_phase_b_history_rows_v2(
   $1::integer,
   $2::timestamptz,
@@ -3200,7 +3251,7 @@ from uk_aq_ops.uk_aq_phase_b_history_rows_v2(
   const cursor = streamClient.query(new Cursor(sql, [connectorId, dayStart, dayEnd]));
   try {
     for (;;) {
-      assertBudget(runtime, "frozen_source_fetch", { day_utc: dayUtc, connector_id: connectorId }, 30_000);
+      assertBudget(runtime, "frozen_source_fetch", { day_utc: dayUtc, connector_id: connectorId }, PHASE_B_STAGE_MIN_MS.observation_segment);
       const rows = await cursorRead(cursor, runtime.cursor_fetch_rows);
       if (!rows.length) break;
       for (const raw of rows) {
@@ -3224,6 +3275,7 @@ from uk_aq_ops.uk_aq_phase_b_history_rows_v2(
           counts.target_day_supported_aqi_source_row_count += 1;
         }
         counts.day_observation_row_count += 1;
+        frozenSourceIdentityRows.push(row);
         pendingDayRows.push(row);
         if (pendingDayRows.length >= runtime.observations_part_max_rows) await flushObservationRows();
       }
@@ -3236,13 +3288,34 @@ from uk_aq_ops.uk_aq_phase_b_history_rows_v2(
   if (observedRows !== candidate.expected_row_count) {
     throw new Error(`Row count mismatch for day=${dayUtc} connector=${connectorId}: expected=${candidate.expected_row_count.toString()} observed=${observedRows.toString()}`);
   }
-  return { temp, counts, committedParts, observedRows, totalBytes };
+  const sourceIdentity = computePruneConnectorSourceIdentity(frozenSourceIdentityRows);
+  if (BigInt(sourceIdentity.source_content_hash_row_count) !== observedRows) {
+    throw new Error(`Source identity row count mismatch for day=${dayUtc} connector=${connectorId}`);
+  }
+  return {
+    temp,
+    counts,
+    committedParts,
+    observedRows,
+    totalBytes,
+    canonicalRowsByPollutant,
+    sourceIdentity,
+  };
 }
 
 async function buildAqiRowsFromFrozenSource({ runtime, dayUtc, connectorId, frozenSourcePath }) {
   const sourceRows = [];
   let targetDaySupportedRowCount = 0;
+  let replayedRowCount = 0;
   for await (const row of readFrozenSourceRows(frozenSourcePath)) {
+    replayedRowCount += 1;
+    if (replayedRowCount % 10_000 === 0) {
+      assertBudget(runtime, "aqi_calculation_replay", {
+        day_utc: dayUtc,
+        connector_id: connectorId,
+        replayed_row_count: replayedRowCount,
+      }, PHASE_B_STAGE_MIN_MS.observation_segment);
+    }
     if (!AQI_SUPPORTED_POLLUTANTS.includes(row.pollutant_code)) continue;
     if (!isObservationRowInDay(row, dayUtc)) {
       throw new Error(`AQI target-day source contained an out-of-range row for day=${dayUtc} connector=${connectorId}`);
@@ -3276,6 +3349,10 @@ async function buildAqiRowsFromFrozenSource({ runtime, dayUtc, connectorId, froz
       eaqi_status_counts: {},
     };
   }
+  assertBudget(runtime, "aqi_calculation_normalize", {
+    day_utc: dayUtc,
+    connector_id: connectorId,
+  }, PHASE_B_STAGE_MIN_MS.observation_segment);
   const acceptedRows = dedupeSourceObservationRows(sourceRows);
   const targetDayHourlyRows = sourceObservationsToNarrowRows(acceptedRows);
   if (acceptedRows.length === 0 || targetDayHourlyRows.length === 0) {
@@ -3296,6 +3373,10 @@ async function buildAqiRowsFromFrozenSource({ runtime, dayUtc, connectorId, froz
     contextRows: pmContext.rows,
     targetDayRows: targetDayHourlyRows,
   });
+  assertBudget(runtime, "aqi_calculation_finalize", {
+    day_utc: dayUtc,
+    connector_id: connectorId,
+  }, PHASE_B_STAGE_MIN_MS.observation_segment);
   const rows = buildAqilevelHistoryRowsForDayFromHourlyRows(mergedHourlyRows, dayUtc);
   if (rows.length === 0) {
     throw new Error(`Phase B AQI hourly calculation produced zero output for day=${dayUtc} connector=${connectorId} despite ${targetDaySupportedRowCount} target-day supported source rows`);
@@ -3322,7 +3403,7 @@ async function buildAqiRowsFromFrozenSource({ runtime, dayUtc, connectorId, froz
 async function writeEmptyAqilevelConnectorManifests({ runtime, dayUtc, connectorId, backedUpAtUtc }) {
   const writeProfile = async ({ prefix, profile }) => {
     const manifestKey = buildConnectorManifestKey(prefix, dayUtc, connectorId);
-    const manifest = createHistoryV2ConnectorManifest({
+    const manifest = buildHistoryV2ConnectorManifest({
       domain: "aqilevels",
       grain: HISTORY_AQILEVELS_GRAIN,
       profile,
@@ -3359,17 +3440,14 @@ async function writeEmptyAqilevelConnectorManifests({ runtime, dayUtc, connector
   };
 }
 
-async function exportCandidateToR2WithFrozenAqi({ candidate, runtime }) {
+async function exportCandidateObservationsToR2({ candidate, runtime }) {
   if (runtime.history_write_version !== "v2") {
     throw new Error("Phase B observation-derived AQI writer requires R2 history write version v2.");
   }
   const dayUtc = candidate.day_utc;
   const connectorId = candidate.connector_id;
-  let temp = null;
   return await withPgClient(runtime.supabase_db_url, async (streamClient) => {
-    try {
       const staged = await stageFrozenSourceAndWriteObservations({ streamClient, candidate, runtime });
-      temp = staged.temp;
       const backedUpAtUtc = nowIso();
       const { connectorManifest, connectorManifestKey } = await writeObservationV2ConnectorManifest({
         runtime,
@@ -3377,24 +3455,8 @@ async function exportCandidateToR2WithFrozenAqi({ candidate, runtime }) {
         connectorId,
         committedParts: staged.committedParts,
         backedUpAtUtc,
+        canonicalRowsByPollutant: staged.canonicalRowsByPollutant,
       });
-      const aqiBuild = await buildAqiRowsFromFrozenSource({ runtime, dayUtc, connectorId, frozenSourcePath: temp.ndjsonPath });
-      let aqiResult = { status: aqiBuild.status, source_row_count: BigInt(aqiBuild.rows.length), file_count: 0, total_bytes: 0n };
-      if (aqiBuild.status !== "no_supported_aqi_source") {
-        aqiResult = await exportAqilevelConnectorRowsToR2({
-          runtime,
-          dayUtc,
-          connector: {
-            connector_id: connectorId,
-            expected_row_count: BigInt(aqiBuild.rows.length),
-            min_timeseries_id: null,
-            max_timeseries_id: null,
-          },
-          rows: aqiBuild.rows,
-        });
-      } else if (runtime.history_write_version === "v2") {
-        aqiResult = await writeEmptyAqilevelConnectorManifests({ runtime, dayUtc, connectorId, backedUpAtUtc });
-      }
       return {
         day_utc: dayUtc,
         connector_id: connectorId,
@@ -3405,329 +3467,71 @@ async function exportCandidateToR2WithFrozenAqi({ candidate, runtime }) {
         total_bytes: staged.totalBytes,
         parquet_object_keys: connectorManifest.parquet_object_keys,
         files: staged.committedParts,
-        aqi: {
-          status: aqiBuild.status,
-          frozen_source_row_count: staged.counts.frozen_source_row_count,
-          frozen_source_bytes: staged.counts.frozen_source_bytes,
-          supported_aqi_source_row_count: staged.counts.supported_aqi_source_row_count,
-          target_day_supported_aqi_source_row_count: aqiBuild.target_day_supported_source_row_count ?? staged.counts.target_day_supported_aqi_source_row_count,
-          accepted_aqi_source_row_count: aqiBuild.accepted_source_row_count ?? 0,
-          rejected_aqi_source_row_count: aqiBuild.rejected_source_row_count ?? 0,
-          supported_pollutant_counts: staged.counts.supported_pollutant_counts,
-          ...(aqiBuild.pm_context || {}),
-          context_supported_aqi_hour_count: aqiBuild.context_supported_aqi_hour_count ?? 0,
-          daqi_status_counts: aqiBuild.daqi_status_counts ?? {},
-          eaqi_status_counts: aqiBuild.eaqi_status_counts ?? {},
-          output_row_count: aqiBuild.rows.length,
-          manifest_key: aqiResult.manifest_key || aqiResult.connector_manifest?.manifest_key || null,
-          debug_manifest_key: aqiResult.debug_connector_manifest?.manifest_key || null,
-          file_count: aqiResult.file_count || 0,
-          debug_file_count: aqiResult.debug_file_count || 0,
-        },
+        frozen_source_temp: staged.temp,
+        frozen_source_counts: staged.counts,
+        source_identity: staged.sourceIdentity,
       };
-    } finally {
-      cleanupPhaseBTargetDaySourceTemp(temp);
-    }
-  });
+  }, { statementTimeoutMs: Math.max(1, (remainingBudgetMs(runtime) ?? 600_000) - 1_000) });
 }
 
-async function exportCandidateToR2({ candidate, runtime }) {
-  if (runtime.phase_b_calculate_aqi_from_observations_enabled) {
-    return await exportCandidateToR2WithFrozenAqi({ candidate, runtime });
-  }
+async function exportCandidateAqiFromFrozenSource({ candidate, runtime, observationResult }) {
   const dayUtc = candidate.day_utc;
   const connectorId = candidate.connector_id;
-  const dayStart = `${dayUtc}T00:00:00.000Z`;
-  const dayEnd = `${shiftIsoDay(dayUtc, 1)}T00:00:00.000Z`;
-
-  const expectedRowCount = candidate.expected_row_count;
-  let committedParts = [...candidate.resume_parts];
-  let observedRows = candidate.resume_exported_row_count;
-  const observedRowsFromParts = committedParts.reduce(
-    (sum, part) => sum + BigInt(part.row_count),
-    0n,
-  );
-  if (observedRows !== observedRowsFromParts) {
-    observedRows = observedRowsFromParts;
-  }
-  let totalBytes = committedParts.reduce(
-    (sum, part) => sum + BigInt(part.bytes),
-    0n,
-  );
-  let partIndex = Number(candidate.resume_part_index || 0);
-  let resumeTimeseriesId = candidate.resume_last_timeseries_id;
-  let resumeObservedAt = candidate.resume_last_observed_at;
-  logPhaseB(runtime, "INFO", "phase_b_history_connector_start", {
-    day_utc: dayUtc,
-    connector_id: connectorId,
-    rows_selected: expectedRowCount.toString(),
-    prefix: connectorPrefix(runtime.committed_prefix, dayUtc, connectorId),
-    manifest_path: buildConnectorManifestKey(runtime.committed_prefix, dayUtc, connectorId),
-  });
-
-  if (runtime.history_write_version === "v2" && partIndex > committedParts.length) {
-    throw new Error(
-      `Resume checkpoint mismatch for day=${dayUtc} connector=${connectorId}: v2 part_index=${partIndex} parts=${committedParts.length}`,
-    );
-  }
-  if (runtime.history_write_version !== "v2" && partIndex !== committedParts.length) {
-    throw new Error(
-      `Resume checkpoint mismatch for day=${dayUtc} connector=${connectorId}: part_index=${partIndex} parts=${committedParts.length}`,
-    );
-  }
-  if (partIndex > 0 && (resumeTimeseriesId === null || !resumeObservedAt)) {
-    throw new Error(
-      `Resume checkpoint missing key tuple for day=${dayUtc} connector=${connectorId} with part_index=${partIndex}`,
-    );
-  }
-
-  if (runtime.history_write_version === "v2") {
-    const connectorManifestKey = buildHistoryV2ConnectorManifestKey(runtime.committed_prefix, dayUtc, connectorId);
-    const connectorManifestHead = await r2HeadObject({ r2: runtime.r2, key: connectorManifestKey });
-    if (!connectorManifestHead.exists) {
-      const existingEntries = await r2ListAllObjects({
-        r2: runtime.r2,
-        prefix: `${connectorPrefix(runtime.committed_prefix, dayUtc, connectorId)}/`,
-        max_keys: 1000,
-      });
-      if (shouldResetManifestlessV2ResumeForTest({
-        connectorManifestExists: connectorManifestHead.exists,
-        existingEntryCount: existingEntries.length,
-        resumePartIndex: partIndex,
-        resumeParts: committedParts,
-      })) {
-        logPhaseB(runtime, "WARNING", "phase_b_history_candidate_skipped", {
-          day_utc: dayUtc,
-          connector_id: connectorId,
-          prefix: connectorPrefix(runtime.committed_prefix, dayUtc, connectorId),
-          reason: "manifestless_partial_final_prefix_cleanup_before_retry",
-        });
-        if (existingEntries.length > 0) {
-          await cleanupCandidatePartialOutput({ runtime, dayUtc, connectorId });
-        }
-        committedParts = [];
-        observedRows = 0n;
-        totalBytes = 0n;
-        partIndex = 0;
-        resumeTimeseriesId = null;
-        resumeObservedAt = null;
-      }
-    }
-  }
-
-  for (const part of committedParts) {
-    const head = await r2HeadObject({ r2: runtime.r2, key: part.key });
-    if (!head.exists) {
-      throw new Error(`Resume checkpoint references missing committed object: ${part.key}`);
-    }
-    if (typeof head.bytes === "number" && Number.isFinite(head.bytes)) {
-      part.bytes = Math.trunc(head.bytes);
-    }
-    part.etag_or_hash = head.etag || part.etag_or_hash || null;
-  }
-  totalBytes = committedParts.reduce((sum, part) => sum + BigInt(part.bytes), 0n);
-
-  await withPgClient(runtime.supabase_db_url, async (streamClient) => {
-    const sql = runtime.history_write_version === "v2" ? `
-select
-  connector_id,
-  station_id,
-  timeseries_id,
-  pollutant_code,
-  observed_at_utc,
-  value
-from uk_aq_ops.uk_aq_phase_b_history_rows_v2(
-  $1::integer,
-  $2::timestamptz,
-  $3::timestamptz,
-  $4::integer,
-  $5::timestamptz
-)
-` : `
-select
-  connector_id,
-  timeseries_id,
-  observed_at,
-  value
-from uk_aq_ops.uk_aq_phase_b_history_rows(
-  $1::integer,
-  $2::timestamptz,
-  $3::timestamptz,
-  $4::integer,
-  $5::timestamptz
-)
-`;
-
-    const cursor = streamClient.query(
-      new Cursor(
-        sql,
-        runtime.history_write_version === "v2"
-          ? [connectorId, dayStart, dayEnd, resumeTimeseriesId, resumeObservedAt]
-          : [connectorId, dayStart, dayEnd, resumeTimeseriesId, resumeObservedAt],
-      ),
-    );
-    let pendingRows = [];
-
-    try {
-      for (;;) {
-        assertBudget(runtime, "row_fetch", { day_utc: dayUtc, connector_id: connectorId }, 30_000);
-        logPhaseB(runtime, "INFO", "phase_b_history_row_fetch_start", {
-          day_utc: dayUtc,
-          connector_id: connectorId,
-          rows_selected: observedRows.toString(),
-        });
-        const fetchStartedAtMs = Date.now();
-        const rows = await cursorRead(cursor, runtime.cursor_fetch_rows);
-        logPhaseB(runtime, "INFO", "phase_b_history_row_fetch_complete", {
-          day_utc: dayUtc,
-          connector_id: connectorId,
-          rows_selected: rows.length,
-          duration_ms: Math.max(0, Date.now() - fetchStartedAtMs),
-        });
-        if (!rows.length) {
-          break;
-        }
-
-        for (const row of rows) {
-          if (runtime.history_write_version === "v2") {
-            pendingRows.push({
-              connector_id: Number(row.connector_id),
-              station_id: row.station_id === null || row.station_id === undefined
-                ? null
-                : Number(row.station_id),
-              timeseries_id: Number(row.timeseries_id),
-              pollutant_code: normalizePollutantCodeForPath(row.pollutant_code),
-              observed_at_utc: row.observed_at_utc,
-              value: row.value,
-            });
-          } else {
-            pendingRows.push({
-              connector_id: Number(row.connector_id),
-              timeseries_id: Number(row.timeseries_id),
-              observed_at: row.observed_at,
-              value: row.value,
-            });
-          }
-
-          if (pendingRows.length >= runtime.observations_part_max_rows) {
-            const flushed = await writeCommittedPartAndCheckpoint({
-              streamClient,
-              runtime,
-              dayUtc,
-              connectorId,
-              partIndex,
-              rows: pendingRows,
-              committedParts,
-              observedRows,
-              totalBytes,
-            });
-            partIndex = flushed.partIndex;
-            committedParts = flushed.committedParts;
-            observedRows = flushed.observedRows;
-            totalBytes = flushed.totalBytes;
-            pendingRows = [];
-          }
-        }
-      }
-
-      if (pendingRows.length > 0) {
-        const flushed = await writeCommittedPartAndCheckpoint({
-          streamClient,
-          runtime,
-          dayUtc,
-          connectorId,
-          partIndex,
-          rows: pendingRows,
-          committedParts,
-          observedRows,
-          totalBytes,
-        });
-        partIndex = flushed.partIndex;
-        committedParts = flushed.committedParts;
-        observedRows = flushed.observedRows;
-        totalBytes = flushed.totalBytes;
-      }
-    } finally {
-      await closeCursor(cursor);
-    }
-  });
-
-  if (observedRows !== expectedRowCount) {
-    throw new Error(
-      `Row count mismatch for day=${dayUtc} connector=${connectorId}: expected=${expectedRowCount.toString()} observed=${observedRows.toString()}`,
-    );
-  }
-
-  const backedUpAtUtc = nowIso();
-  if (runtime.history_write_version === "v2") {
-    const { connectorManifest, connectorManifestKey } = await writeObservationV2ConnectorManifest({
+  const counts = observationResult.frozen_source_counts;
+  const aqiBuild = await runBudgetedPhaseBStage({
+    runtime,
+    operation: "aqi_calculation",
+    fields: { day_utc: dayUtc, connector_id: connectorId },
+    minMs: PHASE_B_STAGE_MIN_MS.aqi_calculation,
+    adapter: async () => await buildAqiRowsFromFrozenSource({
       runtime,
       dayUtc,
       connectorId,
-      committedParts,
-      backedUpAtUtc,
-    });
-
-    logPhaseB(runtime, "INFO", "phase_b_history_connector_complete", {
-      day_utc: dayUtc,
-      connector_id: connectorId,
-      rows_written: observedRows.toString(),
-      part_count: committedParts.length,
-      manifest_path: connectorManifestKey,
-      prefix: connectorPrefix(runtime.committed_prefix, dayUtc, connectorId),
-    });
-    return {
-      day_utc: dayUtc,
-      connector_id: connectorId,
-      manifest_key: connectorManifestKey,
-      source_row_count: expectedRowCount,
-      written_row_count: observedRows,
-      file_count: committedParts.length,
-      total_bytes: totalBytes,
-      parquet_object_keys: connectorManifest.parquet_object_keys,
-      files: committedParts,
-    };
-  }
-
-  const connectorManifest = createConnectorManifest({
-    dayUtc,
-    connectorId,
-    runId: runtime.run_id,
-    sourceRowCount: Number(expectedRowCount),
-    minObservedAt: candidate.min_observed_at,
-    maxObservedAt: candidate.max_observed_at,
-    fileEntries: committedParts,
-    writerGitSha: runtime.writer_git_sha,
-    backedUpAtUtc,
+      frozenSourcePath: observationResult.frozen_source_temp.ndjsonPath,
+    }),
   });
-
-  const connectorManifestKey = buildConnectorManifestKey(runtime.committed_prefix, dayUtc, connectorId);
-  await r2PutObject({
-    r2: runtime.r2,
-    key: connectorManifestKey,
-    body: Buffer.from(JSON.stringify(connectorManifest, null, 2), "utf8"),
-    content_type: "application/json",
+  const aqiResult = await runBudgetedPhaseBStage({
+    runtime,
+    operation: "aqi_object_write",
+    fields: { day_utc: dayUtc, connector_id: connectorId },
+    minMs: PHASE_B_STAGE_MIN_MS.aqi_object_write,
+    adapter: async () => aqiBuild.status !== "no_supported_aqi_source"
+      ? await exportAqilevelConnectorRowsToR2({
+        runtime,
+        dayUtc,
+        connector: { connector_id: connectorId, expected_row_count: BigInt(aqiBuild.rows.length), min_timeseries_id: null, max_timeseries_id: null },
+        rows: aqiBuild.rows,
+      })
+      : await writeEmptyAqilevelConnectorManifests({ runtime, dayUtc, connectorId, backedUpAtUtc: nowIso() }),
   });
-
-  const manifestHead = await r2HeadObject({ r2: runtime.r2, key: connectorManifestKey });
-  if (!manifestHead.exists) {
-    throw new Error(`Connector manifest missing after upload: ${connectorManifestKey}`);
-  }
-
   return {
-    day_utc: dayUtc,
-    connector_id: connectorId,
-    manifest_key: connectorManifestKey,
-    source_row_count: expectedRowCount,
-    written_row_count: observedRows,
-    file_count: committedParts.length,
-    total_bytes: totalBytes,
-    parquet_object_keys: committedParts.map((part) => part.key),
-    files: committedParts,
+    status: aqiBuild.status,
+    frozen_source_row_count: counts.frozen_source_row_count,
+    frozen_source_bytes: counts.frozen_source_bytes,
+    supported_aqi_source_row_count: counts.supported_aqi_source_row_count,
+    target_day_supported_aqi_source_row_count: aqiBuild.target_day_supported_source_row_count ?? counts.target_day_supported_aqi_source_row_count,
+    accepted_aqi_source_row_count: aqiBuild.accepted_source_row_count ?? 0,
+    rejected_aqi_source_row_count: aqiBuild.rejected_source_row_count ?? 0,
+    supported_pollutant_counts: counts.supported_pollutant_counts,
+    ...(aqiBuild.pm_context || {}),
+    context_supported_aqi_hour_count: aqiBuild.context_supported_aqi_hour_count ?? 0,
+    daqi_status_counts: aqiBuild.daqi_status_counts ?? {},
+    eaqi_status_counts: aqiBuild.eaqi_status_counts ?? {},
+    output_row_count: aqiBuild.rows?.length || 0,
+    manifest_key: aqiResult.manifest_key || aqiResult.connector_manifest?.manifest_key || null,
+    debug_manifest_key: aqiResult.debug_connector_manifest?.manifest_key || null,
+    file_count: aqiResult.file_count || 0,
+    debug_file_count: aqiResult.debug_file_count || 0,
   };
 }
 
-async function dropboxRefreshAccessToken(dropboxConfig) {
+async function exportCandidateToR2({ candidate, runtime }) {
+  if (runtime.history_write_version !== "v2") {
+    throw new Error("Phase B connector-day export requires canonical R2 history version v2");
+  }
+  return await exportCandidateObservationsToR2({ candidate, runtime });
+}
+async function dropboxRefreshAccessToken(dropboxConfig, { signal = undefined } = {}) {
   const appKey = String(dropboxConfig?.app_key || "").trim();
   const appSecret = String(dropboxConfig?.app_secret || "").trim();
   const refreshToken = String(dropboxConfig?.refresh_token || "").trim();
@@ -3746,6 +3550,7 @@ async function dropboxRefreshAccessToken(dropboxConfig) {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: tokenBody.toString(),
+    signal,
   });
   if (!tokenResp.ok) {
     const text = await readResponseText(tokenResp);
@@ -3759,7 +3564,7 @@ async function dropboxRefreshAccessToken(dropboxConfig) {
   return token;
 }
 
-async function uploadBytesToDropbox({ accessToken, path, body, contentType = "application/octet-stream" }) {
+async function uploadBytesToDropbox({ accessToken, path, body, contentType = "application/octet-stream", signal = undefined }) {
   // Dropbox /2/files/upload rejects application/json; force JSON payloads to octet-stream.
   const normalizedContentType = /^application\/json\b/i.test(String(contentType || ""))
     ? "application/octet-stream"
@@ -3777,6 +3582,7 @@ async function uploadBytesToDropbox({ accessToken, path, body, contentType = "ap
       }),
     },
     body,
+    signal,
   });
   if (!response.ok) {
     const text = await readResponseText(response);
@@ -3876,6 +3682,321 @@ function validateAdoptedManifest({
   };
 }
 
+function requireManifestHash(manifest, manifestKey) {
+  try {
+    return validateCanonicalHistoryV2Manifest(manifest).manifest_hash;
+  } catch (error) {
+    throw new Error(`Manifest validation failed for ${manifestKey}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function requireNonNegativeSafeInteger(value, fieldName, manifestKey) {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new Error(`Manifest ${fieldName} is invalid: ${manifestKey}`);
+  }
+  return parsed;
+}
+
+export function validateObservationPollutantManifestForGate({
+  childManifest,
+  childReference,
+  childKey,
+  requiresActiveValidation,
+}) {
+  const childHash = requireManifestHash(childManifest, childKey);
+  if (
+    String(childReference?.manifest_hash || "").trim().toLowerCase()
+      !== childHash
+  ) {
+    throw new Error(`Connector child manifest hash mismatch: ${childKey}`);
+  }
+  const rowCount = requireNonNegativeSafeInteger(
+    childManifest.source_row_count,
+    "source_row_count",
+    childKey,
+  );
+  const fileCount = requireNonNegativeSafeInteger(
+    childManifest.file_count,
+    "file_count",
+    childKey,
+  );
+  const totalBytes = requireNonNegativeSafeInteger(
+    childManifest.total_bytes,
+    "total_bytes",
+    childKey,
+  );
+  if (requiresActiveValidation) {
+    validateObservationContentHashMetadata(childManifest, { rowCount });
+  }
+  return {
+    child_hash: childHash,
+    row_count: rowCount,
+    file_count: fileCount,
+    total_bytes: totalBytes,
+  };
+}
+
+export async function verifyOpaqueObservationFileForGate({
+  r2,
+  fileKey,
+  manifestIdentity,
+  expectedBytes,
+  getObject = r2GetObject,
+  headObject = r2HeadObject,
+}) {
+  const identity = classifyManifestFileIdentity(manifestIdentity, {
+    objectKey: fileKey,
+  });
+  const liveFile = identity.type === "etag"
+    ? await headObject({ r2, key: fileKey })
+    : await getObject({ r2, key: fileKey });
+  if (liveFile?.exists === false) {
+    throw new Error(`Opaque observation Parquet object is missing: ${fileKey}`);
+  }
+  return verifyManifestFileIdentity({
+    manifestIdentity,
+    expectedBytes,
+    liveObject: liveFile,
+    objectKey: fileKey,
+  });
+}
+
+export async function verifyObservationConnectorHistory({
+  runtime,
+  dayUtc,
+  connectorId,
+  manifestKey,
+  expectedRowCount = null,
+  activePollutants = null,
+}) {
+  assertBudget(runtime, "observation_history_verification", {
+    day_utc: dayUtc,
+    connector_id: connectorId,
+  }, PHASE_B_STAGE_MIN_MS.observation_index);
+  const expectedConnectorKey = canonicalObservationConnectorManifestKey(dayUtc, connectorId);
+  if (manifestKey !== expectedConnectorKey || runtime.committed_prefix !== HISTORY_R2_V2_OBSERVATIONS_PREFIX) {
+    throw new Error(`Observation connector manifest is not the canonical v2 key: ${manifestKey}`);
+  }
+
+  const connectorObject = await r2GetObject({ r2: runtime.r2, key: manifestKey });
+  const connectorManifest = JSON.parse(connectorObject.body.toString("utf8"));
+  if (
+    connectorManifest?.history_version !== "v2"
+    || connectorManifest?.domain !== "observations"
+    || connectorManifest?.manifest_kind !== "connector"
+    || connectorManifest?.day_utc !== dayUtc
+    || Number(connectorManifest?.connector_id) !== connectorId
+    || connectorManifest?.manifest_key !== manifestKey
+  ) {
+    throw new Error(`Observation connector manifest identity mismatch: ${manifestKey}`);
+  }
+  const connectorManifestHash = requireManifestHash(connectorManifest, manifestKey);
+  const childReferences = Array.isArray(connectorManifest.pollutant_manifests)
+    ? connectorManifest.pollutant_manifests
+    : connectorManifest.child_manifests;
+  if (!Array.isArray(childReferences) || childReferences.length === 0) {
+    throw new Error(`Observation connector manifest has no pollutant children: ${manifestKey}`);
+  }
+
+  const activePollutantSet = activePollutants === null
+    ? null
+    : new Set([...activePollutants].map((value) =>
+      normalizePollutantCodeForPath(value)
+    ));
+
+  const seenPollutants = new Set();
+  const verifiedChildren = [];
+  for (const reference of childReferences) {
+    assertBudget(runtime, "observation_history_verification", {
+      day_utc: dayUtc,
+      connector_id: connectorId,
+      pollutant_code: reference?.pollutant_code || null,
+    }, PHASE_B_STAGE_MIN_MS.observation_segment);
+    const pollutantCode = normalizePollutantCodeForPath(reference?.pollutant_code);
+    if (seenPollutants.has(pollutantCode)) {
+      throw new Error(`Duplicate pollutant child in connector manifest: ${manifestKey}`);
+    }
+    seenPollutants.add(pollutantCode);
+    const childKey = buildHistoryV2PollutantManifestKey(
+      HISTORY_R2_V2_OBSERVATIONS_PREFIX,
+      dayUtc,
+      connectorId,
+      pollutantCode,
+    );
+    if (reference?.manifest_key !== childKey) {
+      throw new Error(`Non-canonical pollutant child key in connector manifest: ${manifestKey}`);
+    }
+    const childObject = await r2GetObject({ r2: runtime.r2, key: childKey });
+    const childManifest = JSON.parse(childObject.body.toString("utf8"));
+    if (
+      childManifest?.history_version !== "v2"
+      || childManifest?.domain !== "observations"
+      || childManifest?.manifest_kind !== "pollutant"
+      || childManifest?.day_utc !== dayUtc
+      || Number(childManifest?.connector_id) !== connectorId
+      || childManifest?.pollutant_code !== pollutantCode
+      || childManifest?.manifest_key !== childKey
+    ) {
+      throw new Error(`Observation pollutant manifest identity mismatch: ${childKey}`);
+    }
+    const requiresActiveValidation = activePollutantSet === null
+      || activePollutantSet.has(pollutantCode);
+    const childValidation = validateObservationPollutantManifestForGate({
+      childManifest,
+      childReference: reference,
+      childKey,
+      requiresActiveValidation,
+    });
+    const childHash = childValidation.child_hash;
+    const rowCount = childValidation.row_count;
+    const fileCount = childValidation.file_count;
+    const totalBytes = childValidation.total_bytes;
+    const files = Array.isArray(childManifest.files) ? childManifest.files : [];
+    if (files.length !== fileCount || files.length === 0) {
+      throw new Error(`Observation pollutant manifest file_count mismatch: ${childKey}`);
+    }
+    let childRows = 0;
+    let childBytes = 0;
+    for (const file of files) {
+      assertBudget(runtime, "observation_history_part_verification", {
+        day_utc: dayUtc,
+        connector_id: connectorId,
+        pollutant_code: pollutantCode,
+        part_key: file?.key || null,
+      }, PHASE_B_STAGE_MIN_MS.observation_segment);
+      const fileKey = String(file?.key || "").trim();
+      const expectedPrefix = childKey.slice(0, -"manifest.json".length);
+      if (!fileKey.startsWith(expectedPrefix) || !fileKey.endsWith(".parquet")) {
+        throw new Error(`Observation pollutant manifest has a non-canonical Parquet key: ${childKey}`);
+      }
+      const fileRows = requireNonNegativeSafeInteger(file?.row_count, "files.row_count", childKey);
+      const fileBytes = requireNonNegativeSafeInteger(file?.bytes, "files.bytes", childKey);
+      if (requiresActiveValidation) {
+        const liveFile = await r2GetObject({ r2: runtime.r2, key: fileKey });
+        verifyManifestFileIdentity({
+          manifestIdentity: file?.etag_or_hash,
+          expectedBytes: fileBytes,
+          liveObject: liveFile,
+          objectKey: fileKey,
+        });
+      } else {
+        await verifyOpaqueObservationFileForGate({
+          r2: runtime.r2,
+          fileKey,
+          manifestIdentity: file?.etag_or_hash,
+          expectedBytes: fileBytes,
+        });
+      }
+      childRows += fileRows;
+      childBytes += fileBytes;
+    }
+    if (childRows !== rowCount || childBytes !== totalBytes) {
+      throw new Error(`Observation pollutant manifest aggregate mismatch: ${childKey}`);
+    }
+    verifiedChildren.push({
+      pollutant_code: pollutantCode,
+      manifest_key: childKey,
+      manifest_hash: childHash,
+      source_row_count: rowCount,
+      file_count: fileCount,
+      total_bytes: totalBytes,
+      validation_scope: requiresActiveValidation ? "active" : "opaque_preserved",
+    });
+  }
+
+  const rowCount = requireNonNegativeSafeInteger(connectorManifest.source_row_count, "source_row_count", manifestKey);
+  const fileCount = requireNonNegativeSafeInteger(connectorManifest.file_count, "file_count", manifestKey);
+  const totalBytes = requireNonNegativeSafeInteger(connectorManifest.total_bytes, "total_bytes", manifestKey);
+  if (
+    verifiedChildren.reduce((sum, child) => sum + child.source_row_count, 0) !== rowCount
+    || verifiedChildren.reduce((sum, child) => sum + child.file_count, 0) !== fileCount
+    || verifiedChildren.reduce((sum, child) => sum + child.total_bytes, 0) !== totalBytes
+  ) {
+    throw new Error(`Observation connector manifest aggregate mismatch: ${manifestKey}`);
+  }
+  if (expectedRowCount !== null && BigInt(rowCount) !== BigInt(expectedRowCount)) {
+    throw new Error(
+      `Observation connector manifest source row count mismatch: expected=${String(expectedRowCount)} actual=${rowCount} key=${manifestKey}`,
+    );
+  }
+
+  const indexSummary = await runBudgetedPhaseBStage({
+    runtime,
+    operation: "observation_index",
+    fields: { day_utc: dayUtc, connector_id: connectorId },
+    minMs: PHASE_B_STAGE_MIN_MS.observation_index,
+    adapter: async () => await updateR2HistoryIndexesTargeted({
+      env: {
+        ...process.env,
+        UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX: HISTORY_R2_V2_OBSERVATIONS_PREFIX,
+      },
+      r2: runtime.r2,
+      historyVersion: "v2",
+      domains: ["observations"],
+      fromDayUtc: dayUtc,
+      toDayUtc: dayUtc,
+      connectorId,
+      connectorManifestKey: manifestKey,
+      updateLatestIndex: false,
+      strictMissingTimeseriesCounts: true,
+      writeR2: true,
+    }),
+  });
+  const indexResult = indexSummary.observations_timeseries;
+  if (
+    !indexResult
+    || indexResult.warning_count !== 0
+    || indexResult.rewritten_connector_index_count !== 1
+    || !Array.isArray(indexResult.affected_pollutant_indexes)
+  ) {
+    throw new Error(`Observation connector-targeted index update failed: ${manifestKey}`);
+  }
+  for (const child of verifiedChildren) {
+    const indexKey = buildR2HistoryV2ObservationsTimeseriesPollutantIndexKey(
+      indexResult.timeseries_index_prefix,
+      dayUtc,
+      connectorId,
+      child.pollutant_code,
+    );
+    const affected = indexResult.affected_pollutant_indexes.find((entry) => entry?.key === indexKey);
+    const liveIndex = JSON.parse((await r2GetObject({ r2: runtime.r2, key: indexKey })).body.toString("utf8"));
+    if (
+      !affected
+      || liveIndex?.history_version !== "v2"
+      || liveIndex?.domain !== "observations"
+      || liveIndex?.day_utc !== dayUtc
+      || Number(liveIndex?.connector_id) !== connectorId
+      || liveIndex?.pollutant_code !== child.pollutant_code
+      || liveIndex?.pollutant_manifest_key !== child.manifest_key
+      || liveIndex?.pollutant_manifest_hash !== child.manifest_hash
+      || Number(liveIndex?.source_row_count) !== child.source_row_count
+      || Number(liveIndex?.file_count) !== child.file_count
+      || Number(liveIndex?.indexed_file_count) !== child.file_count
+      || liveIndex?.index_coverage !== "complete"
+      || !liveIndex?.timeseries_row_counts
+    ) {
+      throw new Error(`Observation connector-targeted index verification failed: ${indexKey}`);
+    }
+  }
+
+  return {
+    connector_manifest: connectorManifest,
+    history_manifest_key: manifestKey,
+    history_manifest_hash: connectorManifestHash,
+    history_row_count: rowCount,
+    history_file_count: fileCount,
+    history_total_bytes: totalBytes,
+    connector_index_count: verifiedChildren.length,
+    active_pollutant_count: verifiedChildren.filter((child) =>
+      child.validation_scope === "active"
+    ).length,
+    opaque_preserved_pollutant_count: verifiedChildren.filter((child) =>
+      child.validation_scope === "opaque_preserved"
+    ).length,
+  };
+}
+
 function createPruneComparisonManifest({
   baseManifest,
   canonicalManifestKey,
@@ -3920,7 +4041,8 @@ select
   connector_id,
   timeseries_id,
   observed_at_utc as observed_at,
-  value
+  value,
+  status
 from uk_aq_ops.uk_aq_phase_b_history_rows_v2(
   $1::integer,
   $2::timestamptz,
@@ -3975,6 +4097,12 @@ async function exportPruneComparisonToDropbox({
   const dayEnd = `${shiftIsoDay(dayUtc, 1)}T00:00:00.000Z`;
   const comparisonRoot = buildPruneComparisonBasePath({ runtime, dayUtc, connectorId });
   const comparisonQuery = buildPruneComparisonRowsQuery({ runtime, connectorId, dayStart, dayEnd });
+  assertBudget(runtime, "dropbox_comparison", {
+    day_utc: dayUtc,
+    connector_id: connectorId,
+  }, PHASE_B_STAGE_MIN_MS.dropbox_comparison);
+  const externalTimeoutMs = Math.max(1, (remainingBudgetMs(runtime) ?? 600_000) - 1_000);
+  const externalSignal = AbortSignal.timeout(externalTimeoutMs);
 
   logStructured("INFO", "phase_b_history_prune_check_dropbox_filter", {
     run_id: runtime.run_id,
@@ -3985,7 +4113,7 @@ async function exportPruneComparisonToDropbox({
     comparison_pollutant_codes: comparisonQuery.comparison_pollutant_codes,
   });
 
-  const accessToken = await dropboxRefreshAccessToken(runtime.dropbox);
+  const accessToken = await dropboxRefreshAccessToken(runtime.dropbox, { signal: externalSignal });
   const committedParts = [];
   let observedRows = 0n;
   let totalBytes = 0n;
@@ -4003,6 +4131,11 @@ async function exportPruneComparisonToDropbox({
       }
       const rows = pendingRows;
       pendingRows = [];
+      assertBudget(runtime, "dropbox_comparison_upload", {
+        day_utc: dayUtc,
+        connector_id: connectorId,
+        part_index: partIndex,
+      }, PHASE_B_STAGE_MIN_MS.dropbox_comparison);
       const parquetBuffer = rowsToParquetBuffer(
         rows,
         parquetWriterProperties(runtime.observations_row_group_size),
@@ -4013,6 +4146,7 @@ async function exportPruneComparisonToDropbox({
         accessToken,
         path: dropboxPath,
         body: parquetBuffer,
+        signal: externalSignal,
       });
 
       const partSummary = summarizeObservationPartRows(rows);
@@ -4035,6 +4169,11 @@ async function exportPruneComparisonToDropbox({
 
     try {
       for (;;) {
+        assertBudget(runtime, "dropbox_comparison_fetch", {
+          day_utc: dayUtc,
+          connector_id: connectorId,
+          part_index: partIndex,
+        }, PHASE_B_STAGE_MIN_MS.observation_segment);
         const rows = await cursorRead(cursor, runtime.cursor_fetch_rows);
         if (!rows.length) {
           break;
@@ -4057,7 +4196,7 @@ async function exportPruneComparisonToDropbox({
     } finally {
       await closeCursor(cursor);
     }
-  });
+  }, { statementTimeoutMs: Math.max(1, externalTimeoutMs) });
 
   const comparisonManifestBase = createConnectorManifest({
     dayUtc,
@@ -4105,18 +4244,21 @@ async function exportPruneComparisonToDropbox({
     path: `${comparisonRoot}/prune_manifest.json`,
     body: Buffer.from(JSON.stringify(pruneManifest, null, 2), "utf8"),
     contentType: "application/json",
+    signal: externalSignal,
   });
   await uploadBytesToDropbox({
     accessToken,
     path: `${comparisonRoot}/adopted_r2_manifest.json`,
     body: Buffer.from(JSON.stringify(adoptedManifest, null, 2), "utf8"),
     contentType: "application/json",
+    signal: externalSignal,
   });
   await uploadBytesToDropbox({
     accessToken,
     path: `${comparisonRoot}/comparison_context.json`,
     body: Buffer.from(JSON.stringify(comparisonContext, null, 2), "utf8"),
     contentType: "application/json",
+    signal: externalSignal,
   });
 
   logStructured("INFO", "phase_b_history_prune_check_dropbox_export_complete", {
@@ -4140,152 +4282,40 @@ async function exportPruneComparisonToDropbox({
   };
 }
 
-async function maybeAdoptExistingConnectorManifest({
+async function ensureConnectorPruneComparison({
   candidate,
   runtime,
+  manifestKey,
+  manifest,
+  existingComparison = null,
   logStructured,
 }) {
-  if (!runtime.adopt_existing_manifest_enabled) {
-    return { adopted: false, reason: "adoption_guard_disabled" };
+  if (!runtime.prune_check_dropbox?.enabled || existingComparison) {
+    return existingComparison;
   }
-  if (runtime.phase_b_calculate_aqi_from_observations_enabled) {
-    logStructured("INFO", "phase_b_history_existing_manifest_adoption_skipped", {
-      run_id: runtime.run_id,
+  try {
+    return await exportPruneComparisonToDropbox({
+      candidate,
+      runtime,
+      adoptedManifestKey: manifestKey,
+      adoptedManifest: manifest,
+      logStructured,
+    });
+  } catch (error) {
+    rethrowIfBudgetDeadlineReached(runtime, error, "dropbox_comparison", {
       day_utc: candidate.day_utc,
       connector_id: candidate.connector_id,
-      reason: "observation_manifest_cannot_satisfy_aqi_gate",
     });
-    return { adopted: false, reason: "observation_manifest_cannot_satisfy_aqi_gate" };
-  }
-
-  const dayUtc = candidate.day_utc;
-  const connectorId = candidate.connector_id;
-  const connectorManifestKey = buildConnectorManifestKey(runtime.committed_prefix, dayUtc, connectorId);
-  const manifestHead = await r2HeadObject({ r2: runtime.r2, key: connectorManifestKey });
-  if (!manifestHead.exists) {
-    return { adopted: false, reason: "manifest_missing" };
-  }
-
-  logStructured("INFO", "phase_b_history_existing_manifest_found", {
-    run_id: runtime.run_id,
-    day_utc: dayUtc,
-    connector_id: connectorId,
-    manifest_key: connectorManifestKey,
-  });
-
-  try {
-    const object = await r2GetObject({ r2: runtime.r2, key: connectorManifestKey });
-    let parsedManifest;
-    try {
-      parsedManifest = JSON.parse(object.body.toString("utf8"));
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      throw new Error(`Manifest JSON parse failed for ${connectorManifestKey}: ${message}`);
-    }
-    const validated = validateAdoptedManifest({
-      manifest: parsedManifest,
-      dayUtc,
-      connectorId,
-      manifestKey: connectorManifestKey,
+    logPhaseB(runtime, "ERROR", "phase_b_history_dropbox_check_failed", {
+      day_utc: candidate.day_utc,
+      connector_id: candidate.connector_id,
+      manifest_key: manifestKey,
+      required: runtime.prune_check_dropbox?.required === true,
+      ...errorLogFields(error),
     });
-
-    const probeKey = validated.parquet_keys[0];
-    const probeHead = await r2HeadObject({ r2: runtime.r2, key: probeKey });
-    if (!probeHead.exists) {
-      throw new Error(`Adopted manifest references missing parquet object: ${probeKey}`);
-    }
-
-    let comparison = null;
-    if (runtime.prune_check_dropbox?.enabled) {
-      logPhaseB(runtime, "INFO", "phase_b_history_dropbox_check_start", {
-        day_utc: dayUtc,
-        connector_id: connectorId,
-        manifest_key: connectorManifestKey,
-      });
-      try {
-        comparison = await exportPruneComparisonToDropbox({
-          candidate,
-          runtime,
-          adoptedManifestKey: connectorManifestKey,
-          adoptedManifest: validated.manifest,
-          logStructured,
-        });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        logPhaseB(runtime, "ERROR", "phase_b_history_dropbox_check_failed", {
-          day_utc: dayUtc,
-          connector_id: connectorId,
-          manifest_key: connectorManifestKey,
-          error: message,
-          ...errorLogFields(error),
-          required: runtime.prune_check_dropbox?.required === true,
-        });
-        if (runtime.prune_check_dropbox?.required) {
-          throw error;
-        }
-      }
-      if (comparison) {
-        logPhaseB(runtime, "INFO", "phase_b_history_dropbox_check_complete", {
-          day_utc: dayUtc,
-          connector_id: connectorId,
-          manifest_key: connectorManifestKey,
-          comparison_output_root: comparison.comparison_output_root,
-        });
-      }
-    }
-
-    return {
-      adopted: true,
-      manifest_key: connectorManifestKey,
-      history_row_count: validated.manifest_row_count,
-      history_file_count: validated.manifest_file_count,
-      history_total_bytes: validated.manifest_total_bytes,
-      comparison,
-    };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    logStructured("ERROR", "phase_b_history_existing_manifest_adoption_failed", {
-      run_id: runtime.run_id,
-      day_utc: dayUtc,
-      connector_id: connectorId,
-      manifest_key: connectorManifestKey,
-      error: message,
-    });
-    throw error;
+    if (runtime.prune_check_dropbox?.required) throw error;
+    return null;
   }
-}
-
-function toAqilevelConnectorCountRow(row) {
-  const expectedRowCountValue = row.expected_row_count === undefined
-    ? row.row_count
-    : row.expected_row_count;
-  return {
-    connector_id: Number(row.connector_id),
-    expected_row_count: parseBigInt(expectedRowCountValue, "aqi_expected_row_count"),
-    min_timeseries_id: Number.isFinite(Number(row.min_timeseries_id))
-      ? Math.max(1, Math.trunc(Number(row.min_timeseries_id)))
-      : null,
-    max_timeseries_id: Number.isFinite(Number(row.max_timeseries_id))
-      ? Math.max(1, Math.trunc(Number(row.max_timeseries_id)))
-      : null,
-    min_timestamp_hour_utc: row.min_timestamp_hour_utc
-      ? new Date(row.min_timestamp_hour_utc).toISOString()
-      : null,
-    max_timestamp_hour_utc: row.max_timestamp_hour_utc
-      ? new Date(row.max_timestamp_hour_utc).toISOString()
-      : null,
-  };
-}
-
-function hasAqilevelSourceConfig(runtime) {
-  const source = runtime?.aqilevels_source || {};
-  return Boolean(
-    String(source.base_url || "").trim()
-    && String(source.privileged_key || "").trim()
-    && String(source.rpc_schema || "").trim()
-    && String(source.connector_counts_rpc || "").trim()
-    && String(source.rows_rpc || "").trim(),
-  );
 }
 
 function normalizeAqilevelHistoryRow(row, connectorIdFallback = null) {
@@ -4350,96 +4380,10 @@ export function normalizeAqilevelHistoryRowForTest(row, connectorIdFallback = nu
   return normalizeAqilevelHistoryRow(row, connectorIdFallback);
 }
 
-async function fetchAqilevelConnectorCounts(runtime, dayUtc) {
-  const payload = await postgrestRpc({
-    baseUrl: runtime.aqilevels_source.base_url,
-    privilegedKey: runtime.aqilevels_source.privileged_key,
-    rpcSchema: runtime.aqilevels_source.rpc_schema,
-    rpcName: runtime.aqilevels_source.connector_counts_rpc,
-    payload: {
-      p_day_utc: dayUtc,
-      p_connector_ids: null,
-    },
-  });
-
-  if (!Array.isArray(payload)) {
-    return [];
+async function exportAqilevelConnectorRowsToR2({ runtime, dayUtc, connector, rows: sourceRows }) {
+  if (runtime.history_write_version !== "v2" || !Array.isArray(sourceRows)) {
+    throw new Error("Phase B AQI connector output requires observation-derived rows and canonical v2 history");
   }
-
-  return payload
-    .map(toAqilevelConnectorCountRow)
-    .filter((row) => Number.isInteger(row.connector_id) && row.connector_id > 0 && row.expected_row_count > 0n);
-}
-
-async function fetchAqilevelRowsPage(runtime, { dayUtc, connectorId, afterTimeseriesId, afterTimestampHourUtc, limit }) {
-  const payload = await postgrestRpc({
-    baseUrl: runtime.aqilevels_source.base_url,
-    privilegedKey: runtime.aqilevels_source.privileged_key,
-    rpcSchema: runtime.aqilevels_source.rpc_schema,
-    rpcName: runtime.aqilevels_source.rows_rpc,
-    payload: {
-      p_day_utc: dayUtc,
-      p_connector_id: connectorId,
-      p_after_timeseries_id: afterTimeseriesId,
-      p_after_timestamp_hour_utc: afterTimestampHourUtc,
-      p_limit: limit,
-    },
-  });
-
-  if (!Array.isArray(payload)) {
-    return [];
-  }
-
-  const normalized = [];
-  for (const row of payload) {
-    const parsed = normalizeAqilevelHistoryRow(row, connectorId);
-    if (parsed) {
-      normalized.push(parsed);
-    }
-  }
-  return normalized;
-}
-
-async function fetchAqilevelCandidateDays(client, latestEligibleDayUtc, scanLimit) {
-  const sql = `
-select g.day_utc::text as day_utc
-from uk_aq_ops.prune_day_gates g
-where g.history_done is true
-  and g.day_utc <= $1::date
-order by g.day_utc desc
-limit $2
-`;
-  const result = await client.query(sql, [latestEligibleDayUtc, scanLimit]);
-  return result.rows.map((row) => normalizeDayUtc(row.day_utc)).filter(Boolean);
-}
-
-async function discoverPendingAqilevelDays({ client, runtime, latestEligibleDayUtc }) {
-  const scanLimit = Math.max(runtime.max_candidates_per_run * 4, runtime.max_candidates_per_run);
-  const candidates = await fetchAqilevelCandidateDays(client, latestEligibleDayUtc, scanLimit);
-  const pending = [];
-
-  for (const dayUtc of candidates) {
-    const manifestKeys = [buildDayManifestKey(runtime.aqilevels_prefix, dayUtc)];
-    if (runtime.history_write_version === "v2") {
-      manifestKeys.push(buildDayManifestKey(runtime.aqilevels_hourly_debug_prefix_v2, dayUtc));
-    }
-
-    for (const manifestKey of manifestKeys) {
-      const head = await r2HeadObject({ r2: runtime.r2, key: manifestKey });
-      if (!head.exists) {
-        pending.push(dayUtc);
-        break;
-      }
-    }
-    if (pending.length >= runtime.max_candidates_per_run) {
-      break;
-    }
-  }
-
-  return uniqueSorted(pending);
-}
-
-async function exportAqilevelConnectorRowsToR2({ runtime, dayUtc, connector, rows: sourceRows = null }) {
   const connectorId = Number(connector.connector_id);
   const expectedRowCount = connector.expected_row_count;
   const fileEntries = [];
@@ -4451,16 +4395,11 @@ async function exportAqilevelConnectorRowsToR2({ runtime, dayUtc, connector, row
   let debugTotalBytes = 0n;
   let minTimestampHourUtc = null;
   let maxTimestampHourUtc = null;
-  let cursorAfterTimeseriesId = null;
-  let cursorAfterTimestampHourUtc = null;
-  let pageCount = 0;
-  const normalizedSourceRows = Array.isArray(sourceRows)
-    ? [...sourceRows].sort((left, right) => {
+  const normalizedSourceRows = [...sourceRows].sort((left, right) => {
       const leftKey = `${left.timeseries_id || 0}|${left.timestamp_hour_utc || ""}`;
       const rightKey = `${right.timeseries_id || 0}|${right.timestamp_hour_utc || ""}`;
       return leftKey.localeCompare(rightKey);
-    })
-    : null;
+    });
 
   const flushPart = async () => {
     if (!pendingRows.length) {
@@ -4469,7 +4408,6 @@ async function exportAqilevelConnectorRowsToR2({ runtime, dayUtc, connector, row
     const partRows = pendingRows;
     pendingRows = [];
 
-    if (runtime.history_write_version === "v2") {
       const groupedRows = groupRowsByPollutant(partRows);
       logPhaseB(runtime, "INFO", "phase_b_aqilevels_v2_pollutant_plan", {
         day_utc: dayUtc,
@@ -4482,6 +4420,12 @@ async function exportAqilevelConnectorRowsToR2({ runtime, dayUtc, connector, row
       for (const [pollutantCode, pollutantRows] of groupedRows) {
         const partSummary = summarizeAqilevelPartRows(pollutantRows);
         const writeProfilePart = async ({ prefix, profile, toParquetBuffer, targetFileEntries }) => {
+          assertBudget(runtime, "aqi_object_write", {
+            day_utc: dayUtc,
+            connector_id: connectorId,
+            pollutant_code: pollutantCode,
+            profile,
+          }, PHASE_B_STAGE_MIN_MS.aqi_object_write);
           const partKey = buildHistoryV2PartKey(prefix, dayUtc, connectorId, pollutantCode, partIndex);
           const parquetBuffer = toParquetBuffer(
             pollutantRows,
@@ -4526,50 +4470,9 @@ async function exportAqilevelConnectorRowsToR2({ runtime, dayUtc, connector, row
       partIndex += 1;
       observedRows += BigInt(partRows.length);
       return;
-    }
-
-    const partSummary = summarizeAqilevelPartRows(partRows);
-    const partKey = buildPartKey(runtime.aqilevels_prefix, dayUtc, connectorId, partIndex);
-    const parquetBuffer = rowsToAqilevelParquetBuffer(
-      partRows,
-      parquetWriterProperties(
-        runtime.aqilevels_row_group_size,
-        HISTORY_AQILEVELS_WRITER_VERSION,
-      ),
-    );
-    const putResult = await r2PutObject({
-      r2: runtime.r2,
-      key: partKey,
-      body: parquetBuffer,
-      content_type: "application/octet-stream",
-    });
-    const head = await r2HeadObject({ r2: runtime.r2, key: partKey });
-    if (!head.exists) {
-      throw new Error(`Missing AQI committed object after write: ${partKey}`);
-    }
-    const bytes = typeof head.bytes === "number" && Number.isFinite(head.bytes)
-      ? Math.trunc(head.bytes)
-      : Math.trunc(putResult.bytes);
-    const etagOrHash = head.etag || putResult.etag || null;
-
-    fileEntries.push({
-      key: partKey,
-      row_count: partRows.length,
-      bytes,
-      etag_or_hash: etagOrHash,
-      min_timeseries_id: partSummary.min_timeseries_id,
-      max_timeseries_id: partSummary.max_timeseries_id,
-      min_timestamp_hour_utc: partSummary.min_timestamp_hour_utc,
-      max_timestamp_hour_utc: partSummary.max_timestamp_hour_utc,
-      pollutant_codes: partSummary.pollutant_codes,
-    });
-    partIndex += 1;
-    observedRows += BigInt(partRows.length);
-    totalBytes += BigInt(bytes);
   };
 
-  if (normalizedSourceRows) {
-    for (const row of normalizedSourceRows) {
+  for (const row of normalizedSourceRows) {
       if (!minTimestampHourUtc || row.timestamp_hour_utc < minTimestampHourUtc) {
         minTimestampHourUtc = row.timestamp_hour_utc;
       }
@@ -4580,58 +4483,6 @@ async function exportAqilevelConnectorRowsToR2({ runtime, dayUtc, connector, row
       if (pendingRows.length >= runtime.aqilevels_part_max_rows) {
         await flushPart();
       }
-    }
-  } else {
-    for (;;) {
-      pageCount += 1;
-      if (pageCount > runtime.aqilevels_source_max_pages) {
-        throw new Error(
-          `AQI source RPC exceeded max pages (${runtime.aqilevels_source_max_pages}) for day=${dayUtc} connector=${connectorId}`,
-        );
-      }
-
-      const pageRows = await fetchAqilevelRowsPage(runtime, {
-        dayUtc,
-        connectorId,
-        afterTimeseriesId: cursorAfterTimeseriesId,
-        afterTimestampHourUtc: cursorAfterTimestampHourUtc,
-        limit: runtime.cursor_fetch_rows,
-      });
-      if (!pageRows.length) {
-        break;
-      }
-
-      for (const row of pageRows) {
-        if (!minTimestampHourUtc || row.timestamp_hour_utc < minTimestampHourUtc) {
-          minTimestampHourUtc = row.timestamp_hour_utc;
-        }
-        if (!maxTimestampHourUtc || row.timestamp_hour_utc > maxTimestampHourUtc) {
-          maxTimestampHourUtc = row.timestamp_hour_utc;
-        }
-
-        pendingRows.push({
-          ...row,
-          connector_id: connectorId,
-        });
-
-        if (pendingRows.length >= runtime.aqilevels_part_max_rows) {
-          await flushPart();
-        }
-      }
-
-      const last = pageRows[pageRows.length - 1];
-      const nextAfterTimeseriesId = Number(last.timeseries_id);
-      const nextAfterTimestampHourUtc = String(last.timestamp_hour_utc);
-      const cursorUnchanged = nextAfterTimeseriesId === cursorAfterTimeseriesId
-        && nextAfterTimestampHourUtc === cursorAfterTimestampHourUtc;
-      if (cursorUnchanged) {
-        throw new Error(
-          `AQI source RPC cursor did not advance for day=${dayUtc} connector=${connectorId}`,
-        );
-      }
-      cursorAfterTimeseriesId = nextAfterTimeseriesId;
-      cursorAfterTimestampHourUtc = nextAfterTimestampHourUtc;
-    }
   }
 
   if (pendingRows.length > 0) {
@@ -4649,7 +4500,6 @@ async function exportAqilevelConnectorRowsToR2({ runtime, dayUtc, connector, row
   let connectorManifest;
   let debugConnectorManifestKey = null;
   let debugConnectorManifest = null;
-  if (runtime.history_write_version === "v2") {
     const createAndUploadProfileConnectorManifest = async ({ prefix, profile, profileFileEntries }) => {
       const pollutantManifests = [];
       const partsByPollutant = new Map();
@@ -4659,8 +4509,14 @@ async function exportAqilevelConnectorRowsToR2({ runtime, dayUtc, connector, row
         partsByPollutant.get(pollutantCode).push(fileEntry);
       }
       for (const [pollutantCode, pollutantParts] of Array.from(partsByPollutant.entries()).sort(([left], [right]) => left.localeCompare(right))) {
+        assertBudget(runtime, "aqi_object_write", {
+          day_utc: dayUtc,
+          connector_id: connectorId,
+          pollutant_code: pollutantCode,
+          profile,
+        }, PHASE_B_STAGE_MIN_MS.aqi_object_write);
         const pollutantManifestKey = buildHistoryV2PollutantManifestKey(prefix, dayUtc, connectorId, pollutantCode);
-        const pollutantManifest = createHistoryV2PollutantManifest({
+        const pollutantManifest = buildHistoryV2PollutantManifest({
           domain: "aqilevels", grain: HISTORY_AQILEVELS_GRAIN, profile, dayUtc, connectorId, pollutantCode,
           runId: runtime.run_id, manifestKey: pollutantManifestKey,
           sourceRowCount: pollutantParts.reduce((sum, part) => sum + Number(part.row_count || 0), 0),
@@ -4672,7 +4528,7 @@ async function exportAqilevelConnectorRowsToR2({ runtime, dayUtc, connector, row
         pollutantManifests.push(pollutantManifest);
       }
       const profileConnectorManifestKey = buildConnectorManifestKey(prefix, dayUtc, connectorId);
-      return { key: profileConnectorManifestKey, manifest: createHistoryV2ConnectorManifest({
+      return { key: profileConnectorManifestKey, manifest: buildHistoryV2ConnectorManifest({
         domain: "aqilevels", grain: HISTORY_AQILEVELS_GRAIN, profile, dayUtc, connectorId,
         runId: runtime.run_id, manifestKey: profileConnectorManifestKey, pollutantManifests,
         writerGitSha: runtime.writer_git_sha, backedUpAtUtc,
@@ -4684,21 +4540,11 @@ async function exportAqilevelConnectorRowsToR2({ runtime, dayUtc, connector, row
     const debugProfile = await createAndUploadProfileConnectorManifest({ prefix: runtime.aqilevels_hourly_debug_prefix_v2, profile: "debug", profileFileEntries: debugFileEntries });
     debugConnectorManifestKey = debugProfile.key;
     debugConnectorManifest = debugProfile.manifest;
-  } else {
-    connectorManifest = createAqilevelConnectorManifest({
-      dayUtc,
-      connectorId,
-      runId: runtime.run_id,
-      sourceRowCount: Number(observedRows),
-      minTimeseriesId: connector.min_timeseries_id ?? null,
-      maxTimeseriesId: connector.max_timeseries_id ?? null,
-      minTimestampHourUtc: minTimestampHourUtc || connector.min_timestamp_hour_utc || null,
-      maxTimestampHourUtc: maxTimestampHourUtc || connector.max_timestamp_hour_utc || null,
-      fileEntries,
-      writerGitSha: runtime.writer_git_sha,
-      backedUpAtUtc,
-    });
-  }
+  assertBudget(runtime, "aqi_object_write", {
+    day_utc: dayUtc,
+    connector_id: connectorId,
+    profile: "connector_manifest",
+  }, PHASE_B_STAGE_MIN_MS.aqi_object_write);
   await r2PutObject({
     r2: runtime.r2,
     key: connectorManifestKey,
@@ -4711,13 +4557,16 @@ async function exportAqilevelConnectorRowsToR2({ runtime, dayUtc, connector, row
     throw new Error(`AQI connector manifest missing after upload: ${connectorManifestKey}`);
   }
 
-  if (runtime.history_write_version === "v2") {
+    assertBudget(runtime, "aqi_object_write", {
+      day_utc: dayUtc,
+      connector_id: connectorId,
+      profile: "debug_connector_manifest",
+    }, PHASE_B_STAGE_MIN_MS.aqi_object_write);
     await r2PutObject({ r2: runtime.r2, key: debugConnectorManifestKey, body: Buffer.from(JSON.stringify(debugConnectorManifest, null, 2), "utf8"), content_type: "application/json" });
     const debugManifestHead = await r2HeadObject({ r2: runtime.r2, key: debugConnectorManifestKey });
     if (!debugManifestHead.exists) {
       throw new Error(`AQI debug connector manifest missing after upload: ${debugConnectorManifestKey}`);
     }
-  }
 
   return {
     connector_id: connectorId,
@@ -4737,133 +4586,6 @@ async function exportAqilevelConnectorRowsToR2({ runtime, dayUtc, connector, row
     } : null,
   };
 }
-
-async function exportAqilevelConnectorDayToR2({ runtime, dayUtc, connector }) {
-  return await exportAqilevelConnectorRowsToR2({ runtime, dayUtc, connector });
-}
-
-export async function discoverPendingAqilevelDaysForTest(args) {
-  return await discoverPendingAqilevelDays(args);
-}
-
-export async function exportAqilevelDayToR2ForTest(args) {
-  return await exportAqilevelDayToR2(args);
-}
-
-async function exportAqilevelDayToR2({ runtime, dayUtc }) {
-  const connectorCounts = await fetchAqilevelConnectorCounts(runtime, dayUtc);
-  if (connectorCounts.length === 0) {
-    return {
-      status: "skipped_no_source_rows",
-      day_utc: dayUtc,
-      connector_count: 0,
-      source_row_count: 0n,
-      file_count: 0,
-      total_bytes: 0n,
-      day_manifest_key: null,
-    };
-  }
-
-  const connectorManifests = [];
-  const debugConnectorManifests = [];
-  let totalRows = 0n;
-  let totalBytes = 0n;
-  let totalFiles = 0;
-  let debugTotalBytes = 0n;
-  let debugTotalFiles = 0;
-
-  for (const connector of connectorCounts) {
-    const result = await exportAqilevelConnectorDayToR2({
-      runtime,
-      dayUtc,
-      connector,
-    });
-    totalRows += result.source_row_count;
-    totalBytes += result.total_bytes;
-    totalFiles += result.file_count;
-    debugTotalBytes += result.debug_total_bytes || 0n;
-    debugTotalFiles += result.debug_file_count || 0;
-    connectorManifests.push(result.connector_manifest);
-    if (result.debug_connector_manifest) {
-      debugConnectorManifests.push(result.debug_connector_manifest);
-    }
-  }
-
-  const backedUpAtUtc = nowIso();
-  const dayManifestKey = buildDayManifestKey(runtime.aqilevels_prefix, dayUtc);
-  const dayManifest = runtime.history_write_version === "v2"
-    ? createHistoryV2DayManifest({
-      domain: "aqilevels",
-      grain: HISTORY_AQILEVELS_GRAIN,
-      profile: "data",
-      dayUtc,
-      runId: runtime.run_id,
-      manifestKey: dayManifestKey,
-      connectorManifests,
-      writerGitSha: runtime.writer_git_sha,
-      backedUpAtUtc,
-    })
-    : createAqilevelDayManifest({
-      dayUtc,
-      runId: runtime.run_id,
-      connectorManifests,
-      writerGitSha: runtime.writer_git_sha,
-      backedUpAtUtc,
-    });
-  await r2PutObject({
-    r2: runtime.r2,
-    key: dayManifestKey,
-    body: Buffer.from(JSON.stringify(dayManifest, null, 2), "utf8"),
-    content_type: "application/json",
-  });
-
-  let debugDayManifestKey = null;
-  if (runtime.history_write_version === "v2") {
-    debugDayManifestKey = buildDayManifestKey(runtime.aqilevels_hourly_debug_prefix_v2, dayUtc);
-    const debugDayManifest = createHistoryV2DayManifest({
-      domain: "aqilevels",
-      grain: HISTORY_AQILEVELS_GRAIN,
-      profile: "debug",
-      dayUtc,
-      runId: runtime.run_id,
-      manifestKey: debugDayManifestKey,
-      connectorManifests: debugConnectorManifests,
-      writerGitSha: runtime.writer_git_sha,
-      backedUpAtUtc,
-    });
-    await r2PutObject({
-      r2: runtime.r2,
-      key: debugDayManifestKey,
-      body: Buffer.from(JSON.stringify(debugDayManifest, null, 2), "utf8"),
-      content_type: "application/json",
-    });
-  }
-
-  const dayHead = await r2HeadObject({ r2: runtime.r2, key: dayManifestKey });
-  if (!dayHead.exists) {
-    throw new Error(`AQI day manifest missing after upload: ${dayManifestKey}`);
-  }
-  if (runtime.history_write_version === "v2") {
-    const debugDayHead = await r2HeadObject({ r2: runtime.r2, key: debugDayManifestKey });
-    if (!debugDayHead.exists) {
-      throw new Error(`AQI debug day manifest missing after upload: ${debugDayManifestKey}`);
-    }
-  }
-
-  return {
-    status: "complete",
-    day_utc: dayUtc,
-    connector_count: connectorCounts.length,
-    source_row_count: totalRows,
-    file_count: totalFiles,
-    total_bytes: totalBytes,
-    day_manifest_key: dayManifestKey,
-    debug_file_count: debugTotalFiles,
-    debug_total_bytes: debugTotalBytes,
-    debug_day_manifest_key: debugDayManifestKey,
-  };
-}
-
 
 export function summarizeFrozenObservationSourceForAqi({ rows = [], dayUtc, maxRows = DEFAULT_PHASE_B_OBSERVATION_SNAPSHOT_MAX_ROWS } = {}) {
   const dayStart = Date.parse(`${dayUtc}T00:00:00.000Z`);
@@ -4927,151 +4649,52 @@ export function summarizeFrozenObservationSourceForAqi({ rows = [], dayUtc, maxR
   };
 }
 
-async function runAqilevelsBackup({ runtime, latestEligibleDayUtc, dryRun, logStructured }) {
-  const summary = {
-    enabled: true,
-    dry_run: dryRun,
-    latest_eligible_day_utc: latestEligibleDayUtc,
-    pending_days: 0,
-    completed_days: 0,
-    skipped_days_no_source_rows: 0,
-    failed_days: 0,
-    total_written_rows: "0",
-    total_written_bytes: "0",
-    pending_preview: [],
-    completed_preview: [],
-    failures: [],
-    aqilevels_prefix: runtime.aqilevels_prefix,
-    aqilevels_schema_name: HISTORY_AQILEVELS_SCHEMA_NAME,
-    aqilevels_schema_version: HISTORY_AQILEVELS_SCHEMA_VERSION,
-    aqilevels_grain: HISTORY_AQILEVELS_GRAIN,
-    aqilevels_writer_version: HISTORY_AQILEVELS_WRITER_VERSION,
-  };
-
-  logStructured("INFO", "phase_b_aqilevels_run_start", {
-    run_id: runtime.run_id,
-    dry_run: dryRun,
-    latest_eligible_day_utc: latestEligibleDayUtc,
-    max_candidates_per_run: runtime.max_candidates_per_run,
-    aqilevels_prefix: runtime.aqilevels_prefix,
-    aqilevels_schema_name: HISTORY_AQILEVELS_SCHEMA_NAME,
-    aqilevels_schema_version: HISTORY_AQILEVELS_SCHEMA_VERSION,
-    aqilevels_grain: HISTORY_AQILEVELS_GRAIN,
-    aqilevels_writer_version: HISTORY_AQILEVELS_WRITER_VERSION,
-    aqilevels_rpc_schema: runtime.aqilevels_source?.rpc_schema || null,
-    aqilevels_rows_rpc: runtime.aqilevels_source?.rows_rpc || null,
-    aqilevels_connector_counts_rpc: runtime.aqilevels_source?.connector_counts_rpc || null,
-  });
-
-  if (!hasAqilevelSourceConfig(runtime)) {
-    throw new Error("Phase B AQI export requires OBS_AQIDB_SUPABASE_URL and OBS_AQIDB_SECRET_KEY with AQI history RPCs.");
-  }
-
-  const pendingDays = await withPgClient(runtime.supabase_db_url, async (client) => {
-    return await discoverPendingAqilevelDays({
-      client,
-      runtime,
-      latestEligibleDayUtc,
-    });
-  });
-
-  summary.pending_days = pendingDays.length;
-  summary.pending_preview = pendingDays.slice(0, 25);
-  if (dryRun) {
-    summary.completed_preview = summary.completed_preview.slice(0, 25);
-    summary.failures = summary.failures.slice(0, 25);
-    logStructured("INFO", "phase_b_aqilevels_run_summary", {
-      run_id: runtime.run_id,
-      ...summary,
-    });
-    return summary;
-  }
-
-  let totalRows = 0n;
-  let totalBytes = 0n;
-  for (const dayUtc of pendingDays) {
-    const startedAtMs = Date.now();
-    try {
-      const dayResult = await exportAqilevelDayToR2({
-        runtime,
-        dayUtc,
-      });
-
-      if (dayResult.status === "skipped_no_source_rows") {
-        summary.skipped_days_no_source_rows += 1;
-        logStructured("INFO", "phase_b_aqilevels_day_skipped_no_source_rows", {
-          run_id: runtime.run_id,
-          day_utc: dayUtc,
-        });
-        continue;
-      }
-
-      summary.completed_days += 1;
-      totalRows += dayResult.source_row_count;
-      totalBytes += dayResult.total_bytes;
-      summary.completed_preview.push({
-        day_utc: dayUtc,
-        connector_count: dayResult.connector_count,
-        source_row_count: dayResult.source_row_count.toString(),
-        file_count: dayResult.file_count,
-        total_bytes: dayResult.total_bytes.toString(),
-        day_manifest_key: dayResult.day_manifest_key,
-      });
-      logStructured("INFO", "phase_b_aqilevels_day_complete", {
-        run_id: runtime.run_id,
-        day_utc: dayUtc,
-        connector_count: dayResult.connector_count,
-        source_row_count: dayResult.source_row_count.toString(),
-        file_count: dayResult.file_count,
-        total_bytes: dayResult.total_bytes.toString(),
-        day_manifest_key: dayResult.day_manifest_key,
-        duration_ms: Math.max(0, Date.now() - startedAtMs),
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      summary.failed_days += 1;
-      summary.failures.push({
-        day_utc: dayUtc,
-        error: message,
-        next_action: "retry_safe",
-      });
-      logStructured("ERROR", "phase_b_aqilevels_day_failed", {
-        run_id: runtime.run_id,
-        day_utc: dayUtc,
-        error: message,
-        duration_ms: Math.max(0, Date.now() - startedAtMs),
-        next_action: "retry_safe",
-      });
-    }
-  }
-
-  summary.total_written_rows = totalRows.toString();
-  summary.total_written_bytes = totalBytes.toString();
-
-  summary.completed_preview = summary.completed_preview.slice(0, 25);
-  summary.failures = summary.failures.slice(0, 25);
-  logStructured("INFO", "phase_b_aqilevels_run_summary", {
-    run_id: runtime.run_id,
-    ...summary,
-  });
-  return summary;
-}
-
-
-async function writeAqilevelDayManifestFromConnectorOutputs({ runtime, dayUtc }) {
-  if (!runtime.phase_b_calculate_aqi_from_observations_enabled || runtime.history_write_version !== "v2") {
-    return { required: false };
+async function writeAqilevelDayManifestFromConnectorOutputs({ runtime, dayUtc, changedConnectorIds = [] }) {
+  if (runtime.history_write_version !== "v2" || !runtime.phase_b_calculate_aqi_from_observations_enabled) {
+    throw new Error("Phase B AQI day finalisation requires the canonical observation-derived v2 writer");
   }
   const readConnectorManifests = async (prefix) => {
-    const entries = await r2ListAllObjects({
+    const dayManifestKey = buildDayManifestKey(prefix, dayUtc);
+    const profile = prefix === runtime.aqilevels_hourly_debug_prefix_v2 ? "debug" : "data";
+    const currentRead = await readParentManifestForBoundedRecovery({
+      getObject: r2GetObject,
       r2: runtime.r2,
-      prefix: `${prefix}/day_utc=${dayUtc}/`,
-      max_keys: 10_000,
+      key: dayManifestKey,
+      validate: (current) => {
+        validateCanonicalHistoryV2Manifest(current, {
+          history_version: "v2",
+          domain: "aqilevels",
+          grain: HISTORY_AQILEVELS_GRAIN,
+          profile,
+          manifest_kind: "day",
+          day_utc: dayUtc,
+          manifest_key: dayManifestKey,
+        });
+        const references = Array.isArray(current.connector_manifests)
+          ? current.connector_manifests
+          : Array.isArray(current.child_manifests) ? current.child_manifests : [];
+        const manifestKeys = references.map((entry) => String(entry.manifest_key || "").trim());
+        if (!manifestKeys.length || manifestKeys.some((key) => !/\/connector_id=\d+\/manifest\.json$/.test(key))) {
+          throw new Error("current AQI day manifest has invalid connector references");
+        }
+        return manifestKeys;
+      },
     });
-    const manifestKeys = entries
-      .map((entry) => String(entry.key || ""))
-      .filter((key) => /\/connector_id=\d+\/manifest\.json$/.test(key))
-      .sort();
+    let manifestKeys = currentRead.state === "valid" ? currentRead.value : [];
+    if (currentRead.state !== "valid") {
+      const entries = await r2ListAllObjects({
+        r2: runtime.r2,
+        prefix: `${prefix}/day_utc=${dayUtc}/`,
+        max_keys: 10_000,
+      });
+      manifestKeys = entries
+        .map((entry) => String(entry.key || ""))
+        .filter((key) => /\/connector_id=\d+\/manifest\.json$/.test(key));
+    }
+    manifestKeys = uniqueSorted([
+      ...manifestKeys,
+      ...changedConnectorIds.map((connectorId) => buildConnectorManifestKey(prefix, dayUtc, connectorId)),
+    ]);
     const manifests = [];
     for (const key of manifestKeys) {
       const object = await r2GetObject({ r2: runtime.r2, key });
@@ -5090,7 +4713,7 @@ async function writeAqilevelDayManifestFromConnectorOutputs({ runtime, dayUtc })
   const backedUpAtUtc = nowIso();
   const dataDayManifestKey = buildDayManifestKey(runtime.aqilevels_prefix, dayUtc);
   const debugDayManifestKey = buildDayManifestKey(runtime.aqilevels_hourly_debug_prefix_v2, dayUtc);
-  const dataDayManifest = createHistoryV2DayManifest({
+  const dataDayManifest = buildHistoryV2DayManifest({
     domain: "aqilevels",
     grain: HISTORY_AQILEVELS_GRAIN,
     profile: "data",
@@ -5101,7 +4724,7 @@ async function writeAqilevelDayManifestFromConnectorOutputs({ runtime, dayUtc })
     writerGitSha: runtime.writer_git_sha,
     backedUpAtUtc,
   });
-  const debugDayManifest = createHistoryV2DayManifest({
+  const debugDayManifest = buildHistoryV2DayManifest({
     domain: "aqilevels",
     grain: HISTORY_AQILEVELS_GRAIN,
     profile: "debug",
@@ -5244,13 +4867,11 @@ function buildAqilevelIndexEnv(runtime) {
 }
 
 export async function buildAqilevelDayIndexes({ runtime, dayUtc, connectorManifests }) {
-  if (!runtime.phase_b_calculate_aqi_from_observations_enabled) {
-    return { required: false, reason: "legacy_aqi_rpc_export" };
-  }
   const requiredTargets = requiredAqilevelDayIndexTargets({ runtime, dayUtc, connectorManifests });
   if (requiredTargets.length === 0 && (!Array.isArray(connectorManifests) || connectorManifests.length === 0 || !hasRequiredR2Config(runtime.r2))) {
     return { required: false, reason: "no_supported_aqi_source" };
   }
+  assertBudget(runtime, "aqi_index", { day_utc: dayUtc }, PHASE_B_STAGE_MIN_MS.aqi_index);
   const summary = await updateR2HistoryIndexesTargeted({
     env: buildAqilevelIndexEnv(runtime),
     r2: runtime.r2,
@@ -5259,6 +4880,7 @@ export async function buildAqilevelDayIndexes({ runtime, dayUtc, connectorManife
     fromDayUtc: dayUtc,
     toDayUtc: dayUtc,
     connectorId: null,
+    updateLatestIndex: false,
     strictMissingTimeseriesCounts: true,
     fetchConcurrency: 1,
     writeR2: true,
@@ -5283,13 +4905,11 @@ export async function buildAqilevelDayIndexes({ runtime, dayUtc, connectorManife
 }
 
 export async function verifyAqilevelDayIndexes({ runtime, dayUtc, connectorManifests, indexBuild = null }) {
-  if (!runtime.phase_b_calculate_aqi_from_observations_enabled) {
-    return { required: false, reason: "legacy_aqi_rpc_export" };
-  }
   const requiredTargets = requiredAqilevelDayIndexTargets({ runtime, dayUtc, connectorManifests });
   if (requiredTargets.length === 0) {
     return { required: false, reason: "no_supported_aqi_source" };
   }
+  assertBudget(runtime, "aqi_index_verify", { day_utc: dayUtc }, PHASE_B_STAGE_MIN_MS.aqi_index);
   const buildResult = Array.isArray(indexBuild?.summary?.results)
     ? indexBuild.summary.results.find((entry) => entry?.history_version === "v2" && entry?.domain === "aqilevels")
     : null;
@@ -5306,6 +4926,11 @@ export async function verifyAqilevelDayIndexes({ runtime, dayUtc, connectorManif
   );
   const failures = [];
   for (const target of requiredTargets) {
+    assertBudget(runtime, "aqi_index_verify", {
+      day_utc: dayUtc,
+      connector_id: target.connector_id,
+      pollutant_code: target.pollutant_code,
+    }, PHASE_B_STAGE_MIN_MS.aqi_index);
     if (buildResult && !buildKeys.has(target.index_key)) {
       failures.push(`${target.index_key}: not reported by current targeted build`);
       continue;
@@ -5357,7 +4982,43 @@ export const extractAqilevelIndexPollutantsFromConnectorManifestForTest = extrac
 export const buildAqilevelDayIndexesForTest = buildAqilevelDayIndexes;
 export const verifyAqilevelDayIndexesForTest = verifyAqilevelDayIndexes;
 
-async function finalizeDayGateIfReady({ client, runtime, dayUtc }) {
+export function summarizeVerifiedMergedDayManifestForGate({ manifest, manifestKey, dayUtc }) {
+  if (!manifest || manifest.history_version !== "v2" || manifest.domain !== "observations"
+    || manifest.manifest_kind !== "day" || manifest.day_utc !== dayUtc
+    || manifest.manifest_key !== manifestKey) {
+    throw new Error(`Verified day manifest identity mismatch: ${manifestKey}`);
+  }
+  requireManifestHash(manifest, manifestKey);
+  const connectorReferences = Array.isArray(manifest.connector_manifests)
+    ? manifest.connector_manifests
+    : [];
+  if (connectorReferences.length === 0) {
+    throw new Error(`Verified day manifest has no connector evidence: ${manifestKey}`);
+  }
+  const rowCount = requireNonNegativeSafeInteger(manifest.source_row_count, "source_row_count", manifestKey);
+  const fileCount = requireNonNegativeSafeInteger(manifest.file_count, "file_count", manifestKey);
+  const totalBytes = requireNonNegativeSafeInteger(manifest.total_bytes, "total_bytes", manifestKey);
+  const childTotals = connectorReferences.reduce((totals, child) => ({
+    rows: totals.rows + requireNonNegativeSafeInteger(child?.source_row_count, "connector source_row_count", manifestKey),
+    files: totals.files + requireNonNegativeSafeInteger(child?.file_count, "connector file_count", manifestKey),
+    bytes: totals.bytes + requireNonNegativeSafeInteger(child?.total_bytes, "connector total_bytes", manifestKey),
+  }), { rows: 0, files: 0, bytes: 0 });
+  if (rowCount !== childTotals.rows || fileCount !== childTotals.files || totalBytes !== childTotals.bytes) {
+    throw new Error(`Verified day manifest aggregate totals do not match merged connector evidence: ${manifestKey}`);
+  }
+  if ((rowCount === 0 && (fileCount !== 0 || totalBytes !== 0))
+    || (rowCount > 0 && (fileCount === 0 || totalBytes === 0))) {
+    throw new Error(`Verified day manifest aggregate totals are internally inconsistent: ${manifestKey}`);
+  }
+  return {
+    history_manifest_hash: manifest.manifest_hash,
+    history_row_count: BigInt(rowCount),
+    history_file_count: fileCount,
+    history_total_bytes: BigInt(totalBytes),
+  };
+}
+
+async function finalizeDayGateIfReadyUnlocked({ client, runtime, dayUtc }) {
   const dayCandidates = await fetchDayCandidates(client, dayUtc);
   const dayState = computeDayGateState(dayCandidates);
 
@@ -5370,40 +5031,92 @@ async function finalizeDayGateIfReady({ client, runtime, dayUtc }) {
     };
   }
 
+  assertBudget(runtime, "day_finalization", { day_utc: dayUtc }, PHASE_B_STAGE_MIN_MS.day_finalization);
+
+  const dayManifestKey = buildHistoryV2DayManifestKey(runtime.committed_prefix, dayUtc);
+  const dayPrefix = `${runtime.committed_prefix}/day_utc=${dayUtc}/`;
+  const currentRead = await readParentManifestForBoundedRecovery({
+    getObject: r2GetObject,
+    r2: runtime.r2,
+    key: dayManifestKey,
+    validate: (current) => {
+      validateCanonicalHistoryV2Manifest(current, {
+        history_version: "v2",
+        domain: "observations",
+        manifest_kind: "day",
+        day_utc: dayUtc,
+        manifest_key: dayManifestKey,
+      });
+      const currentReferences = Array.isArray(current.connector_manifests)
+        ? current.connector_manifests
+        : Array.isArray(current.child_manifests) ? current.child_manifests : [];
+      const references = currentReferences.map((entry) => ({
+        connector_id: Number(entry.connector_id),
+        manifest_key: String(entry.manifest_key || ""),
+      }));
+      if (references.some((entry) =>
+        !Number.isInteger(entry.connector_id) || entry.connector_id <= 0 ||
+        !entry.manifest_key.startsWith(dayPrefix) ||
+        !entry.manifest_key.endsWith(`/connector_id=${entry.connector_id}/manifest.json`)
+      )) {
+        throw new Error(`Current day manifest has invalid connector references: ${dayManifestKey}`);
+      }
+      return references;
+    },
+  });
+  let existingReferences = currentRead.state === "valid" ? currentRead.value : [];
+  if (currentRead.state !== "valid") {
+    const discovered = await r2ListAllObjects({
+      r2: runtime.r2,
+      prefix: dayPrefix,
+      max_keys: 10_000,
+    });
+    existingReferences = discovered.flatMap((entry) => {
+      const key = String(entry.key || "");
+      const match = key.match(/\/connector_id=([1-9]\d*)\/manifest\.json$/);
+      return match ? [{ connector_id: Number(match[1]), manifest_key: key }] : [];
+    });
+  }
+  const replacementReferences = dayCandidates.map((candidate) => ({
+    connector_id: candidate.connector_id,
+    manifest_key: candidate.manifest_key,
+  }));
+  const mergedReferences = mergeConnectorManifestReferences(existingReferences, replacementReferences);
   const connectorManifests = [];
-  for (const candidate of dayCandidates) {
-    if (!candidate.manifest_key) {
-      throw new Error(`Missing connector manifest_key for day=${dayUtc} connector=${candidate.connector_id}`);
+  for (const reference of mergedReferences) {
+    assertBudget(runtime, "day_finalization", {
+      day_utc: dayUtc,
+      connector_id: reference.connector_id,
+    }, PHASE_B_STAGE_MIN_MS.day_finalization);
+    if (!reference.manifest_key) {
+      throw new Error(`Missing connector manifest_key for day=${dayUtc} connector=${reference.connector_id}`);
     }
-    const object = await r2GetObject({ r2: runtime.r2, key: candidate.manifest_key });
+    const object = await r2GetObject({ r2: runtime.r2, key: reference.manifest_key });
     const parsed = JSON.parse(object.body.toString("utf8"));
+    validateCanonicalHistoryV2Manifest(parsed, {
+      history_version: "v2",
+      domain: "observations",
+      manifest_kind: "connector",
+      day_utc: dayUtc,
+      connector_id: reference.connector_id,
+      manifest_key: reference.manifest_key,
+    });
     connectorManifests.push({
       ...parsed,
-      manifest_key: candidate.manifest_key,
+      manifest_key: reference.manifest_key,
     });
   }
 
   const backedUpAtUtc = nowIso();
-  const dayManifestKey = runtime.history_write_version === "v2"
-    ? buildHistoryV2DayManifestKey(runtime.committed_prefix, dayUtc)
-    : buildDayManifestKey(runtime.committed_prefix, dayUtc);
-  const dayManifest = runtime.history_write_version === "v2"
-    ? createHistoryV2DayManifest({
-      domain: "observations",
-      dayUtc,
-      runId: runtime.run_id,
-      manifestKey: dayManifestKey,
-      connectorManifests,
-      writerGitSha: runtime.writer_git_sha,
-      backedUpAtUtc,
-    })
-    : createDayManifest({
-      dayUtc,
-      runId: runtime.run_id,
-      connectorManifests,
-      writerGitSha: runtime.writer_git_sha,
-      backedUpAtUtc,
-    });
+  const dayManifest = buildHistoryV2DayManifest({
+    domain: "observations",
+    dayUtc,
+    runId: runtime.run_id,
+    manifestKey: dayManifestKey,
+    connectorManifests,
+    writerGitSha: runtime.writer_git_sha,
+    backedUpAtUtc,
+  });
 
   await r2PutObject({
     r2: runtime.r2,
@@ -5412,25 +5125,24 @@ async function finalizeDayGateIfReady({ client, runtime, dayUtc }) {
     content_type: "application/json",
   });
 
-  const manifestHead = await r2HeadObject({ r2: runtime.r2, key: dayManifestKey });
-  if (!manifestHead.exists) {
-    throw new Error(`Day manifest missing after upload: ${dayManifestKey}`);
-  }
+  const verifiedDayManifest = JSON.parse(
+    (await r2GetObject({ r2: runtime.r2, key: dayManifestKey })).body.toString("utf8"),
+  );
+  const verifiedDayTotals = summarizeVerifiedMergedDayManifestForGate({
+    manifest: verifiedDayManifest,
+    manifestKey: dayManifestKey,
+    dayUtc,
+  });
 
-  const aqiDayManifest = await writeAqilevelDayManifestFromConnectorOutputs({ runtime, dayUtc });
+  const aqiDayManifest = await writeAqilevelDayManifestFromConnectorOutputs({
+    runtime,
+    dayUtc,
+    changedConnectorIds: dayCandidates.map((candidate) => candidate.connector_id),
+  });
 
-  const totalRows = dayCandidates.reduce(
-    (sum, row) => sum + (row.history_row_count || 0n),
-    0n,
-  );
-  const totalFiles = dayCandidates.reduce(
-    (sum, row) => sum + Number(row.history_file_count || 0),
-    0,
-  );
-  const totalBytes = dayCandidates.reduce(
-    (sum, row) => sum + (row.history_total_bytes || 0n),
-    0n,
-  );
+  const totalRows = verifiedDayTotals.history_row_count;
+  const totalFiles = verifiedDayTotals.history_file_count;
+  const totalBytes = verifiedDayTotals.history_total_bytes;
 
   await updateDayGateComplete(client, {
     dayUtc,
@@ -5451,6 +5163,16 @@ async function finalizeDayGateIfReady({ client, runtime, dayUtc }) {
     history_total_bytes: totalBytes.toString(),
     aqi_day_manifest: aqiDayManifest,
   };
+}
+
+async function finalizeDayGateIfReady({ client, runtime, dayUtc }) {
+  return await runCanonicalDayFinalizer({
+    client,
+    dayUtc,
+    diagnosticEnvironment: runtime.environment,
+    timeoutMs: Math.min(15_000, Math.max(1, remainingBudgetMs(runtime) ?? 15_000)),
+    finalize: async () => await finalizeDayGateIfReadyUnlocked({ client, runtime, dayUtc }),
+  });
 }
 
 async function cleanupStaging({ runtime, logStructured }) {
@@ -5577,7 +5299,6 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
     env.UK_AQ_R2_HISTORY_STAGING_PREFIX || DEFAULT_STAGING_PREFIX,
   );
   const writePrefixes = resolvePhaseBHistoryWritePrefixes(env);
-  const committedPrefix = writePrefixes.observations_prefix_v1;
   const committedPrefixV2 = writePrefixes.observations_prefix_v2;
   const activeCommittedPrefix = writePrefixes.observations_prefix;
   const aqilevelsPrefix = writePrefixes.aqilevels_prefix;
@@ -5599,32 +5320,16 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
   );
 
   const allowedPollutantCodes = [];
-  const phaseBCalculateAqiFromObservationsEnabled = parseBoolean(
-    env.UK_AQ_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED,
-    DEFAULT_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED,
-  );
-  const phaseBLegacyAqiRpcExportEnabled = parseBoolean(
-    env.UK_AQ_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED,
-    DEFAULT_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED,
-  );
-  if (phaseBCalculateAqiFromObservationsEnabled === phaseBLegacyAqiRpcExportEnabled) {
-    throw new Error(
-      `Invalid Phase B AQI writer configuration: exactly one of UK_AQ_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED or UK_AQ_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED must be true (got calculate=${phaseBCalculateAqiFromObservationsEnabled}, legacy=${phaseBLegacyAqiRpcExportEnabled}).`,
-    );
-  }
   const observsSource = {
     base_url: String(env.OBS_AQIDB_SUPABASE_URL || "").trim(),
     privileged_key: String(env.OBS_AQIDB_SECRET_KEY || "").trim(),
     rpc_schema: String(env.UK_AQ_PUBLIC_SCHEMA || DEFAULT_RPC_SCHEMA).trim() || DEFAULT_RPC_SCHEMA,
     pm_context_rpc: String(env.UK_AQ_PHASE_B_PM_CONTEXT_RPC || DEFAULT_PHASE_B_PM_CONTEXT_RPC).trim(),
-    connector_counts_rpc: String(env.UK_AQ_BACKFILL_AQI_R2_CONNECTOR_COUNTS_RPC || AQILEVELS_CONNECTOR_COUNTS_RPC)
-      .trim(),
-    rows_rpc: String(env.UK_AQ_BACKFILL_AQI_R2_SOURCE_RPC || AQILEVELS_ROWS_RPC).trim(),
   };
 
   return {
     enabled: String(env.UK_AQ_R2_HISTORY_PHASE_B_ENABLED || "true").trim().toLowerCase() !== "false",
-    supabase_db_url: String(env.SUPABASE_DB_URL || env.DATABASE_URL || "").trim(),
+    supabase_db_url: String(env.SUPABASE_DB_URL || "").trim(),
     r2: {
       endpoint: String(env.CFLARE_R2_ENDPOINT || env.R2_ENDPOINT || "").trim(),
       bucket: resolveR2Bucket(env),
@@ -5665,8 +5370,7 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
       10_000,
       2_000_000,
     ),
-    phase_b_calculate_aqi_from_observations_enabled: phaseBCalculateAqiFromObservationsEnabled,
-    phase_b_legacy_aqi_rpc_export_enabled: phaseBLegacyAqiRpcExportEnabled,
+    phase_b_calculate_aqi_from_observations_enabled: true,
     phase_b_observation_snapshot_max_rows: parsePositiveInt(
       env.UK_AQ_PHASE_B_OBSERVATION_SNAPSHOT_MAX_ROWS,
       DEFAULT_PHASE_B_OBSERVATION_SNAPSHOT_MAX_ROWS,
@@ -5678,6 +5382,13 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
       DEFAULT_PHASE_B_OBSERVATION_SNAPSHOT_MAX_BYTES,
       1024 * 1024,
       2 * 1024 * 1024 * 1024,
+    ),
+    sos_connector_id: parsePositiveInt(
+      env.UK_AQ_PHASE_B_SOS_CONNECTOR_ID ||
+        env.UK_AQ_BACKFILL_SOS_CONNECTOR_ID_FALLBACK,
+      DEFAULT_PHASE_B_SOS_CONNECTOR_ID,
+      1,
+      2_147_483_647,
     ),
     observs_retention_days: parsePositiveInt(
       env.OBS_AQIDB_OBSERVS_RETENTION_DAYS,
@@ -5703,12 +5414,6 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
       1,
       250_000,
     ),
-    aqilevels_source_max_pages: parsePositiveInt(
-      env.UK_AQ_R2_HISTORY_AQILEVELS_SOURCE_MAX_PAGES,
-      DEFAULT_AQILEVELS_SOURCE_MAX_PAGES,
-      10,
-      1_000_000,
-    ),
     max_candidates_per_run: parsePositiveInt(
       env.UK_AQ_R2_HISTORY_MAX_CANDIDATES_PER_RUN,
       DEFAULT_MAX_CANDIDATES_PER_RUN,
@@ -5716,13 +5421,13 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
       50_000,
     ),
     max_seconds_per_run: parsePositiveInt(
-      env.UK_AQ_R2_HISTORY_MAX_SECONDS_PER_RUN,
+      env.UK_AQ_PRUNE_DAILY_PHASE_B_MAX_SECONDS_PER_RUN,
       DEFAULT_MAX_SECONDS_PER_RUN,
       30,
       86_400,
     ),
     stop_before_timeout_seconds: parsePositiveInt(
-      env.UK_AQ_R2_HISTORY_STOP_BEFORE_TIMEOUT_SECONDS,
+      env.UK_AQ_PRUNE_DAILY_PHASE_B_STOP_BEFORE_TIMEOUT_SECONDS,
       DEFAULT_STOP_BEFORE_TIMEOUT_SECONDS,
       0,
       3_600,
@@ -5735,21 +5440,14 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
     ),
     staging_prefix_base: stagingBasePrefix,
     committed_prefix: activeCommittedPrefix,
-    committed_prefix_v1: committedPrefix,
     aqilevels_prefix: aqilevelsPrefix,
-    aqilevels_prefix_v1: writePrefixes.aqilevels_prefix_v1,
     history_write_version: historyWriteVersion,
     committed_prefix_v2: committedPrefixV2,
     aqilevels_hourly_data_prefix_v2: aqilevelsDataPrefixV2,
     aqilevels_hourly_debug_prefix_v2: aqilevelsDebugPrefixV2,
     aqilevels_timeseries_index_prefix: normalizePrefix(env.UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX || "history/_index_v2/aqilevels_hourly_data_timeseries"),
     runs_prefix: runsPrefix,
-    runs_prefix_v1: writePrefixes.runs_prefix_v1,
     runs_prefix_v2: writePrefixes.runs_prefix_v2,
-    adopt_existing_manifest_enabled: parseBoolean(
-      env.UK_AQ_R2_HISTORY_ADOPT_EXISTING_MANIFEST_ENABLED,
-      true,
-    ),
     prune_check_dropbox: {
       enabled: parseBoolean(env.UK_AQ_R2_HISTORY_PRUNE_CHECK_DROPBOX_ENABLED, false),
       required: parseBoolean(env.UK_AQ_R2_HISTORY_PRUNE_CHECK_DROPBOX_REQUIRED, false),
@@ -5762,8 +5460,6 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
       refresh_token: String(env.DROPBOX_REFRESH_TOKEN || "").trim(),
     },
     observs_source: observsSource,
-    // Legacy materialised-AQI export still reads this alias until its separate retirement.
-    aqilevels_source: observsSource,
     writer_git_sha: String(env.GITHUB_SHA || "").trim() || null,
   };
 }
@@ -5775,6 +5471,8 @@ export async function runPhaseBBackup({
   logStructured,
   runId = randomUUID(),
   nowUtc = nowIso(),
+  nowMs = Date.now,
+  createPgClient = (config) => new Client(config),
 }) {
   const runtime = {
     ...phaseB,
@@ -5783,6 +5481,7 @@ export async function runPhaseBBackup({
     staging_prefix: `${phaseB.staging_prefix_base}/run_id=${runId}`,
     logStructured,
     run_budget: createPhaseBRunBudgetForTest({
+      nowMs,
       maxSecondsPerRun: phaseB.max_seconds_per_run,
       stopBeforeTimeoutSeconds: phaseB.stop_before_timeout_seconds,
     }),
@@ -5797,7 +5496,10 @@ export async function runPhaseBBackup({
   }
 
   if (!runtime.supabase_db_url) {
-    throw new Error("Phase B history export requires SUPABASE_DB_URL (or DATABASE_URL) for streaming Postgres extraction.");
+    throw new Error("Phase B history export requires SUPABASE_DB_URL for streaming Postgres extraction and deletion safety.");
+  }
+  if (runtime.history_write_version !== "v2") {
+    throw new Error("Phase B history writes require canonical R2 history version v2");
   }
   if (!hasRequiredR2Config(runtime.r2)) {
     throw new Error("Phase B history export requires R2 endpoint/bucket/region/access credentials.");
@@ -5806,6 +5508,8 @@ export async function runPhaseBBackup({
   const window = dayWindowFromNow(nowUtc, ingestRetentionDays);
   const summary = {
     enabled: true,
+    status: "completed",
+    stopped_for_budget: false,
     run_id: runId,
     now_utc: window.now_utc,
     ingest_retention_days: window.ingest_retention_days,
@@ -5817,8 +5521,10 @@ export async function runPhaseBBackup({
     pending_candidates: 0,
     processed_candidates: 0,
     completed_candidates: 0,
-    adopted_candidates: 0,
     failed_candidates: 0,
+    source_changed_connector_gate_invalidated_count: 0,
+    source_changed_connector_gate_invalidated_preview: [],
+    source_identity_invalidated_connector_days: 0,
     total_written_rows: "0",
     total_written_bytes: "0",
     completed_days: 0,
@@ -5826,7 +5532,7 @@ export async function runPhaseBBackup({
     failures: [],
     completed_preview: [],
     blocked_preview: [],
-    adoption_failures: [],
+    aggregate_day_failures: [],
     prune_check_dropbox_exports: 0,
     prune_check_dropbox_failures: 0,
     pm_context: {
@@ -5848,7 +5554,6 @@ export async function runPhaseBBackup({
     ingest_retention_days: window.ingest_retention_days,
     phase_b_eligible_age_days: window.phase_b_eligible_age_days,
     latest_eligible_day_utc: window.latest_eligible_day_utc,
-    adopt_existing_manifest_enabled: runtime.adopt_existing_manifest_enabled,
     prune_check_dropbox_enabled: runtime.prune_check_dropbox?.enabled === true,
     prune_check_dropbox_required: runtime.prune_check_dropbox?.required === true,
     prune_check_dropbox_dir: runtime.prune_check_dropbox?.dir || DEFAULT_PRUNE_CHECK_DROPBOX_DIR,
@@ -5859,7 +5564,6 @@ export async function runPhaseBBackup({
     observations_part_max_rows: runtime.observations_part_max_rows,
     aqilevels_part_max_rows: runtime.aqilevels_part_max_rows,
     history_write_version: runtime.history_write_version,
-    observations_prefix_v1: runtime.committed_prefix_v1,
     observations_prefix_v2: runtime.committed_prefix_v2,
     cursor_fetch_rows: runtime.cursor_fetch_rows,
     row_group_size: runtime.row_group_size,
@@ -5869,11 +5573,9 @@ export async function runPhaseBBackup({
     r2_bucket: runtime.r2.bucket,
     observations_prefix: runtime.committed_prefix,
     aqilevels_prefix: runtime.aqilevels_prefix,
-    aqilevels_prefix_v1: runtime.aqilevels_prefix_v1,
     aqilevels_hourly_data_prefix_v2: runtime.aqilevels_hourly_data_prefix_v2,
     aqilevels_hourly_debug_prefix_v2: runtime.aqilevels_hourly_debug_prefix_v2,
     runs_prefix: runtime.runs_prefix,
-    runs_prefix_v1: runtime.runs_prefix_v1,
     runs_prefix_v2: runtime.runs_prefix_v2,
   });
 
@@ -5881,14 +5583,33 @@ export async function runPhaseBBackup({
   let totalWrittenRows = 0n;
   let totalWrittenBytes = 0n;
 
-  await withPgClient(runtime.supabase_db_url, async (controlClient) => {
+  const controlPgTimeouts = derivePhaseBPgTimeoutsForTest(runtime);
+  try {
+    await withPgClient(runtime.supabase_db_url, async (controlClient) => {
+    if (!hasBudgetFor(runtime, PHASE_B_STAGE_MIN_MS.candidate_start)) {
+      stopPhaseBForBudget(summary, runtime, { operation: "candidate_discovery" });
+      return;
+    }
     const upsertedCandidates = await populateBackupCandidates(
       controlClient,
       window.latest_eligible_window_end_utc,
       runtime,
     );
     summary.populated_candidates = upsertedCandidates.length;
-    if (runtime.history_write_version === "v2" && upsertedCandidates.length > 0) {
+    const sourceChangedInvalidations = upsertedCandidates
+      .filter((candidate) => candidate.source_changed_connector_gate_invalidated === true)
+      .map((candidate) => candidate.source_change_invalidation);
+    summary.source_changed_connector_gate_invalidated_count = sourceChangedInvalidations.length;
+    summary.source_changed_connector_gate_invalidated_preview = sourceChangedInvalidations.slice(0, 10);
+    summary.source_identity_invalidated_connector_days = upsertedCandidates
+      .reduce((count, candidate) => count + Number(candidate.source_identity_invalidated_connector_days || 0), 0);
+    logStructured("INFO", "phase_b_history_source_changed_connector_gate_invalidation_summary", {
+      run_id: runId,
+      source_changed_connector_gate_invalidated_count: sourceChangedInvalidations.length,
+      source_changed_connector_gate_invalidated_preview: sourceChangedInvalidations.slice(0, 10),
+      source_identity_invalidated_connector_days: summary.source_identity_invalidated_connector_days,
+    });
+    if (upsertedCandidates.length > 0) {
       logStructured("INFO", "phase_b_history_candidate_eligibility_summary", {
         run_id: runId,
         history_write_version: runtime.history_write_version,
@@ -5914,9 +5635,17 @@ export async function runPhaseBBackup({
       });
     }
 
-    await markIncompleteDaysAsBackupBlocked(controlClient);
+    if (!hasBudgetFor(runtime, PHASE_B_STAGE_MIN_MS.candidate_start)) {
+      stopPhaseBForBudget(summary, runtime, { operation: "active_scope_gate_preparation" });
+      return;
+    }
+    await markActiveIncompleteDaysAsBackupBlocked(controlClient, upsertedCandidates);
 
-    const pendingCandidates = await fetchPendingCandidates(controlClient, runtime.max_candidates_per_run);
+    const pendingCandidates = await fetchPendingCandidates(
+      controlClient,
+      upsertedCandidates,
+      runtime.max_candidates_per_run,
+    );
     summary.pending_candidates = pendingCandidates.length;
 
     if (dryRun) {
@@ -5947,7 +5676,7 @@ export async function runPhaseBBackup({
 
     for (let candidateIndex = 0; candidateIndex < pendingCandidates.length; candidateIndex += 1) {
       const candidate = pendingCandidates[candidateIndex];
-      if (!hasBudgetFor(runtime, 60_000)) {
+      if (!hasBudgetFor(runtime, PHASE_B_STAGE_MIN_MS.candidate_start)) {
         logPhaseB(runtime, "WARNING", "phase_b_history_budget_exhausted", {
           operation: "candidate_start",
           day_utc: candidate.day_utc,
@@ -5955,6 +5684,7 @@ export async function runPhaseBBackup({
           candidate_index: candidateIndex,
           candidate_count: pendingCandidates.length,
         });
+        stopPhaseBForBudget(summary, runtime, { operation: "candidate_start", candidate });
         break;
       }
       summary.processed_candidates += 1;
@@ -5972,6 +5702,8 @@ export async function runPhaseBBackup({
       }
 
       const startedAtMs = Date.now();
+      let connectorGateCompleted = false;
+      let frozenSourceTemp = null;
       try {
         logPhaseB(runtime, "INFO", "phase_b_history_candidate_start", {
           day_utc: candidate.day_utc,
@@ -5982,58 +5714,107 @@ export async function runPhaseBBackup({
           prefix: connectorPrefix(runtime.committed_prefix, candidate.day_utc, candidate.connector_id),
           manifest_path: buildConnectorManifestKey(runtime.committed_prefix, candidate.day_utc, candidate.connector_id),
         });
-        const adoptResult = await maybeAdoptExistingConnectorManifest({
-          candidate,
-          runtime,
-          logStructured,
+        let connectorGateEvidence = null;
+        let connectorComparison = null;
+        const lockDiagnostics = [];
+        const connectorWrite = await runCanonicalConnectorDayWriter({
+          client: controlClient,
+          dayUtc: candidate.day_utc,
+          connectorId: candidate.connector_id,
+          diagnosticEnvironment: runtime.environment,
+          diagnostics: lockDiagnostics,
+          timeoutMs: Math.min(15_000, Math.max(1, remainingBudgetMs(runtime) ?? 15_000)),
+          write: async () => {
+            await setConnectorDayGateIncomplete(controlClient, {
+              day_utc: candidate.day_utc,
+              connector_id: candidate.connector_id,
+            });
+            const result = await exportCandidateToR2({ candidate, runtime });
+            result.adopted = false;
+            frozenSourceTemp = result.frozen_source_temp || null;
+            return result;
+          },
+          verify: async (result) => {
+            connectorGateEvidence = await verifyObservationConnectorHistory({
+              runtime,
+              dayUtc: candidate.day_utc,
+              connectorId: candidate.connector_id,
+              manifestKey: result.manifest_key,
+              expectedRowCount: candidate.expected_row_count,
+            });
+            connectorComparison = await ensureConnectorPruneComparison({
+              candidate,
+              runtime,
+              manifestKey: connectorGateEvidence.history_manifest_key,
+              manifest: connectorGateEvidence.connector_manifest,
+              existingComparison: null,
+              logStructured,
+            });
+            return { connectorGateEvidence, connectorComparison };
+          },
         });
-
-        let exportResult;
-        if (adoptResult.adopted) {
-          exportResult = {
-            manifest_key: adoptResult.manifest_key,
-            written_row_count: adoptResult.history_row_count,
-            file_count: adoptResult.history_file_count,
-            total_bytes: adoptResult.history_total_bytes,
-            adopted: true,
-          };
-        } else {
-          exportResult = await exportCandidateToR2({
-            candidate,
-          runtime,
+        const exportResult = connectorWrite.written;
+        logPhaseB(runtime, "INFO", "phase_b_history_connector_lock_complete", {
+          day_utc: candidate.day_utc,
+          connector_id: candidate.connector_id,
+          lock_diagnostics: lockDiagnostics,
         });
-          exportResult.adopted = false;
-        }
-
-        await markCandidateComplete(controlClient, {
+        await markCandidateAndConnectorGateComplete(controlClient, {
           dayUtc: candidate.day_utc,
           connectorId: candidate.connector_id,
           runId,
-          manifestKey: exportResult.manifest_key,
-          historyRowCount: exportResult.written_row_count,
-          historyFileCount: exportResult.file_count,
-          historyTotalBytes: exportResult.total_bytes,
+          manifestKey: connectorGateEvidence.history_manifest_key,
+          manifestHash: connectorGateEvidence.history_manifest_hash,
+          historyRowCount: connectorGateEvidence.history_row_count,
+          historyFileCount: connectorGateEvidence.history_file_count,
+          historyTotalBytes: connectorGateEvidence.history_total_bytes,
+          sourceIdentity: exportResult.source_identity,
         });
+        connectorGateCompleted = true;
+        exportResult.written_row_count = BigInt(connectorGateEvidence.history_row_count);
+        exportResult.file_count = connectorGateEvidence.history_file_count;
+        exportResult.total_bytes = BigInt(connectorGateEvidence.history_total_bytes);
+
+        try {
+            exportResult.aqi = await withConnectorDayHistoryLock({
+              client: controlClient,
+              dayUtc: candidate.day_utc,
+              connectorId: candidate.connector_id,
+              diagnosticEnvironment: runtime.environment,
+              timeoutMs: Math.min(15_000, Math.max(1, remainingBudgetMs(runtime) ?? 15_000)),
+            }, async () => await exportCandidateAqiFromFrozenSource({
+              candidate,
+              runtime,
+              observationResult: exportResult,
+            }));
+        } catch (aqiError) {
+            exportResult.aqi = {
+              status: "failed",
+              error: aqiError instanceof Error ? aqiError.message : String(aqiError),
+            };
+            summary.aggregate_day_failures.push({
+              day_utc: candidate.day_utc,
+              connector_id: candidate.connector_id,
+              domain: "aqilevels",
+              error: exportResult.aqi.error,
+            });
+            logPhaseB(runtime, "ERROR", "phase_b_history_aqi_failed_gate_preserved", {
+              day_utc: candidate.day_utc,
+              connector_id: candidate.connector_id,
+              connector_gate_preserved: true,
+              error: exportResult.aqi.error,
+            });
+        } finally {
+            cleanupPhaseBTargetDaySourceTemp(frozenSourceTemp);
+            frozenSourceTemp = null;
+        }
 
         summary.completed_candidates += 1;
-        if (exportResult.adopted) {
-          summary.adopted_candidates += 1;
-          logStructured("INFO", "phase_b_history_existing_manifest_adopted", {
-            run_id: runId,
-            day_utc: candidate.day_utc,
-            connector_id: candidate.connector_id,
-            manifest_key: exportResult.manifest_key,
-            history_row_count: exportResult.written_row_count.toString(),
-            history_file_count: exportResult.file_count,
-            history_total_bytes: exportResult.total_bytes.toString(),
-          });
-        } else {
-          totalWrittenRows += exportResult.written_row_count;
-          totalWrittenBytes += exportResult.total_bytes;
-        }
-        if (adoptResult.adopted && adoptResult.comparison) {
+        totalWrittenRows += exportResult.written_row_count;
+        totalWrittenBytes += exportResult.total_bytes;
+        if (connectorComparison) {
           summary.prune_check_dropbox_exports += 1;
-        } else if (adoptResult.adopted && runtime.prune_check_dropbox?.enabled) {
+        } else if (runtime.prune_check_dropbox?.enabled) {
           summary.prune_check_dropbox_failures += 1;
         }
         if (exportResult.aqi?.pm_context_source === "obs_aqidb") {
@@ -6064,8 +5845,15 @@ export async function runPhaseBBackup({
           file_count: exportResult.file_count,
           total_bytes: exportResult.total_bytes.toString(),
           manifest_key: exportResult.manifest_key,
+          source_identity_contract_version: exportResult.source_identity.source_content_hash_contract_version,
+          source_identity_match: true,
+          source_identity_failure_reason: null,
+          source_identity_rows: exportResult.source_identity.source_content_hash_row_count,
+          candidate_source_identity_present: true,
+          gate_source_identity_present: true,
+          source_content_hash: exportResult.source_identity.source_content_hash,
           source_owner: exportResult.adopted ? "adopted_existing_r2_manifest" : "phase_b_export",
-          comparison_output_root: adoptResult.comparison?.comparison_output_root || null,
+          comparison_output_root: connectorComparison?.comparison_output_root || null,
           pm_context: exportResult.aqi ? {
             pm_context_source: exportResult.aqi.pm_context_source || null,
             pm_context_window_start_utc: exportResult.aqi.pm_context_window_start_utc || null,
@@ -6085,9 +5873,77 @@ export async function runPhaseBBackup({
           duration_ms: durationMs,
         });
       } catch (error) {
+        cleanupPhaseBTargetDaySourceTemp(frozenSourceTemp);
+        frozenSourceTemp = null;
         const message = error instanceof Error ? error.message : String(error);
+        if (error instanceof PhaseBHistoryBudgetExhaustedError) {
+          if (!connectorGateCompleted) {
+            try {
+              await cleanupCandidatePartialOutput({
+                runtime,
+                dayUtc: candidate.day_utc,
+                connectorId: candidate.connector_id,
+              });
+            } catch (cleanupError) {
+              logPhaseB(runtime, "ERROR", "phase_b_history_partial_cleanup_failed", {
+                day_utc: candidate.day_utc,
+                connector_id: candidate.connector_id,
+                ...errorLogFields(cleanupError),
+              });
+            }
+            await markCandidateStoppedForBudget(controlClient, {
+              dayUtc: candidate.day_utc,
+              connectorId: candidate.connector_id,
+              runId,
+              errorText: message,
+              clearCheckpoint: true,
+            });
+          }
+          await updateDayGateBlocked(controlClient, candidate.day_utc);
+          dayResults.set(candidate.day_utc, {
+            day_utc: candidate.day_utc,
+            history_done: false,
+            pending_connectors: connectorGateCompleted ? 0 : 1,
+            reason: "phase_b_history_budget_exhausted",
+          });
+          stopPhaseBForBudget(summary, runtime, {
+            operation: error.operation || "candidate_work",
+            candidate,
+          });
+          logPhaseB(runtime, "WARNING", "phase_b_history_stopped_budget", {
+            operation: summary.budget_stop.operation,
+            day_utc: candidate.day_utc,
+            connector_id: candidate.connector_id,
+            connector_gate_preserved: connectorGateCompleted,
+          });
+          break;
+        }
+        if (connectorGateCompleted) {
+          await updateDayGateBlocked(controlClient, candidate.day_utc);
+          dayResults.set(candidate.day_utc, {
+            day_utc: candidate.day_utc,
+            history_done: false,
+            pending_connectors: 0,
+            reason: "aggregate_day_finalization_failed",
+          });
+          summary.aggregate_day_failures.push({
+            day_utc: candidate.day_utc,
+            connector_id: candidate.connector_id,
+            error: message,
+          });
+          logStructured("ERROR", "phase_b_history_aggregate_day_finalization_failed", {
+            run_id: runId,
+            day_utc: candidate.day_utc,
+            connector_id: candidate.connector_id,
+            error: message,
+            connector_gate_preserved: true,
+            aggregate_day_gate_complete: false,
+            next_action: "targeted_aqi_history_repair",
+          });
+          continue;
+        }
         try {
-          if (runtime.history_write_version === "v2") {
+          if (!connectorGateCompleted) {
             await cleanupCandidatePartialOutput({
               runtime,
               dayUtc: candidate.day_utc,
@@ -6101,12 +5957,14 @@ export async function runPhaseBBackup({
             ...errorLogFields(cleanupError),
           });
         }
-        await markCandidateFailed(controlClient, {
-          dayUtc: candidate.day_utc,
-          connectorId: candidate.connector_id,
-          runId,
-          errorText: message,
-        });
+        if (!connectorGateCompleted) {
+          await markCandidateFailed(controlClient, {
+            dayUtc: candidate.day_utc,
+            connectorId: candidate.connector_id,
+            runId,
+            errorText: message,
+          });
+        }
         const dayState = await finalizeDayGateIfReady({
           client: controlClient,
           runtime,
@@ -6114,12 +5972,6 @@ export async function runPhaseBBackup({
         });
         dayResults.set(candidate.day_utc, dayState);
         summary.failed_candidates += 1;
-        summary.adoption_failures.push({
-          day_utc: candidate.day_utc,
-          connector_id: candidate.connector_id,
-          run_id: runId,
-          error: message,
-        });
         summary.failures.push({
           day_utc: candidate.day_utc,
           connector_id: candidate.connector_id,
@@ -6143,36 +5995,73 @@ export async function runPhaseBBackup({
           next_action: "retry_safe",
           prune_blocked_for_day: true,
         });
-        if (error instanceof PhaseBHistoryBudgetExhaustedError) {
-          break;
-        }
       }
     }
-  });
 
-  if (runtime.phase_b_calculate_aqi_from_observations_enabled) {
+    const finalizedDays = Array.from(dayResults.values())
+      .filter((state) => state.history_done === true)
+      .map((state) => state.day_utc)
+      .sort();
+    if (finalizedDays.length > 0 && summary.status !== "stopped_budget") {
+      summary.global_index_finalization = await runCanonicalGlobalIndexFinalizer({
+        client: controlClient,
+        diagnosticEnvironment: runtime.environment,
+        timeoutMs: Math.min(15_000, Math.max(1, remainingBudgetMs(runtime) ?? 15_000)),
+        finalize: async () => await updateR2HistoryIndexesTargeted({
+        env: {
+          ...process.env,
+          UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX: runtime.committed_prefix,
+          UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX: runtime.aqilevels_prefix,
+          UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_TIMESERIES_INDEX_PREFIX: runtime.aqilevels_timeseries_index_prefix,
+          UK_AQ_R2_HISTORY_INDEX_V2_PREFIX: runtime.index_prefix_v2,
+        },
+        r2: runtime.r2,
+        historyVersion: "v2",
+        domains: ["observations", "aqilevels"],
+        affectedDaysUtc: finalizedDays,
+        connectorId: null,
+        updateLatestIndex: true,
+        strictMissingTimeseriesCounts: true,
+        writeR2: true,
+        }),
+      });
+    }
+    }, {
+      statementTimeoutMs: controlPgTimeouts.statement_timeout_ms,
+      connectionTimeoutMs: controlPgTimeouts.connection_timeout_ms,
+      createClient: createPgClient,
+    });
+  } catch (error) {
+    if (
+      (error instanceof PhaseBHistoryBudgetExhaustedError)
+      || (isPgStatementTimeoutError(error) && !hasBudgetFor(runtime, 2_000))
+    ) {
+      stopPhaseBForBudget(summary, runtime, {
+        operation: error.operation || "control_database_statement",
+      });
+      logPhaseB(runtime, "WARNING", "phase_b_history_control_database_stopped_budget", {
+        operation: summary.budget_stop.operation,
+        postgres_error_code: error?.code || null,
+        postgres_statement_timeout_ms: controlPgTimeouts.statement_timeout_ms,
+        postgres_connection_timeout_ms: controlPgTimeouts.connection_timeout_ms,
+      });
+    } else {
+      throw error;
+    }
+  }
+
+  if (summary.status === "stopped_budget") {
+    summary.aqilevels = { skipped: true, reason: "phase_b_history_budget_exhausted" };
+  } else if (runtime.phase_b_calculate_aqi_from_observations_enabled) {
     summary.aqilevels = {
       enabled: true,
       source_mode: "frozen_observations_per_candidate",
       status: "completed_with_phase_b_candidates",
-      legacy_aqi_rpc_export_enabled: runtime.phase_b_legacy_aqi_rpc_export_enabled,
       snapshot_max_rows: runtime.phase_b_observation_snapshot_max_rows,
       snapshot_max_bytes: runtime.phase_b_observation_snapshot_max_bytes,
     };
-  } else if (runtime.phase_b_legacy_aqi_rpc_export_enabled && hasBudgetFor(runtime, 120_000)) {
-    summary.aqilevels = await runAqilevelsBackup({
-      runtime,
-      latestEligibleDayUtc: window.latest_eligible_day_utc,
-      dryRun,
-      logStructured,
-    });
-  } else if (!runtime.phase_b_legacy_aqi_rpc_export_enabled) {
-    summary.aqilevels = { skipped: true, reason: "legacy_aqi_rpc_export_disabled" };
   } else {
-    logPhaseB(runtime, "WARNING", "phase_b_history_budget_exhausted", {
-      operation: "aqilevels_backup_start",
-    });
-    summary.aqilevels = { skipped: true, reason: "phase_b_history_budget_exhausted" };
+    summary.aqilevels = { skipped: true, reason: "phase_b_history_not_completed" };
   }
 
   if (dryRun) {
@@ -6188,19 +6077,24 @@ export async function runPhaseBBackup({
   summary.blocked_days = dayStates.filter((state) => state.history_done !== true).length;
   summary.completed_preview = dayStates.slice(0, 25);
   summary.blocked_preview = dayStates.filter((state) => state.history_done !== true).slice(0, 25);
-  summary.adoption_failures = summary.adoption_failures.slice(0, 25);
+  summary.aggregate_day_failures = summary.aggregate_day_failures.slice(0, 25);
   summary.failures = summary.failures.slice(0, 25);
 
-  const cleanupSummary = await cleanupStaging({ runtime, logStructured });
+  const cleanupSummary = summary.status === "stopped_budget"
+    ? { skipped: true, reason: "reserved_for_final_reporting" }
+    : await cleanupStaging({ runtime, logStructured });
   summary.staging_cleanup = cleanupSummary;
 
-  const runManifestKey = await writeRunManifest({ runtime, runSummary: summary });
-  summary.run_manifest_key = runManifestKey;
+  if (summary.status === "stopped_budget") {
+    summary.run_manifest_key = null;
+    summary.run_manifest = { skipped: true, reason: "reserved_for_final_reporting" };
+  } else {
+    summary.run_manifest_key = await writeRunManifest({ runtime, runSummary: summary });
+  }
 
   if (runtime.prune_check_dropbox?.enabled) {
     logStructured("INFO", "phase_b_history_prune_check_summary", {
       run_id: runId,
-      adopted_candidates: summary.adopted_candidates,
       dropbox_exports: summary.prune_check_dropbox_exports,
       dropbox_failures: summary.prune_check_dropbox_failures,
       required: runtime.prune_check_dropbox?.required === true,
@@ -6211,31 +6105,61 @@ export async function runPhaseBBackup({
   return summary;
 }
 
-export async function fetchBackupDoneDays({ supabaseDbUrl, dayUtcList }) {
-  if (!Array.isArray(dayUtcList) || dayUtcList.length === 0) {
+export async function fetchBackupDoneConnectorDays({ supabaseDbUrl, connectorDays }) {
+  if (!Array.isArray(connectorDays) || connectorDays.length === 0) {
     return new Map();
   }
 
-  const distinctDays = uniqueSorted(dayUtcList.map((day) => String(day).slice(0, 10)));
-  if (distinctDays.length === 0) {
+  const distinctPairs = new Map();
+  for (const entry of connectorDays) {
+    const dayUtc = String(entry?.day_utc || "").slice(0, 10);
+    const connectorId = Number(entry?.connector_id);
+    try {
+      distinctPairs.set(connectorDayGateKey(dayUtc, connectorId), {
+        day_utc: dayUtc,
+        connector_id: connectorId,
+      });
+    } catch (_error) {
+      // Invalid bucket identities cannot acquire deletion authority.
+    }
+  }
+  if (distinctPairs.size === 0) {
     return new Map();
   }
 
   return await withPgClient(supabaseDbUrl, async (client) => {
-    const literalList = distinctDays.map((day) => `'${escapeSingleQuotes(day)}'::date`).join(", ");
     const sql = `
-select g.day_utc::text as day_utc
-from uk_aq_ops.prune_day_gates g
-where g.day_utc in (${literalList})
-  and g.history_done is true
-  and nullif(btrim(g.history_manifest_key), '') is not null
-  and g.history_manifest_key ~ '${PRUNE_HISTORY_DAY_MANIFEST_KEY_REGEX_SOURCE}'
-  and g.history_completed_at is not null
+with requested as (
+  select
+    r.day_utc::date as day_utc,
+    r.connector_id::integer as connector_id
+  from jsonb_to_recordset($1::jsonb) as r(day_utc text, connector_id integer)
+)
+select
+  g.day_utc::text as day_utc,
+  g.connector_id,
+  g.history_done,
+  g.history_manifest_key,
+  g.history_manifest_hash,
+  g.history_row_count,
+  g.history_file_count,
+  g.history_total_bytes,
+  g.history_completed_at,
+  g.source_content_hash,
+  g.source_content_hash_contract_version,
+  g.source_content_hash_row_count,
+  g.completion_source
+from uk_aq_ops.prune_connector_day_gates g
+join requested r
+  on r.day_utc = g.day_utc
+ and r.connector_id = g.connector_id
 `;
-    const result = await client.query(sql);
+    const result = await client.query(sql, [JSON.stringify(Array.from(distinctPairs.values()))]);
     const map = new Map();
     for (const row of result.rows) {
-      map.set(normalizeDayUtc(row.day_utc), true);
+      if (isValidConnectorHistoryGateEvidence(row)) {
+        map.set(connectorDayGateKey(row.day_utc, row.connector_id), true);
+      }
     }
     return map;
   });

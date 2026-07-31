@@ -62,8 +62,31 @@ async function waitForStatus(
   });
 }
 
-export async function runJob(triggerMode: string): Promise<Deno.CommandStatus> {
+function reconciliationResultFromOutput(output: string): Record<string, unknown> | undefined {
+  const prefix = "UK_AQ_LATEST_SNAPSHOT_RECONCILE_RESULT ";
+  for (const line of output.split(/\r?\n/).reverse()) {
+    if (!line.startsWith(prefix)) continue;
+    const parsed = JSON.parse(line.slice(prefix.length));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  }
+  return undefined;
+}
+
+export async function runJob(
+  triggerMode: string,
+  reconciliationRequest?: Record<string, unknown>,
+): Promise<{ success: boolean; code: number; result?: Record<string, unknown> }> {
   const startedMs = Date.now();
+  let requestFile: string | null = null;
+  if (reconciliationRequest) {
+    requestFile = await Deno.makeTempFile({
+      prefix: "uk-aq-latest-snapshot-reconcile-",
+      suffix: ".json",
+    });
+    await Deno.writeTextFile(requestFile, JSON.stringify(reconciliationRequest));
+  }
   const child = new Deno.Command("deno", {
     args: [
       "run",
@@ -77,11 +100,17 @@ export async function runJob(triggerMode: string): Promise<Deno.CommandStatus> {
     env: {
       ...Deno.env.toObject(),
       UK_AQ_LATEST_SNAPSHOT_TRIGGER_MODE: triggerMode,
+      ...(requestFile
+        ? { UK_AQ_LATEST_SNAPSHOT_RECONCILE_REQUEST_FILE: requestFile }
+        : {}),
     },
-    stdout: "inherit",
+    stdout: requestFile ? "piped" : "inherit",
     stderr: "inherit",
   }).spawn();
   const statusPromise = child.status;
+  const stdoutPromise = requestFile && child.stdout
+    ? new Response(child.stdout).text()
+    : Promise.resolve("");
 
   logEvent("log", "latest_snapshot_child_started", {
     trigger_mode: triggerMode,
@@ -91,6 +120,15 @@ export async function runJob(triggerMode: string): Promise<Deno.CommandStatus> {
 
   const initialResult = await waitForStatus(statusPromise, JOB_TIMEOUT_MS);
   if (!initialResult.timed_out) {
+    const output = await stdoutPromise;
+    if (output.trim()) console.log(output.trimEnd());
+    if (requestFile) {
+      try {
+        await Deno.remove(requestFile);
+      } catch {
+        // Best-effort cleanup of a non-secret request body.
+      }
+    }
     logEvent(
       initialResult.status.success ? "log" : "error",
       "latest_snapshot_child_completed",
@@ -102,7 +140,11 @@ export async function runJob(triggerMode: string): Promise<Deno.CommandStatus> {
         duration_ms: Date.now() - startedMs,
       },
     );
-    return initialResult.status;
+    return {
+      success: initialResult.status.success,
+      code: initialResult.status.code,
+      result: reconciliationResultFromOutput(output),
+    };
   }
 
   logEvent("error", "latest_snapshot_child_timeout", {
@@ -159,6 +201,14 @@ export async function runJob(triggerMode: string): Promise<Deno.CommandStatus> {
     }
   }
 
+  await stdoutPromise.catch(() => "");
+  if (requestFile) {
+    try {
+      await Deno.remove(requestFile);
+    } catch {
+      // Best-effort cleanup after timeout.
+    }
+  }
   throw new JobTimeoutError(JOB_TIMEOUT_MS);
 }
 

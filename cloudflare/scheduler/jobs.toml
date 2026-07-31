@@ -16,13 +16,36 @@ notes = "Observations partition maintenance via GitHub Actions"
 
 [jobs.uk_aq_prune_daily]
 enabled = true
-cron_expr = "0 2 * * *"
+cron_expr = "30 2 * * *"
 target_type = "github_workflow"
 github_repo = "TEST-uk-aq/uk-aq-ops"
 github_workflow_file = "uk_aq_prune_daily.yml"
 github_ref = "main"
 dry_run = false
 notes = "Prune Daily via GitHub Actions"
+
+[jobs.uk_aq_chart_metrics]
+enabled = true
+cron_expr = "0 2 * * *"
+target_type = "github_workflow"
+github_repo = "TEST-uk-aq/uk-aq-ops"
+github_workflow_file = "uk_aq_chart_metrics.yml"
+github_ref = "main"
+dry_run = false
+notes = "Standalone chart metrics cleanup and daily refresh"
+
+[jobs.uk_aq_supabase_db_dump_backup]
+enabled = true
+cron_expr = "55 0 * * *"
+target_type = "github_workflow"
+github_repo = "TEST-uk-aq/uk-aq-ops"
+github_workflow_file = "uk_aq_supabase_db_dump_backup.yml"
+github_ref = "main"
+dry_run = false
+notes = "Supabase logical database dumps to Dropbox"
+
+[jobs.uk_aq_supabase_db_dump_backup.github_inputs]
+trigger_mode = "scheduler"
 
 [jobs.uk_aq_r2_core_snapshot]
 enabled = true
@@ -33,6 +56,22 @@ github_workflow_file = "uk_aq_r2_core_snapshot.yml"
 github_ref = "main"
 dry_run = false
 notes = "R2 core snapshot"
+
+[jobs.uk_aq_who_2021_daily]
+enabled = true
+cron_expr = "0 4-9 * * *"
+target_type = "github_workflow"
+github_repo = "TEST-uk-aq/uk-aq-ops"
+github_workflow_file = "uk_aq_who_2021_daily.yml"
+github_ref = "main"
+dry_run = true
+notes = "WHO 2021 hourly recalculation and readiness window via GitHub Actions"
+
+[jobs.uk_aq_who_2021_daily.github_inputs]
+run_mode = "daily"
+trigger_mode = "scheduler"
+publish_json = "configured"
+write_parquet = "configured"
 
 [jobs.uk_aq_r2_history_dropbox_backup]
 enabled = true

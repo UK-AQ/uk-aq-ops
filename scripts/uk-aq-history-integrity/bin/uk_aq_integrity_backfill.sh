@@ -19,7 +19,7 @@ Mode-specific requirements:
   --observs-only:
     --timeseries-ids CSV  Comma-separated positive integer timeseries IDs, or:
     --complete-connector-day
-                          Enumerate the adapter's complete source day.
+                           Enumerate the adapter's complete selected source day.
     --connector-id N      Optional connector filter for tighter scope.
   --aqi-only:
     --connector-id N      Optional connector filter for partial-day scope.
@@ -35,6 +35,8 @@ Notes:
   - Reasserts UK_AQ_ENV_NAME and reads UK_AQ_BACKFILL_WRAPPER from the root .env.
   - Never reads the local CIC-Test.env or LIVE.env selector files.
   - Preserves observation-only and AQI-only modes.
+  - Complete connector-day Integrity repairs require an explicit selected
+    pollutant set and resolve its exact active timeseries IDs from Integrity SQLite.
   - Disables the nested full R2 history index rebuild; the Integrity coordinator
     owns targeted indexes after all manifests for the affected day are verified.
 USAGE
@@ -448,11 +450,19 @@ if [[ ! -f "${ENV_FILE}" || ! -r "${ENV_FILE}" ]]; then
   exit 3
 fi
 
+INCOMING_INTEGRITY_REPAIR_POLLUTANTS="$(trim "${UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS:-}")"
+INCOMING_SOS_SOURCE_LABEL_REGISTRY_FILE="$(trim "${UK_AQ_BACKFILL_SOS_SOURCE_LABEL_REGISTRY_FILE:-}")"
 set -a
 # The shared repository .env is the only environment source for this wrapper.
 # shellcheck disable=SC1090
 source "${ENV_FILE}"
 set +a
+if [[ -n "${INCOMING_INTEGRITY_REPAIR_POLLUTANTS}" ]]; then
+  export UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS="${INCOMING_INTEGRITY_REPAIR_POLLUTANTS}"
+fi
+if [[ -n "${INCOMING_SOS_SOURCE_LABEL_REGISTRY_FILE}" ]]; then
+  export UK_AQ_BACKFILL_SOS_SOURCE_LABEL_REGISTRY_FILE="${INCOMING_SOS_SOURCE_LABEL_REGISTRY_FILE}"
+fi
 
 if [[ "$(trim "${UKAQ_ENV_NAME:-}")" != "${ENV_NAME}" ]]; then
   echo "ERROR: UKAQ_ENV_NAME in the selected repository root .env does not match --env=${ENV_NAME}." >&2
@@ -535,7 +545,6 @@ else
   export UK_AQ_BACKFILL_OUTPUT_SCOPE="aqilevels_only"
 fi
 
-
 export UK_AQ_R2_HISTORY_VERSION="${HISTORY_VERSION}"
 export UK_AQ_R2_HISTORY_INDEX_VERSION="${HISTORY_VERSION}"
 export UK_AQ_BACKFILL_TRIGGER_MODE="manual"
@@ -553,6 +562,11 @@ fi
 
 if (( OBSERVS_ONLY == 1 )); then
   if (( COMPLETE_CONNECTOR_DAY == 1 )); then
+    REPAIR_POLLUTANTS="$(trim "${UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS:-}")"
+    if [[ -z "${REPAIR_POLLUTANTS}" ]]; then
+      echo "ERROR: --complete-connector-day requires UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS." >&2
+      exit 3
+    fi
     unset UK_AQ_BACKFILL_TIMESERIES_IDS || true
     unset UK_AQ_BACKFILL_TIMESERIES_ID || true
     export UK_AQ_BACKFILL_INTEGRITY_COMPLETE_CONNECTOR_DAY="true"
@@ -577,7 +591,11 @@ echo "full_r2_history_index_rebuild: ${UK_AQ_BACKFILL_REBUILD_R2_HISTORY_INDEX}"
 echo "from_day_utc: ${UK_AQ_BACKFILL_FROM_DAY_UTC}"
 echo "to_day_utc: ${UK_AQ_BACKFILL_TO_DAY_UTC}"
 echo "connector_ids: ${UK_AQ_BACKFILL_CONNECTOR_IDS:-all}"
-echo "timeseries_ids: ${UK_AQ_BACKFILL_TIMESERIES_IDS:-n/a}"
+if (( COMPLETE_CONNECTOR_DAY == 1 )); then
+  echo "repair_pollutants: ${UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS}"
+else
+  echo "timeseries_ids: ${UK_AQ_BACKFILL_TIMESERIES_IDS:-n/a}"
+fi
 echo "complete_connector_day: ${UK_AQ_BACKFILL_INTEGRITY_COMPLETE_CONNECTOR_DAY:-false}"
 echo "integrity_wrapper: ${INTEGRITY_WRAPPER}"
 echo "backfill_wrapper: ${BACKFILL_WRAPPER}"
