@@ -131,6 +131,10 @@ CURRENT_INTEGRITY_CORE_PREFIX = "history/v2/core"
 SOS_HISTORICAL_REPLACEMENT_EXECUTION_PATH = (
     "dedicated_sos_historical_observation_replacement"
 )
+PROTECTED_CONNECTOR_IDS_ENV = (
+    "UK_AQ_HISTORY_INTEGRITY_PROTECTED_CONNECTOR_IDS"
+)
+DEFAULT_PROTECTED_CONNECTOR_IDS = (1,)
 SOS_HISTORICAL_REPLACEMENT_STAGE_ORDER = (
     "observations_proposal",
     "observations_metadata_proposal",
@@ -155,6 +159,10 @@ CURRENT_STATE_RECONCILE_RPC_DEFAULT = (
 CURRENT_STATE_TIMESERIES_CHUNK_SIZE = 1000
 CURRENT_STATE_LATEST_SNAPSHOT_CHUNK_SIZE = 500
 CURRENT_STATE_REPORT_CALL_LIMIT = 20
+CURRENT_STATE_LATEST_SNAPSHOT_POLICY_HELPER = (
+    "scripts/uk-aq-history-integrity/bin/integrity/current_state/"
+    "latest_snapshot_policy.mjs"
+)
 OVERLAY_CHANGED_SCOPE_SETS = (
     "OBSERVS_CHANGED",
     "OBS_MANIFESTS_CHANGED",
@@ -5091,6 +5099,7 @@ def run_narrow_backfill(
     timeseries_ids: list[int],
     connector_ids: list[int] | None = None,
     day: dt.date,
+    to_day: dt.date | None = None,
     log: logging.Logger,
     timeout_seconds: int = BACKFILL_DEFAULT_TIMEOUT_SECONDS,
     log_dir: Path | None = None,
@@ -5101,7 +5110,7 @@ def run_narrow_backfill(
     complete_connector_day: bool = False,
     repair_pollutants: Iterable[str] | None = None,
 ) -> dict[str, Any]:
-    """Invoke `uk_aq_backfill_local.sh` for one (timeseries-ids, day).
+    """Invoke `uk_aq_backfill_local.sh` for one scope (single day by default).
 
     Returns a result dict suitable for recording on the source_file_events
     row: status in {ok, error, no_wrapper, no_env_file, no_timeseries_ids,
@@ -5135,7 +5144,14 @@ def run_narrow_backfill(
         return result
 
     sub_env: dict[str, str] = {**os.environ}
-    sub_env.pop("UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS", None)
+    internal_scope_keys = (
+        "UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS",
+        "UK_AQ_BACKFILL_SOS_SOURCE_ACQUISITION_MODE",
+        "UK_AQ_BACKFILL_SOS_SOURCE_ACQUISITION_ROOT",
+        "UK_AQ_BACKFILL_SOS_SOURCE_ACQUISITION_RUN_ID",
+    )
+    for key in internal_scope_keys:
+        sub_env.pop(key, None)
     if env_file_path:
         if not Path(env_file_path).is_file():
             result["status"] = "no_env_file"
@@ -5149,10 +5165,14 @@ def run_narrow_backfill(
             len(loaded),
             interesting_keys,
         )
-        loaded.pop("UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS", None)
+        for key in internal_scope_keys:
+            loaded.pop(key, None)
         sub_env.update(loaded)
 
     iso = day.isoformat()
+    to_iso = (to_day or day).isoformat()
+    if to_iso < iso:
+        raise ValueError("narrow backfill to_day must not precede day")
 
     sub_env.update({
         "UK_AQ_BACKFILL_RUN_MODE": "source_to_r2",
@@ -5162,7 +5182,7 @@ def run_narrow_backfill(
         "UK_AQ_R2_HISTORY_VERSION": history_version,
         "UK_AQ_R2_HISTORY_INDEX_VERSION": history_version,
         "UK_AQ_BACKFILL_FROM_DAY_UTC": iso,
-        "UK_AQ_BACKFILL_TO_DAY_UTC": iso,
+        "UK_AQ_BACKFILL_TO_DAY_UTC": to_iso,
         # Always force trigger_mode=manual (wrapper enforces this anyway).
         "UK_AQ_BACKFILL_TRIGGER_MODE": "manual",
     })
@@ -5210,9 +5230,10 @@ def run_narrow_backfill(
 
     started = time.monotonic()
     log.info(
-        "backfill invoke wrapper=%s day=%s connector_ids=%s timeseries_ids=%s",
+        "backfill invoke wrapper=%s day=%s..%s connector_ids=%s timeseries_ids=%s",
         wrapper_path,
         iso,
+        to_iso,
         sub_env.get("UK_AQ_BACKFILL_CONNECTOR_IDS", "all"),
         sub_env.get("UK_AQ_BACKFILL_TIMESERIES_IDS", "complete_connector_day"),
     )
@@ -5231,7 +5252,7 @@ def run_narrow_backfill(
             "--from-day",
             iso,
             "--to-day",
-            iso,
+            to_iso,
         ]
         if complete_connector_day:
             cmd.append("--complete-connector-day")
@@ -16732,6 +16753,132 @@ def build_dedicated_sos_selected_partitions(
     ]
 
 
+def _load_dedicated_sos_source_acquisition_manifest(
+    *,
+    acquisition_root: Path,
+    run_id: int,
+    selected_days: Iterable[str],
+    selected_pollutants: Iterable[str],
+) -> dict[str, Any]:
+    """Validate the completed run-owned SOS source-acquisition manifest."""
+    manifest_path = acquisition_root / "acquisition-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise ValueError("dedicated SOS source acquisition manifest is invalid")
+    completion_hash = str(
+        manifest.get("acquisition_completion_sha256") or ""
+    )
+    semantic = dict(manifest)
+    semantic.pop("acquisition_completion_sha256", None)
+    actual_hash = hashlib.sha256(
+        json.dumps(
+            semantic,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    expected_days = sorted({str(value) for value in selected_days})
+    expected_pollutants = sorted({str(value) for value in selected_pollutants})
+    partition_files = manifest.get("partition_files")
+    source_identities = manifest.get("source_file_identities")
+    if (
+        manifest.get("schema_version") != 1
+        or manifest.get("acquisition_status") != "complete"
+        or str(manifest.get("run_id") or "") != str(run_id)
+        or int(manifest.get("connector_id") or 0) != 1
+        or list(manifest.get("selected_days") or []) != expected_days
+        or list(manifest.get("requested_pollutants") or [])
+        != expected_pollutants
+        or not isinstance(partition_files, list)
+        or not isinstance(source_identities, list)
+        or int(manifest.get("partition_dataset_count") or -1)
+        != len(expected_days) * len(expected_pollutants)
+        or int(manifest.get("unique_source_file_count") or -1)
+        != len(source_identities)
+        or int(manifest.get("source_files_opened") or -1)
+        != len(source_identities)
+        or int(manifest.get("maximum_source_file_open_count") or -1) != 1
+        or not re.fullmatch(r"[0-9a-f]{64}", completion_hash)
+        or completion_hash != actual_hash
+    ):
+        raise ValueError(
+            "dedicated SOS source acquisition manifest is incomplete or changed"
+        )
+    source_files_seen: set[str] = set()
+    identity_bytes = 0
+    for identity in source_identities:
+        if not isinstance(identity, Mapping):
+            raise ValueError(
+                "dedicated SOS source acquisition file identity is invalid"
+            )
+        source_file = str(identity.get("source_file") or "")
+        try:
+            byte_count = int(identity.get("bytes"))
+            modification_time = int(identity.get("mtime_ms"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "dedicated SOS source acquisition file metadata is invalid"
+            ) from exc
+        if (
+            not source_file
+            or str(identity.get("source_path") or "") != source_file
+            or source_file in source_files_seen
+            or not re.fullmatch(
+                r"[0-9a-f]{64}", str(identity.get("sha256") or "")
+            )
+            or byte_count <= 0
+            or modification_time < 0
+        ):
+            raise ValueError(
+                "dedicated SOS source acquisition file identity changed"
+            )
+        source_files_seen.add(source_file)
+        identity_bytes += byte_count
+    if identity_bytes != int(manifest.get("total_source_bytes_read") or -1):
+        raise ValueError(
+            "dedicated SOS source acquisition byte accounting is invalid"
+        )
+    expected_partitions = {
+        (day_utc, pollutant_code)
+        for day_utc in expected_days
+        for pollutant_code in expected_pollutants
+    }
+    actual_partitions: set[tuple[str, str]] = set()
+    for entry in partition_files:
+        if not isinstance(entry, Mapping):
+            raise ValueError(
+                "dedicated SOS source acquisition partition is invalid"
+            )
+        day_utc = str(entry.get("day_utc") or "")
+        pollutant_code = str(entry.get("pollutant_code") or "")
+        partition_path = Path(str(entry.get("path") or ""))
+        expected_path = (
+            acquisition_root
+            / "partitions"
+            / f"day_utc={day_utc}"
+            / "connector_id=1"
+            / f"pollutant_code={pollutant_code}"
+            / "source-partition.json"
+        )
+        body = partition_path.read_bytes()
+        if (
+            int(entry.get("connector_id") or 0) != 1
+            or partition_path != expected_path
+            or hashlib.sha256(body).hexdigest()
+            != str(entry.get("sha256") or "")
+        ):
+            raise ValueError(
+                "dedicated SOS source acquisition partition changed"
+            )
+        actual_partitions.add((day_utc, pollutant_code))
+    if actual_partitions != expected_partitions:
+        raise ValueError(
+            "dedicated SOS source acquisition partition scope is incomplete"
+        )
+    return {**manifest, "path": str(manifest_path)}
+
+
 def _parse_repair_pollutants_arg(raw: str | None) -> list[str]:
     return _normalise_repair_pollutants((raw or "").split(","))
 
@@ -17925,6 +18072,184 @@ def run_v2_gap_backfills(
             for (day_iso, connector_id), ts_ids in sorted(by_key.items())
         ]
     )
+    dedicated_registry_snapshot: dict[str, Any] | None = None
+    dedicated_bridge_snapshot: dict[str, Any] | None = None
+    dedicated_source_acquisition: dict[str, Any] | None = None
+    if direct_targets is not None:
+        if limits.should_stop():
+            raise RuntimeError(
+                "dedicated SOS source acquisition blocked by operation limit"
+            )
+        if run_state is None:
+            raise ValueError(
+                "dedicated SOS source acquisition requires run state"
+            )
+        selected_dates = list(metrics["selected_dates"])
+        selected_pollutants = list(metrics["selected_pollutants"])
+        acquisition_root = (
+            Path(str(run_state["run_root"])) / "sos-source-cache"
+        )
+        registry_root = (
+            Path(str(run_state["run_root"])) / "sos-source-label-registry"
+        )
+        snapshot_day = selected_dates[0]
+        dedicated_registry_snapshot = write_uk_air_source_label_registry_snapshot(
+            conn=conn,
+            connector_id=1,
+            cache_root=Path(
+                env["UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR"]
+            ) / SOS_SOURCE_KEY,
+            snapshot_path=(
+                registry_root / "acquisition" / "connector_id=1.json"
+            ),
+        )
+        dedicated_bridge_snapshot = write_sos_site_ref_bridge_snapshot(
+            conn=conn,
+            connector_id=1,
+            snapshot_path=(
+                registry_root.parent
+                / "sos-site-ref-bridge"
+                / "acquisition"
+                / "connector_id=1.json"
+            ),
+        )
+        acquisition_result = run_narrow_backfill(
+            wrapper_path=resolve_integrity_backfill_wrapper(),
+            env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
+            env_name=env_name,
+            timeseries_ids=[],
+            connector_ids=[1],
+            day=dt.date.fromisoformat(selected_dates[0]),
+            to_day=dt.date.fromisoformat(selected_dates[-1]),
+            log=log,
+            log_dir=backfill_log_dir,
+            log_label=(
+                f"v2_sos_source_acquisition_{selected_dates[0]}_"
+                f"to_{selected_dates[-1]}"
+            ),
+            output_scope="observations_only",
+            history_version="v2",
+            extra_env={
+                "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_MODE": "prepare",
+                "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_ROOT": str(
+                    run_state["overlay_root"]
+                ),
+                "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_FINALIZE": "true",
+                "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_CLEANUP": "false",
+                "UK_AQ_BACKFILL_INTEGRITY_SOURCE_EVIDENCE_ONLY": "true",
+                "UK_AQ_BACKFILL_SOS_SOURCE_ACQUISITION_MODE": "acquire",
+                "UK_AQ_BACKFILL_SOS_SOURCE_ACQUISITION_ROOT": str(
+                    acquisition_root
+                ),
+                "UK_AQ_BACKFILL_SOS_SOURCE_ACQUISITION_RUN_ID": str(run_id),
+                "UK_AQ_BACKFILL_SOS_SOURCE_LABEL_REGISTRY_FILE": str(
+                    dedicated_registry_snapshot["path"]
+                ),
+                "UK_AQ_BACKFILL_SOS_SITE_REF_BRIDGE_FILE": str(
+                    dedicated_bridge_snapshot["path"]
+                ),
+            },
+            complete_connector_day=True,
+            repair_pollutants=selected_pollutants,
+        )
+        if acquisition_result.get("status") != "ok":
+            raise RuntimeError(
+                "dedicated_sos_source_acquisition_failed:"
+                f"{acquisition_result.get('error') or acquisition_result.get('exit_code')}"
+            )
+        dedicated_source_acquisition = (
+            _load_dedicated_sos_source_acquisition_manifest(
+                acquisition_root=acquisition_root,
+                run_id=run_id,
+                selected_days=selected_dates,
+                selected_pollutants=selected_pollutants,
+            )
+        )
+        selected_day_values = [
+            dt.date.fromisoformat(value) for value in selected_dates
+        ]
+        selected_months = {
+            (value.year, value.month) for value in selected_day_values
+        }
+        selected_years = sorted({value.year for value in selected_day_values})
+        metrics["source_acquisition"] = dedicated_source_acquisition
+        metrics.update({
+            "source_acquisition_invocation_count": 1,
+            "source_acquisition_root_creation_count": 1,
+            "source_acquisition_run_id": run_id,
+            "source_acquisition_root": str(acquisition_root),
+            "source_acquisition_manifest_status": (
+                dedicated_source_acquisition.get("acquisition_status")
+            ),
+            "source_acquisition_manifest_path": (
+                dedicated_source_acquisition.get("path")
+            ),
+            "source_acquisition_complete_from_day_utc": selected_dates[0],
+            "source_acquisition_complete_to_day_utc": selected_dates[-1],
+            "source_acquisition_selected_pollutants": selected_pollutants,
+            "source_acquisition_selected_day_count": len(selected_dates),
+            "source_acquisition_selected_pollutant_count": len(
+                selected_pollutants
+            ),
+            "source_acquisition_selected_partition_dataset_count": int(
+                dedicated_source_acquisition.get("partition_dataset_count")
+                or 0
+            ),
+            "source_acquisition_source_years": selected_years,
+            "source_acquisition_crossed_calendar_month_boundary": (
+                len(selected_months) > 1
+            ),
+            "source_acquisition_crossed_calendar_year_boundary": (
+                len(selected_years) > 1
+            ),
+            "source_acquisition_strategy": dedicated_source_acquisition.get(
+                "acquisition_strategy"
+            ),
+            "unique_source_file_count": int(
+                dedicated_source_acquisition.get("unique_source_file_count")
+                or 0
+            ),
+            "source_files_opened": int(
+                dedicated_source_acquisition.get("source_files_opened") or 0
+            ),
+            "maximum_source_file_open_count": int(
+                dedicated_source_acquisition.get(
+                    "maximum_source_file_open_count"
+                ) or 0
+            ),
+            "total_source_bytes_read": int(
+                dedicated_source_acquisition.get("total_source_bytes_read")
+                or 0
+            ),
+            "total_source_rows_scanned": int(
+                dedicated_source_acquisition.get("total_source_rows_scanned")
+                or 0
+            ),
+            "selected_range_rows": int(
+                dedicated_source_acquisition.get("selected_range_rows") or 0
+            ),
+            "partition_datasets_created": int(
+                dedicated_source_acquisition.get("partition_dataset_count")
+                or 0
+            ),
+            "partition_row_counts": dict(
+                dedicated_source_acquisition.get("partition_row_counts") or {}
+            ),
+            "source_cache_path": str(acquisition_root),
+            "source_cache_complete": True,
+            "source_cache_sha256": dedicated_source_acquisition.get(
+                "acquisition_completion_sha256"
+            ),
+            "detector_rescans_avoided": len(normalized_direct_targets),
+            "proposal_builder_rescans_avoided": len(
+                normalized_direct_targets
+            ),
+        })
+        run_state["sos_source_acquisition"] = dedicated_source_acquisition
+        run_state.setdefault("sos_source_label_registry_snapshots", {})[
+            f"{snapshot_day}/connector_id=1/acquisition"
+        ] = dedicated_registry_snapshot
+        write_run_state(run_state)
     for day_iso, connector_id, ts_ids, selected_repair_pollutants in work_items:
         if not selected_repair_pollutants:
             metrics["skipped_v2_observation_repairs"].append({
@@ -17980,26 +18305,33 @@ def run_v2_gap_backfills(
             else backfill_log_dir / "_integrity_proposal" / f"v2_run_{run_id}"
         )
         sos_connector_id = int(str(env.get("UK_AQ_BACKFILL_SOS_CONNECTOR_ID_FALLBACK") or "1"))
-        registry_snapshot: dict[str, Any] | None = None
-        bridge_snapshot: dict[str, Any] | None = None
+        registry_snapshot: dict[str, Any] | None = (
+            dedicated_registry_snapshot
+            if direct_targets is not None else None
+        )
+        bridge_snapshot: dict[str, Any] | None = (
+            dedicated_bridge_snapshot
+            if direct_targets is not None else None
+        )
         if connector_id == sos_connector_id and str((source_scope or {}).get("source") or "") in {"sos", "all"}:
-            registry_root = (
-                Path(str(run_state["run_root"])) / "sos-source-label-registry"
-                if run_state is not None
-                else stage_root / "sos-source-label-registry"
-            )
-            registry_snapshot = write_uk_air_source_label_registry_snapshot(
-                conn=conn,
-                connector_id=connector_id,
-                cache_root=Path(env["UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR"]) / SOS_SOURCE_KEY,
-                snapshot_path=registry_root / f"day_utc={day_iso}" / f"connector_id={connector_id}.json",
-            )
-            bridge_snapshot = write_sos_site_ref_bridge_snapshot(
-                conn=conn,
-                connector_id=connector_id,
-                snapshot_path=registry_root.parent / "sos-site-ref-bridge" /
-                    f"day_utc={day_iso}" / f"connector_id={connector_id}.json",
-            )
+            if registry_snapshot is None or bridge_snapshot is None:
+                registry_root = (
+                    Path(str(run_state["run_root"])) / "sos-source-label-registry"
+                    if run_state is not None
+                    else stage_root / "sos-source-label-registry"
+                )
+                registry_snapshot = write_uk_air_source_label_registry_snapshot(
+                    conn=conn,
+                    connector_id=connector_id,
+                    cache_root=Path(env["UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR"]) / SOS_SOURCE_KEY,
+                    snapshot_path=registry_root / f"day_utc={day_iso}" / f"connector_id={connector_id}.json",
+                )
+                bridge_snapshot = write_sos_site_ref_bridge_snapshot(
+                    conn=conn,
+                    connector_id=connector_id,
+                    snapshot_path=registry_root.parent / "sos-site-ref-bridge" /
+                        f"day_utc={day_iso}" / f"connector_id={connector_id}.json",
+                )
             optional_scan_errors = list((registry_snapshot.get("inventory") or {}).get("scan_errors") or [])
             if optional_scan_errors:
                 log.warning(
@@ -18023,6 +18355,16 @@ def run_v2_gap_backfills(
         partition_source_evidence: dict[str, Any] = {}
         detector_evidence_error: str | None = None
         detector_result: dict[str, Any] | None = None
+        source_acquisition_consumer_env = (
+            {
+                "UK_AQ_BACKFILL_SOS_SOURCE_ACQUISITION_MODE": "consume",
+                "UK_AQ_BACKFILL_SOS_SOURCE_ACQUISITION_ROOT": str(
+                    metrics["source_cache_path"]
+                ),
+                "UK_AQ_BACKFILL_SOS_SOURCE_ACQUISITION_RUN_ID": str(run_id),
+            }
+            if direct_targets is not None else {}
+        )
         shutil.rmtree(
             detector_stage_root / f"day_utc={day_iso}" / f"connector_id={connector_id}",
             ignore_errors=True,
@@ -18047,6 +18389,7 @@ def run_v2_gap_backfills(
                     "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_CLEANUP": "false",
                     "UK_AQ_BACKFILL_INTEGRITY_COMPLETE_CONNECTOR_DAY": "true",
                     "UK_AQ_BACKFILL_INTEGRITY_SOURCE_EVIDENCE_ONLY": "true",
+                    **source_acquisition_consumer_env,
                     **({"UK_AQ_BACKFILL_SOS_SOURCE_LABEL_REGISTRY_FILE": registry_snapshot["path"]} if registry_snapshot else {}),
                     **({"UK_AQ_BACKFILL_SOS_SITE_REF_BRIDGE_FILE": bridge_snapshot["path"]} if bridge_snapshot else {}),
                 },
@@ -18182,6 +18525,7 @@ def run_v2_gap_backfills(
                 "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_FINALIZE": "true",
                 "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_CLEANUP": "false",
                 "UK_AQ_BACKFILL_INTEGRITY_COMPLETE_CONNECTOR_DAY": "true",
+                **source_acquisition_consumer_env,
                 **({"UK_AQ_BACKFILL_SOS_SOURCE_LABEL_REGISTRY_FILE": registry_snapshot["path"]} if registry_snapshot else {}),
                 **({"UK_AQ_BACKFILL_SOS_SITE_REF_BRIDGE_FILE": bridge_snapshot["path"]} if bridge_snapshot else {}),
             }
@@ -18372,6 +18716,7 @@ def run_v2_gap_backfills(
         repair_entry = {
             "day_utc": day_iso,
             "connector_id": connector_id,
+            "pollutant_code": partition_pollutant,
             "history_version": "v2",
             "status": repair_status,
             "wrapper_status": combined.get("status"),
@@ -19519,6 +19864,15 @@ def _record_metadata_executor_overlay(
     planning = output.get("planning") if isinstance(output, Mapping) else None
     if not isinstance(planning, Mapping):
         return
+    preservation = planning.get("protected_connector_preservation")
+    if isinstance(preservation, Mapping):
+        run_state["protected_connector_preservation"] = dict(preservation)
+        for field in (
+            "protected_connector_ids",
+            "selected_mutation_connector_ids",
+            "protected_connector_validation_status",
+        ):
+            run_state[field] = preservation.get(field)
     for blocked in list(planning.get("blocked_scopes") or []):
         if isinstance(blocked, Mapping):
             record_blocked_scope(run_state, {"stage": manifest_stage, **dict(blocked)})
@@ -21181,6 +21535,423 @@ def _current_state_candidates_from_verified_evidence(
     }
 
 
+def _evaluate_latest_snapshot_candidate_eligibility(
+    *, rows: Iterable[Mapping[str, Any]], env: Mapping[str, str],
+) -> list[dict[str, Any]]:
+    """Apply the owner service's shared public-current-value policy once."""
+    materialized = [
+        {
+            "pollutant_code": str(row.get("pollutant_code") or ""),
+            "value": row.get("value"),
+        }
+        for row in rows
+    ]
+    if not materialized:
+        return []
+    repo_root = _repo_root_for_integrity_script(env)
+    helper_path = repo_root / CURRENT_STATE_LATEST_SNAPSHOT_POLICY_HELPER
+    node_bin = str(env.get("UK_AQ_BACKFILL_NODE_BIN") or shutil.which("node") or "node")
+    completed = subprocess.run(
+        [node_bin, str(helper_path)],
+        cwd=repo_root,
+        input=json.dumps(materialized, separators=(",", ":"), ensure_ascii=False),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "Latest Snapshot eligibility policy failed: "
+            + _truncate_text(
+                completed.stderr or completed.stdout or "unknown policy error",
+                1000,
+            )
+        )
+    try:
+        parsed = json.loads(completed.stdout or "[]")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            "Latest Snapshot eligibility policy returned invalid JSON"
+        ) from exc
+    allowed_reasons = {
+        "eligible", "unsupported_pollutant", "missing_or_non_finite_value",
+        "negative_value", "above_pm25_maximum", "above_pm10_maximum",
+    }
+    if (
+        not isinstance(parsed, list)
+        or len(parsed) != len(materialized)
+        or any(
+            not isinstance(decision, Mapping)
+            or not isinstance(decision.get("eligible"), bool)
+            or str(decision.get("reason") or "") not in allowed_reasons
+            for decision in parsed
+        )
+    ):
+        raise RuntimeError(
+            "Latest Snapshot eligibility policy returned invalid decisions"
+        )
+    return [dict(decision) for decision in parsed]
+
+
+def _load_verified_dedicated_sos_current_state_rows(
+    partition_entries: Iterable[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Load only successful, immutable pollutant-scoped replacement evidence."""
+    rows: list[dict[str, Any]] = []
+    verified_identities: list[str] = []
+    verified_by_pollutant: Counter[str] = Counter()
+    rows_by_pollutant: Counter[str] = Counter()
+    timeseries_by_pollutant: dict[str, set[tuple[int, int]]] = {}
+    skipped_all_unmapped = 0
+    skipped_failed_or_unverified = 0
+    authoritative_no_data = 0
+    seen_identities: set[str] = set()
+
+    for raw_entry in partition_entries:
+        if not isinstance(raw_entry, Mapping):
+            skipped_failed_or_unverified += 1
+            continue
+        status = str(raw_entry.get("status") or "").strip()
+        outcome = str(raw_entry.get("outcome") or "").strip()
+        if status == "skipped_all_unmapped" or outcome == (
+            "all_groups_excluded_no_authoritative_binding"
+        ):
+            skipped_all_unmapped += 1
+            continue
+        if status != "ok":
+            skipped_failed_or_unverified += 1
+            continue
+        retained = raw_entry.get("partition_source_evidence")
+        if not isinstance(retained, Mapping):
+            raise ValueError(
+                "verified dedicated SOS partition evidence identity is unavailable"
+            )
+        day_utc = str(retained.get("day_utc") or raw_entry.get("day_utc") or "")
+        try:
+            connector_id = int(
+                retained.get("connector_id") or raw_entry.get("connector_id") or 0
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "verified dedicated SOS partition connector identity is invalid"
+            ) from exc
+        pollutant_code = str(
+            retained.get("pollutant_code")
+            or raw_entry.get("pollutant_code")
+            or ""
+        ).strip().lower()
+        identity = _dedicated_sos_source_evidence_identity(
+            day_utc=day_utc,
+            connector_id=connector_id,
+            pollutant_code=pollutant_code,
+        )
+        if (
+            not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day_utc)
+            or connector_id != 1
+            or pollutant_code not in V2_OBSERVATION_INTEGRITY_POLLUTANTS
+            or str(retained.get("identity") or "") != identity
+            or identity in seen_identities
+        ):
+            raise ValueError(
+                "verified dedicated SOS partition evidence identity is invalid"
+            )
+        seen_identities.add(identity)
+        evidence_path = Path(str(retained.get("evidence_path") or ""))
+        rows_path = Path(str(retained.get("rows_path") or ""))
+        if not evidence_path.is_file() or not rows_path.is_file():
+            raise FileNotFoundError(
+                f"verified dedicated SOS partition evidence is unavailable: {identity}"
+            )
+        evidence_bytes = evidence_path.read_bytes()
+        rows_bytes = rows_path.read_bytes()
+        if (
+            hashlib.sha256(evidence_bytes).hexdigest()
+            != str(retained.get("evidence_sha256") or "")
+            or hashlib.sha256(rows_bytes).hexdigest()
+            != str(retained.get("rows_sha256") or "")
+        ):
+            raise ValueError(
+                f"verified dedicated SOS partition evidence hash mismatch: {identity}"
+            )
+        evidence = json.loads(evidence_bytes)
+        partition_rows = json.loads(rows_bytes)
+        if not isinstance(evidence, Mapping) or not isinstance(partition_rows, list):
+            raise ValueError(
+                f"verified dedicated SOS partition evidence is invalid: {identity}"
+            )
+        if (
+            evidence.get("enumeration_complete") is not True
+            or str(evidence.get("day_utc") or "") != day_utc
+            or int(evidence.get("connector_id") or 0) != connector_id
+            or list(evidence.get("requested_pollutant_set") or [])
+            != [pollutant_code]
+            or str(evidence.get("canonical_rows_sha256") or "")
+            != hashlib.sha256(rows_bytes).hexdigest()
+            or _require_nonnegative_evidence_int(
+                evidence, "canonical_rows_bytes"
+            ) != len(rows_bytes)
+            or _require_nonnegative_evidence_int(
+                evidence, "total_rows"
+            ) != len(partition_rows)
+            or _require_nonnegative_evidence_int(
+                evidence, "blocked_row_count"
+            ) != 0
+        ):
+            raise ValueError(
+                f"verified dedicated SOS partition semantic identity is invalid: {identity}"
+            )
+        verified_identities.append(identity)
+        verified_by_pollutant[pollutant_code] += 1
+        if not partition_rows:
+            authoritative_no_data += 1
+            continue
+        pollutant_timeseries = timeseries_by_pollutant.setdefault(
+            pollutant_code, set()
+        )
+        for raw_row in partition_rows:
+            if not isinstance(raw_row, Mapping):
+                raise ValueError(
+                    f"verified dedicated SOS partition contains a non-object row: {identity}"
+                )
+            row = dict(raw_row)
+            row["_verified_partition_identity"] = identity
+            rows.append(row)
+            rows_by_pollutant[pollutant_code] += 1
+            try:
+                pollutant_timeseries.add(
+                    (connector_id, int(raw_row.get("timeseries_id")))
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"verified dedicated SOS partition has an invalid timeseries: {identity}"
+                ) from exc
+
+    return {
+        "rows": rows,
+        "audit": {
+            "evidence_source": "verified_pollutant_scoped_replacement_partitions",
+            "verified_partition_evidence_count": len(verified_identities),
+            "verified_partition_identities": sorted(verified_identities),
+            "verified_partitions_by_pollutant": dict(sorted(verified_by_pollutant.items())),
+            "canonical_rows_examined_by_pollutant": dict(sorted(rows_by_pollutant.items())),
+            "timeseries_represented_by_pollutant": {
+                pollutant: len(identities)
+                for pollutant, identities in sorted(timeseries_by_pollutant.items())
+            },
+            "skipped_all_unmapped_partitions": skipped_all_unmapped,
+            "skipped_failed_or_unverified_partitions": skipped_failed_or_unverified,
+            "authoritative_no_data_partitions": authoritative_no_data,
+        },
+    }
+
+
+def _dedicated_sos_current_state_candidates(
+    *, partition_entries: Iterable[Mapping[str, Any]], env: Mapping[str, str],
+) -> dict[str, Any]:
+    loaded = _load_verified_dedicated_sos_current_state_rows(partition_entries)
+    canonical_rows = list(loaded["rows"])
+    normalized: list[dict[str, Any]] = []
+    observed_values: list[dt.datetime] = []
+    for raw in canonical_rows:
+        partition_identity = str(raw.get("_verified_partition_identity") or "")
+        match = re.fullmatch(
+            r"day_utc=(\d{4}-\d{2}-\d{2})/connector_id=(\d+)/"
+            r"pollutant_code=([a-z0-9_]+)",
+            partition_identity,
+        )
+        if match is None:
+            raise ValueError("verified current-state partition identity is invalid")
+        day_utc, connector_text, partition_pollutant = match.groups()
+        connector_id = int(connector_text)
+        try:
+            row_connector_id = int(raw.get("connector_id", connector_id))
+            timeseries_id = int(raw.get("timeseries_id"))
+            value = float(raw.get("value"))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("verified current-state row identity is invalid") from exc
+        observed_at = _parse_required_timestamp_value(raw.get("observed_at"))
+        pollutant_code = str(raw.get("pollutant_code") or "").strip().lower()
+        if (
+            row_connector_id != connector_id
+            or timeseries_id <= 0
+            or observed_at is None
+            or observed_at.tzinfo is None
+            or not _timestamp_is_in_utc_day(observed_at, day_utc)
+            or not math.isfinite(value)
+            or pollutant_code != partition_pollutant
+        ):
+            raise ValueError("verified current-state canonical row is invalid")
+        observed_at = observed_at.astimezone(dt.timezone.utc)
+        status = (
+            raw.get("verification_status")
+            if "verification_status" in raw
+            else raw.get("status") if "status" in raw else None
+        )
+        if status is not None:
+            status = str(status)
+        normalized.append({
+            "connector_id": connector_id,
+            "timeseries_id": timeseries_id,
+            "observed_at": _format_utc_timestamp(observed_at),
+            "value": value,
+            "value_float8_hex": struct.pack(">d", value).hex(),
+            "status": status,
+            "pollutant_code": pollutant_code,
+        })
+        observed_values.append(observed_at)
+
+    raw_latest: dict[tuple[int, int], dict[str, Any]] = {}
+    timeseries_equal_timestamp_resolutions = 0
+    for row in normalized:
+        identity = (int(row["connector_id"]), int(row["timeseries_id"]))
+        current = raw_latest.get(identity)
+        if current is None or str(row["observed_at"]) > str(current["observed_at"]):
+            raw_latest[identity] = row
+            continue
+        if str(row["observed_at"]) < str(current["observed_at"]):
+            continue
+        content = (
+            row["value_float8_hex"], row.get("status"), row["pollutant_code"]
+        )
+        current_content = (
+            current["value_float8_hex"], current.get("status"),
+            current["pollutant_code"],
+        )
+        if content != current_content:
+            raise ValueError(
+                "verified current-state evidence contains irreconcilable "
+                "same-timestamp canonical rows"
+            )
+        timeseries_equal_timestamp_resolutions += 1
+
+    supported_rows = [
+        row for row in normalized
+        if row["pollutant_code"] in {"pm25", "pm10", "no2"}
+    ]
+    eligibility = _evaluate_latest_snapshot_candidate_eligibility(
+        rows=supported_rows,
+        env=env,
+    )
+    eligible_rows: list[dict[str, Any]] = []
+    ineligible_by_reason: Counter[str] = Counter()
+    for row, decision in zip(supported_rows, eligibility, strict=True):
+        if decision["eligible"]:
+            eligible_rows.append(row)
+        else:
+            ineligible_by_reason[str(decision["reason"])] += 1
+
+    snapshot_latest: dict[tuple[int, int], dict[str, Any]] = {}
+    snapshot_equal_timestamp_resolutions = 0
+    for row in eligible_rows:
+        identity = (int(row["connector_id"]), int(row["timeseries_id"]))
+        current = snapshot_latest.get(identity)
+        if current is None or str(row["observed_at"]) > str(current["observed_at"]):
+            snapshot_latest[identity] = row
+            continue
+        if str(row["observed_at"]) < str(current["observed_at"]):
+            continue
+        content = (
+            row["value_float8_hex"], row.get("status"), row["pollutant_code"]
+        )
+        current_content = (
+            current["value_float8_hex"], current.get("status"),
+            current["pollutant_code"],
+        )
+        if content != current_content:
+            raise ValueError(
+                "verified Latest Snapshot evidence contains irreconcilable "
+                "same-timestamp canonical rows"
+            )
+        snapshot_equal_timestamp_resolutions += 1
+
+    raw_candidates = [
+        {
+            "connector_id": row["connector_id"],
+            "timeseries_id": row["timeseries_id"],
+            "observed_at": row["observed_at"],
+            "value": row["value"],
+        }
+        for _, row in sorted(raw_latest.items())
+    ]
+    snapshot_candidates = [
+        dict(row) for _, row in sorted(snapshot_latest.items())
+    ]
+    raw_by_pollutant = Counter(
+        row["pollutant_code"] for row in raw_latest.values()
+    )
+    snapshot_by_pollutant = Counter(
+        row["pollutant_code"] for row in snapshot_latest.values()
+    )
+    supported_timeseries = {
+        (int(row["connector_id"]), int(row["timeseries_id"]))
+        for row in supported_rows
+    }
+    latest_raw_ineligible_fallbacks = sum(
+        1
+        for identity, snapshot_row in snapshot_latest.items()
+        if identity in raw_latest
+        and str(snapshot_row["observed_at"])
+        < str(raw_latest[identity]["observed_at"])
+    )
+    return {
+        "scope_count": int(
+            loaded["audit"]["verified_partition_evidence_count"]
+        ),
+        "raw_candidates": raw_candidates,
+        "latest_snapshot_candidates": snapshot_candidates,
+        "candidate_observed_at_min": (
+            _format_utc_timestamp(min(observed_values)) if observed_values else None
+        ),
+        "candidate_observed_at_max": (
+            _format_utc_timestamp(max(observed_values)) if observed_values else None
+        ),
+        "missing_evidence": [],
+        "evidence_audit": loaded["audit"],
+        "timeseries_candidate_audit": {
+            "raw_rows_examined": len(normalized),
+            "candidate_count_before_compaction": len(normalized),
+            "candidate_count_after_compaction": len(raw_candidates),
+            "candidates_by_pollutant": dict(sorted(raw_by_pollutant.items())),
+            "duplicate_or_equal_timestamp_resolutions": (
+                timeseries_equal_timestamp_resolutions
+            ),
+            "payload_chunk_count": (
+                math.ceil(len(raw_candidates) / CURRENT_STATE_TIMESERIES_CHUNK_SIZE)
+                if raw_candidates else 0
+            ),
+            "rpc_submitted_count": 0,
+        },
+        "latest_snapshot_candidate_audit": {
+            "supported_rows_examined": len(supported_rows),
+            "unsupported_pollutant_rows_excluded": (
+                len(normalized) - len(supported_rows)
+            ),
+            "ineligible_rows_excluded_by_reason": dict(
+                sorted(ineligible_by_reason.items())
+            ),
+            "supported_timeseries_represented": len(supported_timeseries),
+            "candidate_count_before_compaction": len(eligible_rows),
+            "candidate_count_after_compaction": len(snapshot_candidates),
+            "candidates_by_pollutant": dict(
+                sorted(snapshot_by_pollutant.items())
+            ),
+            "latest_raw_ineligible_earlier_candidate_selected": (
+                latest_raw_ineligible_fallbacks
+            ),
+            "duplicate_or_equal_timestamp_resolutions": (
+                snapshot_equal_timestamp_resolutions
+            ),
+            "payload_chunk_count": (
+                math.ceil(
+                    len(snapshot_candidates)
+                    / CURRENT_STATE_LATEST_SNAPSHOT_CHUNK_SIZE
+                ) if snapshot_candidates else 0
+            ),
+            "owner_service_submitted_count": 0,
+        },
+    }
+
+
 def _google_cloud_run_identity_token(audience: str) -> str:
     return acquire_identity_token(audience, settings=os.environ)
 
@@ -21239,6 +22010,7 @@ def run_current_state_reconciliation(
     dry_run: bool,
     final_verification: Mapping[str, Any],
     log: logging.Logger,
+    dedicated_partition_entries: Iterable[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     settings = {**os.environ, **{str(key): str(value) for key, value in env.items()}}
     enabled = _is_truthy(settings.get(
@@ -21259,6 +22031,9 @@ def run_current_state_reconciliation(
         "candidate_observed_at_max": None,
         "timeseries": {},
         "latest_snapshot": {},
+        "evidence_audit": {},
+        "timeseries_candidate_audit": {},
+        "latest_snapshot_candidate_audit": {},
         "warnings": [],
         "failures": [],
     }
@@ -21273,24 +22048,37 @@ def run_current_state_reconciliation(
         result["failures"].append("final R2 verification did not succeed")
         return result
 
-    selected_scope = {
-        "scopes": sorted({
-            (
-                str(entry.get("day_utc") or "").strip(),
-                int(entry.get("connector_id") or 0),
+    if dedicated_partition_entries is not None:
+        derived = _dedicated_sos_current_state_candidates(
+            partition_entries=dedicated_partition_entries,
+            env=settings,
+        )
+        selected_scope = {
+            "verified_partitions": list(
+                derived.get("evidence_audit", {}).get(
+                    "verified_partition_identities", []
+                )
             )
-            for entry in scope_entries
-            if isinstance(entry, Mapping)
-        })
-    }
-    derived = _current_state_candidates_from_verified_evidence(
-        conn=conn,
-        env_name=env_name,
-        scope_entries=[
-            {"day_utc": day_utc, "connector_id": connector_id}
-            for day_utc, connector_id in selected_scope["scopes"]
-        ],
-    )
+        }
+    else:
+        selected_scope = {
+            "scopes": sorted({
+                (
+                    str(entry.get("day_utc") or "").strip(),
+                    int(entry.get("connector_id") or 0),
+                )
+                for entry in scope_entries
+                if isinstance(entry, Mapping)
+            })
+        }
+        derived = _current_state_candidates_from_verified_evidence(
+            conn=conn,
+            env_name=env_name,
+            scope_entries=[
+                {"day_utc": day_utc, "connector_id": connector_id}
+                for day_utc, connector_id in selected_scope["scopes"]
+            ],
+        )
     raw_candidates = list(derived["raw_candidates"])
     snapshot_candidates = list(derived["latest_snapshot_candidates"])
     try:
@@ -21307,6 +22095,13 @@ def run_current_state_reconciliation(
         "candidate_observed_at_max": derived["candidate_observed_at_max"],
         "missing_evidence_count": len(derived["missing_evidence"]),
         "missing_evidence_sample": list(derived["missing_evidence"])[:20],
+        "evidence_audit": dict(derived.get("evidence_audit") or {}),
+        "timeseries_candidate_audit": dict(
+            derived.get("timeseries_candidate_audit") or {}
+        ),
+        "latest_snapshot_candidate_audit": dict(
+            derived.get("latest_snapshot_candidate_audit") or {}
+        ),
     })
     if derived["missing_evidence"]:
         result["timeseries_reconciliation_status"] = "failed"
@@ -21442,6 +22237,12 @@ def run_current_state_reconciliation(
             timeseries_error = str(exc)
             result["timeseries_reconciliation_status"] = "failed"
             result["failures"].append(f"timeseries reconciliation failed: {exc}")
+        result["timeseries_candidate_audit"]["rpc_submitted_count"] = int(
+            timeseries_summary["candidate_count"]
+        )
+        result["timeseries_candidate_audit"]["owner_rpc_outcomes"] = dict(
+            timeseries_summary
+        )
         timeseries_audit_status = (
             "succeeded"
             if result["timeseries_reconciliation_status"] == "ok"
@@ -21535,7 +22336,8 @@ def run_current_state_reconciliation(
                     "skipped_invalid_current_value_count",
                     "skipped_unsupported_pollutant_count",
                     "skipped_metadata_unresolved_count", "changed_product_count",
-                    "skipped_unchanged_product_count",
+                    "skipped_unchanged_product_count", "product_success_count",
+                    "product_failure_count",
                 ):
                     aggregate_latest[key] += int(response.get(key) or 0)
                 if response.get("ok") is not True:
@@ -21576,6 +22378,15 @@ def run_current_state_reconciliation(
             result["failures"].append(
                 f"Latest Snapshot reconciliation failed: {exc}"
             )
+        result["latest_snapshot_candidate_audit"][
+            "owner_service_submitted_count"
+        ] = int(aggregate_latest.get("candidate_count") or 0)
+        result["latest_snapshot_candidate_audit"][
+            "owner_service_outcomes"
+        ] = {
+            key: int(value)
+            for key, value in sorted(aggregate_latest.items())
+        }
         latest_audit_status = (
             "succeeded"
             if result["latest_snapshot_reconciliation_status"] == "ok"
@@ -22119,6 +22930,12 @@ def summarize_ordered_apply_verification(
         "r2_objects_changed": len(written_keys) + deleted_object_count,
         "remaining_gap_count": len(remaining_scopes),
         "remaining_scopes": remaining_scopes,
+        "final_protected_connector_r2_verification_status": (
+            ("succeeded" if not remaining_scopes else "failed")
+            if run_state.get("execution_path")
+            == SOS_HISTORICAL_REPLACEMENT_EXECUTION_PATH
+            else "not_applicable"
+        ),
     }
 
 
@@ -22146,6 +22963,7 @@ def run_v2_integrity_repair_flow(
     selected_days: Iterable[str] | None = None,
     repair_pollutants: Iterable[str] | None = None,
     dedicated_sos_historical_replacement: bool = False,
+    protected_connector_ids: Iterable[int] | None = None,
 ) -> dict[str, Any]:
     """Build one canonical local proposal, then optionally apply and verify it."""
     explicit_selected_partitions: list[dict[str, Any]] | None = None
@@ -22161,6 +22979,16 @@ def run_v2_integrity_repair_flow(
                 "dedicated SOS historical replacement requires source=sos and "
                 "connector_id=1 only"
             )
+        resolved_protected_connector_ids = sorted({
+            int(value) for value in (protected_connector_ids or [])
+        })
+        if not resolved_protected_connector_ids or not (
+            allowed_connector_ids <= set(resolved_protected_connector_ids)
+        ):
+            raise RuntimeError(
+                "dedicated SOS historical replacement requires every selected "
+                "mutation connector to be protected"
+            )
         explicit_selected_partitions = build_dedicated_sos_selected_partitions(
             from_day=from_day,
             to_day=to_day,
@@ -22171,6 +22999,9 @@ def run_v2_integrity_repair_flow(
             "execution_path": SOS_HISTORICAL_REPLACEMENT_EXECUTION_PATH,
             "dedicated_sos_historical_replacement": True,
             "mutation_connector_ids": [1],
+            "protected_connector_ids": resolved_protected_connector_ids,
+            "selected_mutation_connector_ids": [1],
+            "protected_connector_validation_status": "pending_proposal_graph",
             "aqi_policy": "bypassed_observation_history_only",
             "target_authority": "explicit_selected_scope",
             "explicit_selected_partitions": explicit_selected_partitions,
@@ -22764,13 +23595,17 @@ def run_v2_integrity_repair_flow(
             log=log,
             require_remote_state=not dry_run,
         )
-    repaired_current_state_scopes = [
+    all_observation_repair_entries = [
         entry
         for entry in list(
             observations.get("v2_observation_repair_results") or []
         )
         if isinstance(entry, Mapping)
-        and str(entry.get("status") or "") == "ok"
+    ]
+    repaired_current_state_scopes = [
+        entry
+        for entry in all_observation_repair_entries
+        if str(entry.get("status") or "") == "ok"
     ]
     repaired_current_state_keys = {
         (str(entry.get("day_utc") or ""), int(entry.get("connector_id") or 0))
@@ -22792,6 +23627,10 @@ def run_v2_integrity_repair_flow(
         dry_run=dry_run,
         final_verification=final_verification,
         log=log,
+        dedicated_partition_entries=(
+            all_observation_repair_entries
+            if dedicated_sos_historical_replacement else None
+        ),
     )
     current_state_reconciliation["latest_snapshot_auth_preflight"] = dict(
         auth_preflight
@@ -22884,6 +23723,10 @@ def run_v2_integrity_repair_flow(
         if dedicated_sos_historical_replacement
         else list(CANONICAL_REPAIR_STAGE_ORDER)
     )
+    protected_preservation = (
+        dict(run_state.get("protected_connector_preservation") or {})
+        if dedicated_sos_historical_replacement else {}
+    )
     result = {
         "status": "failed" if coordinator_failed else (
             "planned" if dry_run else "succeeded"
@@ -22897,6 +23740,45 @@ def run_v2_integrity_repair_flow(
             dedicated_sos_historical_replacement
         ),
         "mutation_connector_ids": [1] if dedicated_sos_historical_replacement else None,
+        "protected_connector_ids": (
+            list(run_state.get("protected_connector_ids") or [])
+            if dedicated_sos_historical_replacement else None
+        ),
+        "selected_mutation_connector_ids": (
+            [1] if dedicated_sos_historical_replacement else None
+        ),
+        "protected_connector_preservation": (
+            protected_preservation
+            if dedicated_sos_historical_replacement else None
+        ),
+        "protected_connector_validation_status": (
+            protected_preservation.get("protected_connector_validation_status")
+            if dedicated_sos_historical_replacement else None
+        ),
+        "healthy_unprotected_children_preserved": (
+            protected_preservation.get("healthy_unprotected_children_preserved")
+            if dedicated_sos_historical_replacement else None
+        ),
+        "unprotected_pollutant_omission_count": (
+            protected_preservation.get("unprotected_pollutant_omission_count")
+            if dedicated_sos_historical_replacement else None
+        ),
+        "unprotected_connector_omission_count": (
+            protected_preservation.get("unprotected_connector_omission_count")
+            if dedicated_sos_historical_replacement else None
+        ),
+        "unprotected_day_omission_count": (
+            protected_preservation.get("unprotected_day_omission_count")
+            if dedicated_sos_historical_replacement else None
+        ),
+        "unprotected_omissions": (
+            protected_preservation.get("unprotected_omissions")
+            if dedicated_sos_historical_replacement else None
+        ),
+        "permitted_parent_metadata_rewrites": (
+            protected_preservation.get("permitted_parent_metadata_rewrites")
+            if dedicated_sos_historical_replacement else None
+        ),
         "bypassed_stages": (
             [
                 "observation_gap_detection",
@@ -22919,6 +23801,88 @@ def run_v2_integrity_repair_flow(
         ),
         "selected_dates": observations.get("selected_dates"),
         "selected_pollutants": observations.get("selected_pollutants"),
+        "source_acquisition": observations.get("source_acquisition"),
+        "source_acquisition_strategy": observations.get(
+            "source_acquisition_strategy"
+        ),
+        "source_acquisition_invocation_count": observations.get(
+            "source_acquisition_invocation_count"
+        ),
+        "source_acquisition_root_creation_count": observations.get(
+            "source_acquisition_root_creation_count"
+        ),
+        "source_acquisition_run_id": observations.get(
+            "source_acquisition_run_id"
+        ),
+        "source_acquisition_root": observations.get(
+            "source_acquisition_root"
+        ),
+        "source_acquisition_manifest_status": observations.get(
+            "source_acquisition_manifest_status"
+        ),
+        "source_acquisition_manifest_path": observations.get(
+            "source_acquisition_manifest_path"
+        ),
+        "source_acquisition_complete_from_day_utc": observations.get(
+            "source_acquisition_complete_from_day_utc"
+        ),
+        "source_acquisition_complete_to_day_utc": observations.get(
+            "source_acquisition_complete_to_day_utc"
+        ),
+        "source_acquisition_selected_pollutants": observations.get(
+            "source_acquisition_selected_pollutants"
+        ),
+        "source_acquisition_selected_day_count": observations.get(
+            "source_acquisition_selected_day_count"
+        ),
+        "source_acquisition_selected_pollutant_count": observations.get(
+            "source_acquisition_selected_pollutant_count"
+        ),
+        "source_acquisition_selected_partition_dataset_count": (
+            observations.get(
+                "source_acquisition_selected_partition_dataset_count"
+            )
+        ),
+        "source_acquisition_source_years": observations.get(
+            "source_acquisition_source_years"
+        ),
+        "source_acquisition_crossed_calendar_month_boundary": (
+            observations.get(
+                "source_acquisition_crossed_calendar_month_boundary"
+            )
+        ),
+        "source_acquisition_crossed_calendar_year_boundary": (
+            observations.get(
+                "source_acquisition_crossed_calendar_year_boundary"
+            )
+        ),
+        "unique_source_file_count": observations.get(
+            "unique_source_file_count"
+        ),
+        "source_files_opened": observations.get("source_files_opened"),
+        "maximum_source_file_open_count": observations.get(
+            "maximum_source_file_open_count"
+        ),
+        "total_source_bytes_read": observations.get(
+            "total_source_bytes_read"
+        ),
+        "total_source_rows_scanned": observations.get(
+            "total_source_rows_scanned"
+        ),
+        "selected_range_rows": observations.get("selected_range_rows"),
+        "partition_datasets_created": observations.get(
+            "partition_datasets_created"
+        ),
+        "partition_row_counts": observations.get("partition_row_counts"),
+        "source_cache_path": observations.get("source_cache_path"),
+        "source_cache_complete": observations.get("source_cache_complete"),
+        "source_cache_sha256": observations.get("source_cache_sha256"),
+        "detector_rescans_avoided": observations.get(
+            "detector_rescans_avoided"
+        ),
+        "proposal_builder_rescans_avoided": observations.get(
+            "proposal_builder_rescans_avoided"
+        ),
         "selected_partition_outcomes": observations.get(
             "selected_partition_outcomes"
         ),
@@ -23114,10 +24078,40 @@ def resolve_effective_mode(args: argparse.Namespace) -> Literal[
     return "check_only"
 
 
+def resolve_protected_connector_ids(
+    values: Mapping[str, str] | None = None,
+) -> list[int]:
+    """Resolve the explicit dedicated-replacement protection policy."""
+    source = os.environ if values is None else values
+    if PROTECTED_CONNECTOR_IDS_ENV not in source:
+        return list(DEFAULT_PROTECTED_CONNECTOR_IDS)
+    raw = str(source.get(PROTECTED_CONNECTOR_IDS_ENV) or "").strip()
+    if not raw:
+        raise RuntimeError(
+            f"{PROTECTED_CONNECTOR_IDS_ENV} must not be explicitly empty"
+        )
+    parts = [part.strip() for part in raw.split(",")]
+    if any(not part or not re.fullmatch(r"[1-9]\d*", part) for part in parts):
+        raise RuntimeError(
+            f"{PROTECTED_CONNECTOR_IDS_ENV} must be a comma-separated list "
+            "of positive integer connector IDs"
+        )
+    parsed_ids = [int(part) for part in parts]
+    if len(set(parsed_ids)) != len(parsed_ids):
+        raise RuntimeError(
+            f"{PROTECTED_CONNECTOR_IDS_ENV} must contain unique connector IDs"
+        )
+    connector_ids = sorted(parsed_ids)
+    if not connector_ids:
+        raise RuntimeError(f"{PROTECTED_CONNECTOR_IDS_ENV} resolved empty")
+    return connector_ids
+
+
 def select_sos_historical_replacement_route(
     args: argparse.Namespace,
     *,
     mutation_connector_ids: Iterable[int] | None = None,
+    protected_connector_ids: Iterable[int] | None = None,
 ) -> dict[str, Any]:
     """Select only the explicit real SOS connector-1 replacement contract."""
     requirements = {
@@ -23140,6 +24134,10 @@ def select_sos_historical_replacement_route(
         "arguments_qualify": arguments_qualify,
         "requirements": requirements,
         "mutation_connector_ids": None,
+        "protected_connector_ids": (
+            sorted({int(value) for value in protected_connector_ids})
+            if protected_connector_ids is not None else None
+        ),
         "reason": None,
     }
     if not arguments_qualify:
@@ -23154,6 +24152,19 @@ def select_sos_historical_replacement_route(
         raise RuntimeError(
             "dedicated SOS historical replacement refuses mutation outside "
             f"connector_id=1; resolved_connector_ids={connector_ids}"
+        )
+    protected_ids = result["protected_connector_ids"]
+    if not protected_ids:
+        raise RuntimeError(
+            "dedicated SOS historical replacement requires a non-empty "
+            "protected connector set"
+        )
+    unprotected_selected = sorted(set(connector_ids) - set(protected_ids))
+    if unprotected_selected:
+        raise RuntimeError(
+            "dedicated SOS historical replacement selected mutation connector "
+            f"outside protected set; selected={connector_ids}; "
+            f"protected={protected_ids}"
         )
     result.update({
         "selected": True,
@@ -25012,6 +26023,51 @@ def format_summary_md(s: dict[str, Any]) -> str:
         "",
     ]
 
+    preservation = (s.get("repair_flow") or {}).get(
+        "protected_connector_preservation"
+    ) or {}
+    if preservation:
+        omissions = list(preservation.get("unprotected_omissions") or [])
+        lines.extend([
+            "## Protected connector preservation",
+            "",
+            "- Protected connector IDs: "
+            + json.dumps(preservation.get("protected_connector_ids") or []),
+            "- Selected mutation connector IDs: "
+            + json.dumps(
+                preservation.get("selected_mutation_connector_ids") or []
+            ),
+            "- Protected validation: "
+            + str(preservation.get("protected_connector_validation_status")),
+            "- Healthy unprotected children preserved: "
+            + str(preservation.get("healthy_unprotected_children_preserved") or 0),
+            "- Unprotected pollutant omissions: "
+            + str(preservation.get("unprotected_pollutant_omission_count") or 0),
+            "- Unprotected connector omissions: "
+            + str(preservation.get("unprotected_connector_omission_count") or 0),
+            "- Unprotected day omissions: "
+            + str(preservation.get("unprotected_day_omission_count") or 0),
+            "- Omitted unprotected children mutated: "
+            + str(bool(preservation.get("omitted_unprotected_children_mutated"))),
+            "- Permitted parent metadata rewrites: "
+            + (", ".join(
+                preservation.get("permitted_parent_metadata_rewrites") or []
+            ) or "(none)"),
+        ])
+        if omissions:
+            lines.extend(["", "### Unprotected omission warnings", ""])
+            for omission in omissions:
+                lines.append(
+                    "- WARNING "
+                    f"day={omission.get('day_utc')} "
+                    f"connector={omission.get('connector_id')} "
+                    f"pollutant={omission.get('pollutant_code') or '(connector)'} "
+                    f"key={omission.get('object_key')} "
+                    f"classification={omission.get('classification')} "
+                    f"reason={omission.get('reason')}"
+                )
+        lines.append("")
+
     selection = s.get("date_selection") or {}
     if selection:
         lines.extend([
@@ -25166,6 +26222,47 @@ def format_summary_md(s: dict[str, Any]) -> str:
             )
         if repair_flow.get("stage_results"):
             lines.append("")
+        if repair_flow.get("dedicated_sos_historical_replacement"):
+            lines.extend([
+                "### SOS source acquisition",
+                "",
+                f"- Strategy: {repair_flow.get('source_acquisition_strategy') or '(none)'}",
+                f"- Invocation count: {int(repair_flow.get('source_acquisition_invocation_count') or 0)}",
+                f"- Root creation count: {int(repair_flow.get('source_acquisition_root_creation_count') or 0)}",
+                f"- Run identity: {repair_flow.get('source_acquisition_run_id') or '(none)'}",
+                f"- Complete requested range: {repair_flow.get('source_acquisition_complete_from_day_utc') or '(none)'} -> {repair_flow.get('source_acquisition_complete_to_day_utc') or '(none)'}",
+                "- Complete pollutant set: " + json.dumps(
+                    repair_flow.get("source_acquisition_selected_pollutants") or []
+                ),
+                f"- Selected days: {int(repair_flow.get('source_acquisition_selected_day_count') or 0)}",
+                f"- Selected pollutants: {int(repair_flow.get('source_acquisition_selected_pollutant_count') or 0)}",
+                f"- Selected partition datasets: {int(repair_flow.get('source_acquisition_selected_partition_dataset_count') or 0)}",
+                "- Source years: " + json.dumps(
+                    repair_flow.get("source_acquisition_source_years") or []
+                ),
+                f"- Crossed calendar-month boundary: {bool(repair_flow.get('source_acquisition_crossed_calendar_month_boundary'))}",
+                f"- Crossed calendar-year boundary: {bool(repair_flow.get('source_acquisition_crossed_calendar_year_boundary'))}",
+                f"- Acquisition root: {repair_flow.get('source_acquisition_root') or '(none)'}",
+                f"- Manifest: {repair_flow.get('source_acquisition_manifest_path') or '(none)'}",
+                f"- Manifest status: {repair_flow.get('source_acquisition_manifest_status') or '(none)'}",
+                f"- Unique source files: {int(repair_flow.get('unique_source_file_count') or 0)}",
+                f"- Source files opened: {int(repair_flow.get('source_files_opened') or 0)}",
+                f"- Maximum opens per source file: {int(repair_flow.get('maximum_source_file_open_count') or 0)}",
+                f"- Source bytes read: {int(repair_flow.get('total_source_bytes_read') or 0)}",
+                f"- Source rows scanned: {int(repair_flow.get('total_source_rows_scanned') or 0)}",
+                f"- Selected-range rows: {int(repair_flow.get('selected_range_rows') or 0)}",
+                f"- Partition datasets: {int(repair_flow.get('partition_datasets_created') or 0)}",
+                "- Partition row counts: " + json.dumps(
+                    repair_flow.get("partition_row_counts") or {},
+                    sort_keys=True,
+                ),
+                f"- Source cache: {repair_flow.get('source_cache_path') or '(none)'}",
+                f"- Source cache complete: {bool(repair_flow.get('source_cache_complete'))}",
+                f"- Source cache SHA-256: {repair_flow.get('source_cache_sha256') or '(none)'}",
+                f"- Detector rescans avoided: {int(repair_flow.get('detector_rescans_avoided') or 0)}",
+                f"- Proposal-builder rescans avoided: {int(repair_flow.get('proposal_builder_rescans_avoided') or 0)}",
+                "",
+            ])
         reconciliation = repair_flow.get("first_value_at_reconciliation") or {}
         if reconciliation:
             lines.extend([
@@ -25234,8 +26331,11 @@ def format_summary_md(s: dict[str, Any]) -> str:
                 f"- Latest Snapshot status: {current_state.get('latest_snapshot_reconciliation_status') or '(none)'}",
                 f"- Overall status: {current_state.get('overall_status') or '(none)'}",
                 f"- Durable target statuses: {json.dumps(current_state.get('target_audit_statuses') or {}, sort_keys=True)}",
-                f"- Raw latest candidates: {int(current_state.get('candidate_count') or 0)}",
-                f"- Latest Snapshot source rows: {int(current_state.get('latest_snapshot_candidate_count') or 0)}",
+                f"- Timeseries candidates: {int(current_state.get('candidate_count') or 0)}",
+                f"- Latest Snapshot candidates: {int(current_state.get('latest_snapshot_candidate_count') or 0)}",
+                f"- Verified evidence: {json.dumps(current_state.get('evidence_audit') or {}, sort_keys=True)}",
+                f"- Timeseries candidate audit: {json.dumps(current_state.get('timeseries_candidate_audit') or {}, sort_keys=True)}",
+                f"- Latest Snapshot candidate audit: {json.dumps(current_state.get('latest_snapshot_candidate_audit') or {}, sort_keys=True)}",
                 f"- Candidate range: {current_state.get('candidate_observed_at_min') or '(none)'} to {current_state.get('candidate_observed_at_max') or '(none)'}",
                 f"- Failures: {json.dumps(current_state.get('failures') or [], sort_keys=True)}",
                 *(
@@ -25257,8 +26357,11 @@ def format_summary_md(s: dict[str, Any]) -> str:
             f"- Latest Snapshot status: {reported_current_state.get('latest_snapshot_reconciliation_status') or '(none)'}",
             f"- Overall status: {reported_current_state.get('overall_status') or '(none)'}",
             f"- Durable target statuses: {json.dumps(reported_current_state.get('target_audit_statuses') or {}, sort_keys=True)}",
-            f"- Raw latest candidates: {int(reported_current_state.get('candidate_count') or 0)}",
-            f"- Latest Snapshot source rows: {int(reported_current_state.get('latest_snapshot_candidate_count') or 0)}",
+            f"- Timeseries candidates: {int(reported_current_state.get('candidate_count') or 0)}",
+            f"- Latest Snapshot candidates: {int(reported_current_state.get('latest_snapshot_candidate_count') or 0)}",
+            f"- Verified evidence: {json.dumps(reported_current_state.get('evidence_audit') or {}, sort_keys=True)}",
+            f"- Timeseries candidate audit: {json.dumps(reported_current_state.get('timeseries_candidate_audit') or {}, sort_keys=True)}",
+            f"- Latest Snapshot candidate audit: {json.dumps(reported_current_state.get('latest_snapshot_candidate_audit') or {}, sort_keys=True)}",
             f"- Failures: {json.dumps(reported_current_state.get('failures') or [], sort_keys=True)}",
             *(
                 ["- Recovery: correct the cause and start a new appropriately scoped Integrity run."]
@@ -25867,6 +26970,11 @@ def main(argv: list[str]) -> int:
     sos_historical_route = select_sos_historical_replacement_route(args)
     dedicated_sos_historical_replacement = False
     env = load_env_or_die()
+    protected_connector_ids = (
+        resolve_protected_connector_ids(os.environ)
+        if sos_historical_route.get("arguments_qualify") else None
+    )
+    sos_historical_route["protected_connector_ids"] = protected_connector_ids
     history_version_mode = resolve_history_version_mode(args)
     checked_history_versions = expand_history_versions(history_version_mode)
     history_path_configs = resolve_history_path_configs(history_version_mode)
@@ -26275,6 +27383,7 @@ def main(argv: list[str]) -> int:
             sos_historical_route = select_sos_historical_replacement_route(
                 args,
                 mutation_connector_ids=v2_allowed_connector_ids,
+                protected_connector_ids=protected_connector_ids,
             )
             dedicated_sos_historical_replacement = bool(
                 sos_historical_route.get("selected")
@@ -26590,6 +27699,14 @@ def main(argv: list[str]) -> int:
                 "execution_path"
             )
             repair_overlay["sos_historical_route"] = dict(sos_historical_route)
+            if dedicated_sos_historical_replacement:
+                repair_overlay["protected_connector_ids"] = list(
+                    protected_connector_ids or []
+                )
+                repair_overlay["selected_mutation_connector_ids"] = [1]
+                repair_overlay["protected_connector_validation_status"] = (
+                    "pending_proposal_graph"
+                )
             repair_overlay["requested_from_day"] = from_day
             repair_overlay["requested_to_day"] = to_day
             repair_overlay["requested_repair_pollutants"] = list(
@@ -26647,6 +27764,7 @@ def main(argv: list[str]) -> int:
                     dedicated_sos_historical_replacement=(
                         dedicated_sos_historical_replacement
                     ),
+                    protected_connector_ids=protected_connector_ids,
                 )
             aqi_stage = next(
                 (
@@ -26960,6 +28078,11 @@ def main(argv: list[str]) -> int:
             sos_metrics.get(
                 "no_authoritative_timeseries_binding_groups"
             ) or 0
+        )
+        warnings_count_total += int(
+            ((repair_flow.get("protected_connector_preservation") or {}).get(
+                "warning_count"
+            )) or 0
         )
 
         metrics: dict[str, Any] = {
