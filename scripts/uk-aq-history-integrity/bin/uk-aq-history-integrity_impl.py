@@ -129,7 +129,7 @@ DEFAULT_R2_HISTORY_DROPBOX_DIR = "R2_history_backup"
 CURRENT_INTEGRITY_HISTORY_VERSION = "v2"
 CURRENT_INTEGRITY_CORE_PREFIX = "history/v2/core"
 SOS_HISTORICAL_REPLACEMENT_EXECUTION_PATH = (
-    "dedicated_sos_historical_observation_replacement"
+    "sos_light"
 )
 PROTECTED_CONNECTOR_IDS_ENV = (
     "UK_AQ_HISTORY_INTEGRITY_PROTECTED_CONNECTOR_IDS"
@@ -19364,7 +19364,47 @@ def _overlay_object_entry(run_state: Mapping[str, Any], object_key: str) -> dict
     return entry
 
 
+def _record_coordinator_complete_run_state_write(
+    run_state: Mapping[str, Any],
+) -> None:
+    apply_summary = run_state.get("apply")
+    if not isinstance(apply_summary, dict):
+        return
+    persistence = apply_summary.get("persistence")
+    if not isinstance(persistence, dict):
+        return
+    node_count_raw = persistence.get("node_complete_run_state_write_count")
+    if node_count_raw is None:
+        node_count_raw = persistence.get("complete_run_state_write_count")
+    if node_count_raw is None:
+        return
+    node_count = int(node_count_raw or 0)
+    coordinator_count = int(
+        persistence.get("coordinator_complete_run_state_write_count") or 0
+    ) + 1
+    total_count = node_count + coordinator_count
+    persistence.update({
+        "node_complete_run_state_write_count": node_count,
+        "coordinator_complete_run_state_write_count": coordinator_count,
+        "total_complete_run_state_write_count": total_count,
+        "complete_run_state_write_count": total_count,
+    })
+    coordinator = run_state.get("coordinator")
+    if isinstance(coordinator, dict):
+        final_verification = coordinator.get("final_verification")
+        if isinstance(final_verification, dict):
+            artifacts = final_verification.get("apply_persistence_artifacts")
+            if isinstance(artifacts, dict):
+                artifacts.update({
+                    "node_complete_run_state_write_count": node_count,
+                    "coordinator_complete_run_state_write_count": coordinator_count,
+                    "total_complete_run_state_write_count": total_count,
+                    "complete_run_state_write_count": total_count,
+                })
+
+
 def write_run_state(run_state: Mapping[str, Any]) -> Path:
+    _record_coordinator_complete_run_state_write(run_state)
     state_path = Path(str(run_state["run_state_path"]))
     state_path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = state_path.with_name(state_path.name + ".tmp")
@@ -19864,15 +19904,9 @@ def _record_metadata_executor_overlay(
     planning = output.get("planning") if isinstance(output, Mapping) else None
     if not isinstance(planning, Mapping):
         return
-    preservation = planning.get("protected_connector_preservation")
-    if isinstance(preservation, Mapping):
-        run_state["protected_connector_preservation"] = dict(preservation)
-        for field in (
-            "protected_connector_ids",
-            "selected_mutation_connector_ids",
-            "protected_connector_validation_status",
-        ):
-            run_state[field] = preservation.get(field)
+    sos_light = planning.get("sos_light")
+    if isinstance(sos_light, Mapping):
+        run_state["sos_light"] = dict(sos_light)
     for blocked in list(planning.get("blocked_scopes") or []):
         if isinstance(blocked, Mapping):
             record_blocked_scope(run_state, {"stage": manifest_stage, **dict(blocked)})
@@ -19887,7 +19921,11 @@ def _record_metadata_executor_overlay(
         with tempfile.TemporaryDirectory(prefix="uk-aq-integrity-proposal-") as temp_dir:
             source = Path(temp_dir) / "generated-object"
             source.write_text(body, encoding="utf-8")
-            stage = manifest_stage if "manifest" in str(proposal.get("kind") or "") else index_stage
+            stage = str(proposal.get("publication_stage") or "").strip() or (
+                manifest_stage
+                if "manifest" in str(proposal.get("kind") or "")
+                else index_stage
+            )
             stage_overlay_object(
                 run_state, object_key=object_key, source_path=source, stage=stage,
                 dependencies=[str(value) for value in list(proposal.get("dependencies") or [])],
@@ -19897,14 +19935,292 @@ def _record_metadata_executor_overlay(
                     else None
                 ),
             )
+        snapshot = proposal.get("local_dependency_snapshot")
+        if isinstance(snapshot, Mapping):
+            _overlay_object_entry(run_state, object_key)[
+                "local_dependency_snapshot"
+            ] = dict(snapshot)
         mark_overlay_structurally_validated(run_state, object_key)
         scope_set = manifest_scope_set if "manifest" in str(proposal.get("kind") or "") else index_scope_set
         record_changed_scope(run_state, scope_set, {
             "object_key": object_key,
-            "stage": manifest_stage if scope_set == manifest_scope_set else index_stage,
+            "stage": stage,
             "provenance": proposal.get("provenance") or "repair_generated",
         })
     write_run_state(run_state)
+
+
+def assemble_sos_light_complete_days(run_state: dict[str, Any]) -> dict[str, Any]:
+    """Materialise the source-plus-Dropbox day proposal, then select full-day deletion."""
+    audit = run_state.get("sos_light")
+    if not isinstance(audit, dict) or audit.get("validation_status") != "validated_local_assembly":
+        raise ValueError("SOS-light local assembly audit is unavailable or invalid")
+    if audit.get("old_live_r2_observation_bodies_used") is not False:
+        raise ValueError("SOS-light planning authority boundary is not explicit")
+    day_entries = [entry for entry in list(audit.get("days") or []) if isinstance(entry, Mapping)]
+    if not day_entries:
+        raise ValueError("SOS-light local assembly contains no selected days")
+    old_prefixes = [
+        _normalise_overlay_object_key(str(entry.get("prefix") or "")).rstrip("/")
+        for entry in list(run_state.get("tombstone_prefixes") or [])
+        if isinstance(entry, Mapping) and entry.get("proposed")
+    ]
+    dropbox_root = Path(str(run_state["base_dropbox_root"]))
+    overlay_root = Path(str(run_state["overlay_root"]))
+    objects = run_state.get("objects")
+    if not isinstance(objects, dict):
+        raise ValueError("SOS-light overlay objects mapping is unavailable")
+    total_day_uploads = 0
+    dropbox_day_absent_days: list[str] = []
+    for raw_day in day_entries:
+        day = dict(raw_day)
+        day_utc = str(day.get("day_utc") or "")
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day_utc):
+            raise ValueError(f"SOS-light day identity is invalid: {day_utc!r}")
+        day_prefix = f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/day_utc={day_utc}"
+        baseline_day = dropbox_root / day_prefix
+        dropbox_day_present = baseline_day.is_dir()
+        day["dropbox_day_present"] = dropbox_day_present
+        day["dropbox_day_absent"] = not dropbox_day_present
+        if not dropbox_day_present:
+            dropbox_day_absent_days.append(day_utc)
+            warning = {
+                "day_utc": day_utc,
+                "object_key": day_prefix,
+                "classification": "dropbox_selected_day_absent",
+                "reason": (
+                    "chosen Dropbox baseline has no selected observation-day directory; "
+                    "continuing with current-run connector 1 source-built objects only"
+                ),
+                "omitted": False,
+            }
+            warnings = audit.setdefault("dropbox_warnings", [])
+            if not isinstance(warnings, list):
+                raise ValueError("SOS-light Dropbox warning audit is invalid")
+            if not any(
+                isinstance(existing, Mapping)
+                and existing.get("classification") == warning["classification"]
+                and existing.get("day_utc") == day_utc
+                for existing in warnings
+            ):
+                warnings.append(warning)
+                audit["dropbox_warning_count"] = int(
+                    audit.get("dropbox_warning_count") or 0
+                ) + 1
+        omitted_prefixes = [
+            _normalise_overlay_object_key(str(value)).rstrip("/")
+            for value in list(day.get("omitted_dropbox_connector_prefixes") or [])
+        ]
+        for source in (
+            sorted(path for path in baseline_day.rglob("*") if path.is_file())
+            if dropbox_day_present
+            else []
+        ):
+            object_key = source.relative_to(dropbox_root).as_posix()
+            if object_key in objects:
+                continue
+            if any(object_key.startswith(f"{prefix}/") for prefix in old_prefixes):
+                continue
+            if any(object_key.startswith(f"{prefix}/") for prefix in omitted_prefixes):
+                continue
+            target = overlay_root / object_key
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+            payload = target.read_bytes()
+            objects[object_key] = {
+                "object_key": object_key,
+                "local_path": str(target),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "bytes": len(payload),
+                "stage": "sos_light_dropbox_baseline",
+                "proposal_owner": "dropbox_day_baseline",
+                "dependencies": [],
+                "dependency_identities": {},
+                "proposed": True,
+                "built": True,
+                "structurally_validated": True,
+                "structurally_validated_at_utc": fmt_iso(utc_now()),
+                "uploaded": False,
+                "uploaded_at_utc": None,
+                "r2_verified": False,
+                "r2_verified_at_utc": None,
+            }
+        day_keys = sorted(
+            key for key in objects if key.startswith(f"{day_prefix}/")
+        )
+        if f"{day_prefix}/manifest.json" not in day_keys:
+            raise ValueError(f"SOS-light assembled day parent is unavailable: {day_utc}")
+        connector1_parent = f"{day_prefix}/connector_id=1/manifest.json"
+        if connector1_parent not in day_keys:
+            raise ValueError(f"SOS-light connector 1 parent is unavailable: {day_utc}")
+        # Freeze every direct child edge for the complete replacement day,
+        # including Dropbox-derived sibling connectors.  These identities are
+        # part of the preflight graph; apply must never rediscover them live.
+        for object_key in day_keys:
+            entry = objects[object_key]
+            if object_key.endswith(".parquet"):
+                entry["stage"] = "observations_data"
+                continue
+            if not object_key.endswith(".json"):
+                continue
+            payload = json.loads(Path(str(entry["local_path"])).read_text(encoding="utf-8"))
+            manifest_kind = str(payload.get("manifest_kind") or "")
+            if manifest_kind == "pollutant":
+                entry["stage"] = "pollutant_manifest"
+            elif manifest_kind == "connector":
+                entry["stage"] = "connector_manifest"
+            elif manifest_kind == "day":
+                entry["stage"] = "day_parent"
+            references = {
+                str(value)
+                for value in list(payload.get("parquet_object_keys") or [])
+                if str(value)
+            }
+            references.update(
+                str(value.get("key") or "")
+                for value in list(payload.get("files") or [])
+                if isinstance(value, Mapping) and str(value.get("key") or "")
+            )
+            for field in (
+                "pollutant_manifests",
+                "connector_manifests",
+                "child_manifests",
+            ):
+                references.update(
+                    str(value.get("manifest_key") or "")
+                    for value in list(payload.get(field) or [])
+                    if isinstance(value, Mapping)
+                    and str(value.get("manifest_key") or "")
+                )
+            missing = sorted(reference for reference in references if reference not in objects)
+            if missing:
+                raise ValueError(
+                    f"SOS-light generated parent has an unstaged child: {object_key} -> {missing[0]}"
+                )
+            entry["dependencies"] = sorted(references)
+            entry["dependency_identities"] = {
+                reference: {
+                    "sha256": objects[reference]["sha256"],
+                    "bytes": objects[reference]["bytes"],
+                    "source": "planned_overlay",
+                }
+                for reference in sorted(references)
+            }
+        for parent_key, reference_fields in (
+            (connector1_parent, ("pollutant_manifests", "child_manifests")),
+            (f"{day_prefix}/manifest.json", ("connector_manifests", "child_manifests")),
+        ):
+            parent_entry = objects[parent_key]
+            parent_payload = json.loads(
+                Path(str(parent_entry["local_path"])).read_text(encoding="utf-8")
+            )
+            references = {
+                str(reference.get("manifest_key") or "")
+                for field in reference_fields
+                for reference in list(parent_payload.get(field) or [])
+                if isinstance(reference, Mapping)
+                and str(reference.get("manifest_key") or "")
+            }
+            missing = sorted(reference for reference in references if reference not in objects)
+            if missing:
+                raise ValueError(
+                    f"SOS-light final parent has an unstaged child: {parent_key} -> {missing[0]}"
+                )
+            parent_entry["dependencies"] = sorted(references)
+            parent_entry["dependency_identities"] = {
+                reference: {
+                    "sha256": objects[reference]["sha256"],
+                    "bytes": objects[reference]["bytes"],
+                    "source": "overlay",
+                }
+                for reference in sorted(references)
+            }
+            parent_entry["local_dependency_snapshot"] = {
+                "source": "complete_local_sos_light_assembly",
+                "expected_child_keys": sorted(references),
+            }
+        connector1_children = list(
+            objects[connector1_parent]["dependencies"]
+        )
+        if connector1_children != sorted(
+            str(value) for value in list(day.get("final_connector_1_child_set") or [])
+        ):
+            raise ValueError(
+                f"SOS-light connector 1 final child-set evidence changed: {day_utc}"
+            )
+        day["complete_day_upload_count"] = len(day_keys)
+        day["complete_day_delete_prefix"] = f"{day_prefix}/"
+        total_day_uploads += len(day_keys)
+        raw_day.update(day)
+
+    # Every dependency below a deleted day is now an explicitly staged object.
+    for entry in objects.values():
+        if not isinstance(entry, dict):
+            continue
+        identities = entry.get("dependency_identities")
+        if not isinstance(identities, dict):
+            continue
+        for dependency, identity in identities.items():
+            staged = objects.get(dependency)
+            if not isinstance(staged, Mapping) or not isinstance(identity, dict):
+                continue
+            identity.update({
+                "sha256": staged.get("sha256"),
+                "bytes": staged.get("bytes"),
+                "source": "overlay",
+            })
+
+    run_state["tombstone_prefixes"] = [
+        {
+            "prefix": (
+                f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/"
+                f"day_utc={str(entry['day_utc'])}"
+            ),
+            "proposed": True,
+            "deleted": False,
+            "deletion_verified": False,
+            "stage": "sos_light_complete_day",
+            "replacement_authorities": [
+                "current_run_sos_source", "chosen_dropbox_baseline"
+            ],
+        }
+        for entry in sorted(day_entries, key=lambda value: str(value["day_utc"]))
+    ]
+    dropbox_day_warning_count = sum(
+        1
+        for warning in list(audit.get("dropbox_warnings") or [])
+        if isinstance(warning, Mapping)
+        and warning.get("classification") == "dropbox_selected_day_absent"
+    )
+    audit.update({
+        "mode": "sos-light",
+        "validation_status": "complete_local_days_validated",
+        "selected_days": sorted(str(entry["day_utc"]) for entry in day_entries),
+        "selected_connector_1_pollutants": sorted({
+            match.group(1)
+            for identity in dict(run_state.get("source_evidence_partitions") or {})
+            if (match := re.search(r"/pollutant_code=([a-z0-9_]+)$", str(identity)))
+        }),
+        "chosen_dropbox_baseline": str(dropbox_root),
+        "source_identities": sorted(
+            str(identity)
+            for identity in dict(run_state.get("source_evidence_partitions") or {})
+        ),
+        "complete_day_count": len(day_entries),
+        "complete_day_upload_count": total_day_uploads,
+        "complete_day_deletion_count": len(day_entries),
+        "dropbox_day_absent_days": sorted(dropbox_day_absent_days),
+        "dropbox_day_absent_count": len(dropbox_day_absent_days),
+        "dropbox_day_warning_count": dropbox_day_warning_count,
+        "warning_count": len(list(audit.get("dropbox_warnings") or [])),
+        "warning_samples": list(audit.get("dropbox_warnings") or [])[:10],
+        "assembly_authority_confirmation":
+            "current-run SOS source plus chosen Dropbox baseline only",
+        "no_old_live_r2_body_planning_or_preservation": True,
+    })
+    run_state["mode"] = "sos-light"
+    write_run_state(run_state)
+    return dict(audit)
 
 def _capture_local_v2_observation_scope(
     *,
@@ -20922,6 +21238,393 @@ def _validate_v2_timeseries_bindings(
     return gaps
 
 
+def _resolve_run_scoped_apply_artifact(
+    run_state: Mapping[str, Any], raw_path: Any,
+) -> Path:
+    artifact_path = Path(str(raw_path or "")).resolve()
+    run_root = Path(str(run_state.get("run_root") or "")).resolve()
+    if not str(raw_path or "").strip() or not run_root.is_dir():
+        raise ValueError("run-scoped apply artifact path is unavailable")
+    try:
+        artifact_path.relative_to(run_root)
+    except ValueError as exc:
+        raise ValueError("apply artifact is outside the current run directory") from exc
+    if not artifact_path.is_file():
+        raise FileNotFoundError(f"apply artifact is missing: {artifact_path}")
+    return artifact_path
+
+
+def _verified_deleted_object_keys(
+    run_state: Mapping[str, Any], prefix_entry: Mapping[str, Any],
+) -> list[str]:
+    sidecar_path_raw = prefix_entry.get("deleted_keys_sidecar_path")
+    if sidecar_path_raw:
+        sidecar_path = _resolve_run_scoped_apply_artifact(
+            run_state, sidecar_path_raw,
+        )
+        body = sidecar_path.read_bytes()
+        expected_bytes = int(prefix_entry.get("deleted_keys_sidecar_bytes") or -1)
+        expected_sha256 = str(
+            prefix_entry.get("deleted_keys_sha256") or ""
+        ).strip().lower()
+        if len(body) != expected_bytes or hashlib.sha256(body).hexdigest() != expected_sha256:
+            raise ValueError(
+                f"deleted-key sidecar identity mismatch: {sidecar_path}"
+            )
+        payload = json.loads(body.decode("utf-8"))
+        if not isinstance(payload, list) or any(
+            not isinstance(value, str) or not value for value in payload
+        ):
+            raise ValueError(f"deleted-key sidecar payload is invalid: {sidecar_path}")
+        keys = list(payload)
+        prefix = str(prefix_entry.get("prefix") or "").rstrip("/") + "/"
+        if keys != sorted(keys) or len(keys) != len(set(keys)) or any(
+            not key.startswith(prefix) for key in keys
+        ):
+            raise ValueError(f"deleted-key sidecar key scope is invalid: {sidecar_path}")
+        if len(keys) != int(prefix_entry.get("deleted_object_count") or 0):
+            raise ValueError(f"deleted-key sidecar count mismatch: {sidecar_path}")
+        return keys
+    return sorted({
+        str(value) for value in list(prefix_entry.get("deleted_object_keys") or [])
+        if str(value)
+    })
+
+
+MUTATION_EVENT_HASH_CONTRACT_VERSION = "integrity-apply-mutation-event-v1"
+PUBLICATION_SCHEDULE_CONTRACT_VERSION = "integrity-apply-publication-schedule-v1"
+
+
+def canonical_mutation_event_hash_input(event: Mapping[str, Any]) -> bytes:
+    hash_fields = {
+        str(key): value for key, value in event.items() if key != "event_sha256"
+    }
+    return json.dumps(
+        hash_fields,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def canonical_publication_schedule_hash_input(
+    schedule: Mapping[str, Any],
+) -> bytes:
+    hash_fields = {
+        str(key): value
+        for key, value in schedule.items()
+        if key != "schedule_sha256"
+    }
+    return json.dumps(
+        hash_fields,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def verify_publication_schedule(
+    run_state: Mapping[str, Any],
+) -> dict[str, Any]:
+    apply_summary = run_state.get("apply") or {}
+    schedule = apply_summary.get("publication_schedule")
+    if not isinstance(schedule, Mapping):
+        raise ValueError("publication schedule is unavailable")
+    if schedule.get("contract_version") != PUBLICATION_SCHEDULE_CONTRACT_VERSION:
+        raise ValueError("publication schedule contract mismatch")
+    expected_sha256 = str(schedule.get("schedule_sha256") or "").strip().lower()
+    recomputed_sha256 = hashlib.sha256(
+        canonical_publication_schedule_hash_input(schedule)
+    ).hexdigest()
+    if expected_sha256 != recomputed_sha256:
+        raise ValueError("publication schedule identity mismatch")
+    entries = list(schedule.get("entries") or [])
+    total_positions = int(schedule.get("total_positions") or 0)
+    if len(entries) != total_positions:
+        raise ValueError("publication schedule position count mismatch")
+    objects = run_state.get("objects") or {}
+    positions_by_key: dict[str, int] = {}
+    stages: list[str] = []
+    for expected_position, raw_entry in enumerate(entries, 1):
+        if not isinstance(raw_entry, Mapping):
+            raise ValueError("publication schedule entry is invalid")
+        position = int(raw_entry.get("position") or 0)
+        key = str(raw_entry.get("canonical_key") or "")
+        if position != expected_position:
+            raise ValueError("publication schedule has a missing, duplicate or reordered position")
+        if not key or key in positions_by_key:
+            raise ValueError("publication schedule has a duplicate or invalid object key")
+        object_entry = objects.get(key) if isinstance(objects, Mapping) else None
+        if not isinstance(object_entry, Mapping):
+            raise ValueError(f"scheduled object is unavailable: {key}")
+        dependencies = sorted({str(value) for value in object_entry.get("dependencies") or []})
+        scheduled_dependencies = list(raw_entry.get("dependencies") or [])
+        if (
+            str(object_entry.get("sha256") or "")
+            != str(raw_entry.get("proposed_sha256") or "")
+            or int(object_entry.get("bytes") or 0)
+            != int(raw_entry.get("proposed_bytes") or -1)
+            or dependencies != scheduled_dependencies
+            or str(object_entry.get("stage") or "")
+            != str(raw_entry.get("publication_stage") or "")
+        ):
+            raise ValueError(f"scheduled object identity is inconsistent: {key}")
+        for dependency in list(raw_entry.get("direct_changed_dependencies") or []):
+            dependency_position = positions_by_key.get(str(dependency))
+            if dependency_position is None or dependency_position >= position:
+                raise ValueError(
+                    f"publication schedule dependency order is invalid: {dependency} -> {key}"
+                )
+        positions_by_key[key] = position
+        stages.append(str(raw_entry.get("publication_stage") or ""))
+    latest_snapshot_positions = [
+        index for index, stage in enumerate(stages, 1) if stage == "latest_snapshot"
+    ]
+    if latest_snapshot_positions and latest_snapshot_positions != [total_positions]:
+        raise ValueError("changed latest snapshot is not the final schedule position")
+    return {
+        "schedule_sha256": expected_sha256,
+        "total_positions": total_positions,
+        "entries": entries,
+        "positions_by_key": positions_by_key,
+    }
+
+
+def verify_apply_persistence_artifacts(
+    run_state: Mapping[str, Any],
+) -> dict[str, Any]:
+    persistence = ((run_state.get("apply") or {}).get("persistence") or {})
+    journal_path_raw = persistence.get("mutation_journal_path")
+    if not journal_path_raw:
+        return {"status": "not_available", "reason": "mutation_journal_not_recorded"}
+    journal_path = _resolve_run_scoped_apply_artifact(run_state, journal_path_raw)
+    body = journal_path.read_bytes()
+    expected_bytes = int(persistence.get("mutation_journal_bytes") or -1)
+    expected_sha256 = str(
+        persistence.get("mutation_journal_sha256") or ""
+    ).strip().lower()
+    if len(body) != expected_bytes or hashlib.sha256(body).hexdigest() != expected_sha256:
+        raise ValueError(f"mutation journal identity mismatch: {journal_path}")
+    lines = [line for line in body.splitlines() if line]
+    expected_events = int(persistence.get("mutation_journal_event_count") or 0)
+    if len(lines) != expected_events:
+        raise ValueError(f"mutation journal event-count mismatch: {journal_path}")
+    previous_recomputed_sha256: str | None = None
+    run_id = str(run_state.get("run_id") or "")
+    event_types: dict[str, int] = {}
+    schedule_verification = verify_publication_schedule(run_state)
+    schedule_sha256 = schedule_verification["schedule_sha256"]
+    total_schedule_positions = schedule_verification["total_positions"]
+    schedule_entries = schedule_verification["entries"]
+    scheduled_event_types = {
+        "put_started",
+        "put_completed",
+        "post_put_get_started",
+        "post_put_get_verified",
+        "put_or_verification_failed",
+    }
+    scheduled_events: dict[str, list[tuple[int, str, str]]] = {
+        event_type: [] for event_type in scheduled_event_types
+    }
+    parsed_events: list[Mapping[str, Any]] = []
+    for raw_line in lines:
+        event = json.loads(raw_line.decode("utf-8"))
+        if not isinstance(event, Mapping):
+            raise ValueError(f"mutation journal event is not an object: {journal_path}")
+        if str(event.get("run_id") or "") != run_id:
+            raise ValueError(f"mutation journal run identity mismatch: {journal_path}")
+        if not event.get("event_hash_contract_version") or not event.get("event_sha256"):
+            raise ValueError(
+                f"unsupported legacy mutation journal contract: {journal_path}"
+            )
+        if event.get("event_hash_contract_version") != MUTATION_EVENT_HASH_CONTRACT_VERSION:
+            raise ValueError(
+                f"unsupported legacy mutation journal contract: {journal_path}"
+            )
+        if event.get("previous_event_sha256") != previous_recomputed_sha256:
+            raise ValueError(
+                f"mutation journal event-chain linkage mismatch: {journal_path}"
+            )
+        event_sha256 = str(event.get("event_sha256") or "").strip().lower()
+        if not re.fullmatch(r"[a-f0-9]{64}", event_sha256):
+            raise ValueError(f"mutation journal event identity is invalid: {journal_path}")
+        recomputed_sha256 = hashlib.sha256(
+            canonical_mutation_event_hash_input(event)
+        ).hexdigest()
+        if event_sha256 != recomputed_sha256:
+            raise ValueError(
+                f"mutation journal event-hash mismatch: {journal_path}"
+            )
+        previous_recomputed_sha256 = recomputed_sha256
+        event_type = str(event.get("event_type") or "")
+        event_types[event_type] = event_types.get(event_type, 0) + 1
+        parsed_events.append(event)
+        if event_type in scheduled_event_types:
+            event_schedule_sha256 = str(
+                event.get("publication_schedule_sha256") or ""
+            )
+            position = int(event.get("schedule_position") or 0)
+            total = int(event.get("total_schedule_positions") or 0)
+            key = str(event.get("canonical_key") or "")
+            proposed_sha256 = str(event.get("sha256") or "")
+            if (
+                event_schedule_sha256 != schedule_sha256
+                or total != total_schedule_positions
+                or position <= 0
+                or position > total_schedule_positions
+            ):
+                raise ValueError("mutation journal schedule evidence mismatch")
+            scheduled = schedule_entries[position - 1]
+            if (
+                key != str(scheduled.get("canonical_key") or "")
+                or proposed_sha256 != str(scheduled.get("proposed_sha256") or "")
+                or str(event.get("publication_stage") or "")
+                != str(scheduled.get("publication_stage") or "")
+            ):
+                raise ValueError(
+                    f"mutation journal scheduled object mismatch at position {position}"
+                )
+            scheduled_events[event_type].append((position, key, proposed_sha256))
+    expected_tail = persistence.get("mutation_journal_tail_event_sha256")
+    if previous_recomputed_sha256 != expected_tail:
+        raise ValueError(
+            f"mutation journal event-chain tail mismatch: {journal_path}"
+        )
+    apply_summary = run_state.get("apply") or {}
+    if apply_summary.get("status") == "succeeded":
+        completed_writes = int(apply_summary.get("completed_writes") or 0)
+        completed_gets = int(
+            apply_summary.get("completed_post_put_verifications") or 0
+        )
+        put_completed = int(event_types.get("put_completed") or 0)
+        get_verified = int(event_types.get("post_put_get_verified") or 0)
+        if not (
+            put_completed == get_verified == completed_writes == completed_gets
+        ):
+            raise ValueError(
+                "mutation journal successful PUT/GET count mismatch: "
+                f"put_completed={put_completed} "
+                f"post_put_get_verified={get_verified} "
+                f"completed_writes={completed_writes} "
+                f"completed_post_put_verifications={completed_gets}"
+            )
+        expected_sequence = list(range(1, total_schedule_positions + 1))
+        for event_type in (
+            "put_started",
+            "put_completed",
+            "post_put_get_started",
+            "post_put_get_verified",
+        ):
+            positions = [position for position, _key, _sha in scheduled_events[event_type]]
+            if positions != expected_sequence:
+                raise ValueError(
+                    f"mutation journal schedule positions are missing, duplicate or reordered: {event_type}"
+                )
+        completed_scheduled = int(
+            apply_summary.get("completed_scheduled_objects") or 0
+        )
+        last_completed_position = int(
+            apply_summary.get("last_completed_schedule_position") or 0
+        )
+        if (
+            completed_scheduled != total_schedule_positions
+            or last_completed_position != total_schedule_positions
+            or completed_writes != total_schedule_positions
+            or completed_gets != total_schedule_positions
+        ):
+            raise ValueError("publication schedule completion totals mismatch")
+        if not parsed_events or parsed_events[-1].get("event_type") != "canonical_apply_completed":
+            raise ValueError("mutation journal final publication stage is incomplete")
+        deletion_verified = int(event_types.get("deletion_verified") or 0)
+        completed_deletions = int(
+            apply_summary.get("completed_deletions") or 0
+        )
+        if deletion_verified != completed_deletions:
+            raise ValueError(
+                "mutation journal successful deletion count mismatch: "
+                f"deletion_verified={deletion_verified} "
+                f"completed_deletions={completed_deletions}"
+            )
+    sidecars: list[dict[str, Any]] = []
+    for raw_prefix in list(run_state.get("tombstone_prefixes") or []):
+        if not isinstance(raw_prefix, Mapping):
+            continue
+        if raw_prefix.get("deletion_verified") and not raw_prefix.get(
+            "deleted_keys_sidecar_path"
+        ):
+            raise ValueError("verified deletion is missing its deleted-key sidecar")
+        if not raw_prefix.get("deleted_keys_sidecar_path"):
+            continue
+        keys = _verified_deleted_object_keys(run_state, raw_prefix)
+        sidecars.append({
+            "prefix": str(raw_prefix.get("prefix") or ""),
+            "path": str(raw_prefix.get("deleted_keys_sidecar_path") or ""),
+            "bytes": int(raw_prefix.get("deleted_keys_sidecar_bytes") or 0),
+            "sha256": str(raw_prefix.get("deleted_keys_sha256") or ""),
+            "deleted_object_count": len(keys),
+        })
+    if len(sidecars) != int(persistence.get("deleted_key_sidecar_count") or 0):
+        raise ValueError("deleted-key sidecar-count mismatch")
+    node_writes = int(
+        persistence.get("node_complete_run_state_write_count") or 0
+    )
+    coordinator_writes = int(
+        persistence.get("coordinator_complete_run_state_write_count") or 0
+    )
+    total_writes = int(
+        persistence.get("total_complete_run_state_write_count") or 0
+    )
+    legacy_total = int(
+        persistence.get("complete_run_state_write_count") or 0
+    )
+    if total_writes != node_writes + coordinator_writes:
+        raise ValueError("complete run-state write count mismatch")
+    if "complete_run_state_write_count" in persistence and legacy_total != total_writes:
+        raise ValueError("legacy complete run-state write count is not an exact total alias")
+    return {
+        "status": "verified",
+        "mutation_journal_path": str(journal_path),
+        "mutation_journal_bytes": len(body),
+        "mutation_journal_sha256": expected_sha256,
+        "mutation_journal_event_count": len(lines),
+        "mutation_journal_tail_event_sha256": previous_recomputed_sha256,
+        "event_type_counts": event_types,
+        "publication_schedule_sha256": schedule_sha256,
+        "scheduled_changed_object_count": total_schedule_positions,
+        "deleted_key_sidecars": sidecars,
+        "compact_checkpoint_count": int(
+            persistence.get("compact_checkpoint_count") or 0
+        ),
+        "node_complete_run_state_write_count": int(
+            persistence.get("node_complete_run_state_write_count")
+            or persistence.get("complete_run_state_write_count")
+            or 0
+        ),
+        "coordinator_complete_run_state_write_count": int(
+            persistence.get("coordinator_complete_run_state_write_count") or 0
+        ),
+        "total_complete_run_state_write_count": int(
+            persistence.get("total_complete_run_state_write_count")
+            or (
+                int(
+                    persistence.get("node_complete_run_state_write_count")
+                    or persistence.get("complete_run_state_write_count")
+                    or 0
+                )
+                + int(
+                    persistence.get("coordinator_complete_run_state_write_count")
+                    or 0
+                )
+            )
+        ),
+        "mutation_journal_flush_count": int(
+            persistence.get("mutation_journal_flush_count") or 0
+        ),
+    }
+
+
 def run_v2_final_verification(
     *,
     run_state: dict[str, Any],
@@ -20962,6 +21665,19 @@ def run_v2_final_verification(
         ),
     )
     remaining_scopes: list[dict[str, Any]] = []
+    try:
+        apply_persistence_artifacts = verify_apply_persistence_artifacts(run_state)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        apply_persistence_artifacts = {
+            "status": "failed",
+            "error": str(exc),
+        }
+    if require_remote_state and apply_persistence_artifacts.get("status") != "verified":
+        remaining_scopes.append({
+            "stage": "canonical_apply_persistence",
+            "gap_type": "apply_persistence_artifact_verification_failed",
+            "evidence": apply_persistence_artifacts,
+        })
     remaining_scopes.extend(_validate_v2_timeseries_bindings(
         conn=conn, view_root=view_root, config=config,
     ))
@@ -21068,10 +21784,13 @@ def run_v2_final_verification(
             "object_key": f"{prefix}/",
             "r2_delete_verified": bool(prefix_entry.get("deletion_verified")),
             "deleted_object_count": int(prefix_entry.get("deleted_object_count") or 0),
-            "deleted_object_keys": sorted({
-                str(value) for value in list(prefix_entry.get("deleted_object_keys") or [])
-                if str(value)
-            }),
+            "deleted_keys_sha256": prefix_entry.get("deleted_keys_sha256"),
+            "deleted_keys_sidecar_path": prefix_entry.get(
+                "deleted_keys_sidecar_path"
+            ),
+            "deleted_keys_sidecar_bytes": prefix_entry.get(
+                "deleted_keys_sidecar_bytes"
+            ),
             "superseded_by_verified_write": False,
         }
         r2_delete_verification_evidence.append(delete_evidence)
@@ -21093,6 +21812,7 @@ def run_v2_final_verification(
         "local_object_resolution": "structurally_validated_overlay_then_proposed_tombstone_then_dropbox",
         "r2_get_verification_evidence": verification_evidence,
         "r2_delete_verification_evidence": r2_delete_verification_evidence,
+        "apply_persistence_artifacts": apply_persistence_artifacts,
         "application_failures": application_failures,
         "r2_objects_written": len(r2_written_keys),
         "r2_objects_deleted": sum(
@@ -21206,11 +21926,7 @@ def record_integrity_object_operations(
                 str(prefix_entry.get("status") or "planned"), prefix_entry.get("error"), now_iso,
             ),
         )
-        for deleted_key in sorted({
-            str(value)
-            for value in list(prefix_entry.get("deleted_object_keys") or [])
-            if str(value)
-        }):
+        for deleted_key in _verified_deleted_object_keys(run_state, prefix_entry):
             conn.execute(
                 """
                 INSERT INTO integrity_object_operations (
@@ -21246,26 +21962,126 @@ def run_canonical_apply_executor(
         "--run-state-json", str(run_state["run_state_path"]),
         "--write-r2",
     ]
-    completed = subprocess.run(
+    process = subprocess.Popen(
         command,
         cwd=repo_root,
         env={**os.environ, **{str(key): str(value) for key, value in env.items()}},
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        check=False,
     )
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+
+    def _drain_apply_output(
+        stream: Any, destination: list[str], *, emit_progress: bool,
+    ) -> None:
+        for line in iter(stream.readline, ""):
+            destination.append(line)
+            if emit_progress:
+                log.info("canonical apply %s", line.rstrip())
+        stream.close()
+
+    stdout_thread = threading.Thread(
+        target=_drain_apply_output,
+        args=(process.stdout, stdout_lines),
+        kwargs={"emit_progress": False},
+        daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=_drain_apply_output,
+        args=(process.stderr, stderr_lines),
+        kwargs={"emit_progress": True},
+        daemon=True,
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+    process.wait()
+    stdout_thread.join()
+    stderr_thread.join()
+    stdout = "".join(stdout_lines)
+    stderr = "".join(stderr_lines)
     try:
-        output = json.loads(completed.stdout) if completed.stdout.strip() else {}
+        output = json.loads(stdout) if stdout.strip() else {}
     except json.JSONDecodeError:
         output = {}
     refreshed = json.loads(Path(str(run_state["run_state_path"])).read_text(encoding="utf-8"))
     run_state.clear()
     run_state.update(refreshed)
-    if completed.returncode != 0:
-        error = _truncate_text(completed.stderr or completed.stdout or "canonical apply failed", 4000)
-        log.error("canonical apply executor failed exit_code=%s error=%s", completed.returncode, error)
-        return {"status": "failed", "exit_code": completed.returncode, "error": error, "output": output}
+    if process.returncode != 0:
+        error = _tail_bytes(stderr or stdout or "canonical apply failed", 4000)
+        log.error("canonical apply executor failed exit_code=%s error=%s", process.returncode, error)
+        apply_failure = run_state.get("apply") or {}
+        return {
+            "status": "failed",
+            "exit_code": process.returncode,
+            "error": error,
+            "output": output,
+            "original_apply_error": apply_failure.get("error"),
+            "failure_checkpoint": apply_failure.get("failure_checkpoint"),
+            "failed_operation": apply_failure.get("failed_operation"),
+            "last_completed_day_utc": apply_failure.get(
+                "last_completed_day_utc"
+            ),
+            "last_completed_publication_level": apply_failure.get(
+                "last_completed_publication_level"
+            ),
+            "later_selected_days_untouched": apply_failure.get(
+                "later_selected_days_untouched"
+            ),
+            "untouched_later_selected_days": apply_failure.get(
+                "untouched_later_selected_days"
+            ),
+        }
     return {"status": "succeeded", "exit_code": 0, "output": output}
+
+
+def checkpoint_apply_progress_from_python(
+    run_state: dict[str, Any], *, reason: str, current_phase: str,
+    status: str | None = None,
+) -> bool:
+    progress_path_raw = ((run_state.get("apply") or {}).get("persistence") or {}).get(
+        "apply_progress_path"
+    )
+    if not progress_path_raw:
+        return False
+    progress_path = _resolve_run_scoped_apply_artifact(run_state, progress_path_raw)
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    if not isinstance(progress, dict):
+        raise ValueError("apply progress checkpoint is not a JSON object")
+    progress["current_phase"] = current_phase
+    progress["current_publication_stage"] = current_phase
+    if status is not None:
+        progress["status"] = status
+    progress["last_checkpoint_reason"] = reason
+    progress["last_checkpoint_at_utc"] = fmt_iso(utc_now())
+    progress["compact_checkpoint_count"] = int(
+        progress.get("compact_checkpoint_count") or 0
+    ) + 1
+    temporary_path = progress_path.with_name(progress_path.name + ".tmp")
+    with temporary_path.open("w", encoding="utf-8") as handle:
+        json.dump(progress, handle, indent=2, sort_keys=True, default=str)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    temporary_path.replace(progress_path)
+    directory_descriptor = os.open(progress_path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
+    persistence = (run_state.get("apply") or {}).get("persistence")
+    if isinstance(persistence, dict):
+        persistence["compact_checkpoint_count"] = progress[
+            "compact_checkpoint_count"
+        ]
+    run_state["apply_progress"] = {
+        "path": str(progress_path),
+        "status": progress.get("status"),
+        "current_phase": current_phase,
+        "last_completed_day_utc": progress.get("last_completed_day_utc"),
+    }
+    return True
 
 
 def resolve_history_writer_database_url(env: Mapping[str, str]) -> str:
@@ -22851,6 +23667,20 @@ def summarize_ordered_apply_verification(
 ) -> dict[str, Any]:
     """Accept dedicated SOS history from the ordered per-object apply audit."""
     remaining_scopes: list[dict[str, Any]] = []
+    apply_status = str(apply_result.get("status") or "")
+    try:
+        apply_persistence_artifacts = verify_apply_persistence_artifacts(run_state)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        apply_persistence_artifacts = {"status": "failed", "error": str(exc)}
+    if (
+        apply_status == "succeeded"
+        and apply_persistence_artifacts.get("status") != "verified"
+    ):
+        remaining_scopes.append({
+            "stage": "canonical_apply_persistence",
+            "gap_type": "apply_persistence_artifact_verification_failed",
+            "evidence": apply_persistence_artifacts,
+        })
     written_keys: list[str] = []
     verification_evidence: list[dict[str, Any]] = []
     for object_key, raw_entry in sorted(dict(run_state.get("objects") or {}).items()):
@@ -22897,6 +23727,13 @@ def summarize_ordered_apply_verification(
             "prefix": str(raw_prefix.get("prefix") or ""),
             "deletion_verified": bool(raw_prefix.get("deletion_verified")),
             "deleted_object_count": int(raw_prefix.get("deleted_object_count") or 0),
+            "deleted_keys_sha256": raw_prefix.get("deleted_keys_sha256"),
+            "deleted_keys_sidecar_path": raw_prefix.get(
+                "deleted_keys_sidecar_path"
+            ),
+            "deleted_keys_sidecar_bytes": raw_prefix.get(
+                "deleted_keys_sidecar_bytes"
+            ),
         }
         deletion_evidence.append(evidence)
         if evidence["deletion_verified"]:
@@ -22905,9 +23742,8 @@ def summarize_ordered_apply_verification(
             remaining_scopes.append({
                 "stage": "ordered_apply_verification",
                 "object_key": f"{evidence['prefix']}/",
-                "gap_type": "selected_prefix_deletion_not_verified",
+                "gap_type": "complete_day_deletion_not_verified",
             })
-    apply_status = str(apply_result.get("status") or "")
     if apply_status not in {"succeeded", "skipped_noop"}:
         remaining_scopes.append({
             "stage": "canonical_apply",
@@ -22924,13 +23760,14 @@ def summarize_ordered_apply_verification(
         "second_broad_r2_scan_invoked": False,
         "r2_get_verification_evidence": verification_evidence,
         "r2_delete_verification_evidence": deletion_evidence,
+        "apply_persistence_artifacts": apply_persistence_artifacts,
         "global_index_finalization": run_state.get("global_index_finalization"),
         "r2_objects_written": len(written_keys),
         "r2_objects_deleted": deleted_object_count,
         "r2_objects_changed": len(written_keys) + deleted_object_count,
         "remaining_gap_count": len(remaining_scopes),
         "remaining_scopes": remaining_scopes,
-        "final_protected_connector_r2_verification_status": (
+        "final_sos_light_r2_verification_status": (
             ("succeeded" if not remaining_scopes else "failed")
             if run_state.get("execution_path")
             == SOS_HISTORICAL_REPLACEMENT_EXECUTION_PATH
@@ -22982,12 +23819,9 @@ def run_v2_integrity_repair_flow(
         resolved_protected_connector_ids = sorted({
             int(value) for value in (protected_connector_ids or [])
         })
-        if not resolved_protected_connector_ids or not (
-            allowed_connector_ids <= set(resolved_protected_connector_ids)
-        ):
+        if resolved_protected_connector_ids != [1]:
             raise RuntimeError(
-                "dedicated SOS historical replacement requires every selected "
-                "mutation connector to be protected"
+                "SOS-light currently requires protected connector IDs exactly [1]"
             )
         explicit_selected_partitions = build_dedicated_sos_selected_partitions(
             from_day=from_day,
@@ -22997,11 +23831,11 @@ def run_v2_integrity_repair_flow(
         )
         run_state.update({
             "execution_path": SOS_HISTORICAL_REPLACEMENT_EXECUTION_PATH,
+            "mode": "sos-light",
             "dedicated_sos_historical_replacement": True,
             "mutation_connector_ids": [1],
             "protected_connector_ids": resolved_protected_connector_ids,
             "selected_mutation_connector_ids": [1],
-            "protected_connector_validation_status": "pending_proposal_graph",
             "aqi_policy": "bypassed_observation_history_only",
             "target_authority": "explicit_selected_scope",
             "explicit_selected_partitions": explicit_selected_partitions,
@@ -23136,6 +23970,10 @@ def run_v2_integrity_repair_flow(
     if observation_failed:
         record_blocked_scope(run_state, {"stage": "observs_manifests", "reason": "observation_repair_failed"})
     _record_metadata_executor_overlay(run_state=run_state, executor_result=metadata, dry_run=dry_run)
+    if dedicated_sos_historical_replacement and not observation_failed and str(
+        metadata.get("status") or ""
+    ) not in {"failed", "blocked_dependency"}:
+        assemble_sos_light_complete_days(run_state)
     observation_manifest_status = str(metadata.get("manifest_status") or metadata.get("status") or "not_run")
     observation_index_status = str(metadata.get("index_status") or metadata.get("status") or "not_run")
     observation_stages_verified = not observation_failed and observation_manifest_status not in {
@@ -23618,20 +24456,57 @@ def run_v2_integrity_repair_flow(
             int(entry.get("connector_id") or 0),
         ) not in repaired_current_state_keys
     ]
-    current_state_reconciliation = run_current_state_reconciliation(
-        conn=conn,
-        env_name=env_name,
-        integrity_run_id=f"{env_name}:{run_id}",
-        env=env,
-        scope_entries=current_state_scopes,
-        dry_run=dry_run,
-        final_verification=final_verification,
-        log=log,
-        dedicated_partition_entries=(
-            all_observation_repair_entries
-            if dedicated_sos_historical_replacement else None
-        ),
-    )
+    canonical_apply_succeeded = apply_result.get("status") == "succeeded"
+    if canonical_apply_succeeded:
+        checkpoint_apply_progress_from_python(
+            run_state,
+            reason="before_current_state_reconciliation",
+            current_phase="current_state_reconciliation",
+            status="running",
+        )
+        log.info("canonical apply current-state reconciliation started")
+    try:
+        current_state_reconciliation = run_current_state_reconciliation(
+            conn=conn,
+            env_name=env_name,
+            integrity_run_id=f"{env_name}:{run_id}",
+            env=env,
+            scope_entries=current_state_scopes,
+            dry_run=dry_run,
+            final_verification=final_verification,
+            log=log,
+            dedicated_partition_entries=(
+                all_observation_repair_entries
+                if dedicated_sos_historical_replacement else None
+            ),
+        )
+    except Exception:
+        if canonical_apply_succeeded:
+            checkpoint_apply_progress_from_python(
+                run_state,
+                reason="current_state_reconciliation_failure",
+                current_phase="current_state_reconciliation_failed",
+                status="failed",
+            )
+            log.exception("canonical apply current-state reconciliation failed")
+        raise
+    if canonical_apply_succeeded:
+        reconciliation_failed = current_state_reconciliation.get(
+            "overall_status"
+        ) in {"failed", "partial_failure", "blocked_dependency"}
+        checkpoint_apply_progress_from_python(
+            run_state,
+            reason="after_current_state_reconciliation",
+            current_phase="current_state_reconciliation_completed",
+            status="failed" if reconciliation_failed else "succeeded",
+        )
+        final_verification["apply_persistence_artifacts"] = (
+            verify_apply_persistence_artifacts(run_state)
+        )
+        log.info(
+            "canonical apply current-state reconciliation completed status=%s",
+            current_state_reconciliation.get("overall_status"),
+        )
     current_state_reconciliation["latest_snapshot_auth_preflight"] = dict(
         auth_preflight
     )
@@ -23723,8 +24598,8 @@ def run_v2_integrity_repair_flow(
         if dedicated_sos_historical_replacement
         else list(CANONICAL_REPAIR_STAGE_ORDER)
     )
-    protected_preservation = (
-        dict(run_state.get("protected_connector_preservation") or {})
+    sos_light = (
+        dict(run_state.get("sos_light") or {})
         if dedicated_sos_historical_replacement else {}
     )
     result = {
@@ -23739,6 +24614,7 @@ def run_v2_integrity_repair_flow(
         "dedicated_sos_historical_replacement": bool(
             dedicated_sos_historical_replacement
         ),
+        "mode": "sos-light" if dedicated_sos_historical_replacement else None,
         "mutation_connector_ids": [1] if dedicated_sos_historical_replacement else None,
         "protected_connector_ids": (
             list(run_state.get("protected_connector_ids") or [])
@@ -23747,36 +24623,8 @@ def run_v2_integrity_repair_flow(
         "selected_mutation_connector_ids": (
             [1] if dedicated_sos_historical_replacement else None
         ),
-        "protected_connector_preservation": (
-            protected_preservation
-            if dedicated_sos_historical_replacement else None
-        ),
-        "protected_connector_validation_status": (
-            protected_preservation.get("protected_connector_validation_status")
-            if dedicated_sos_historical_replacement else None
-        ),
-        "healthy_unprotected_children_preserved": (
-            protected_preservation.get("healthy_unprotected_children_preserved")
-            if dedicated_sos_historical_replacement else None
-        ),
-        "unprotected_pollutant_omission_count": (
-            protected_preservation.get("unprotected_pollutant_omission_count")
-            if dedicated_sos_historical_replacement else None
-        ),
-        "unprotected_connector_omission_count": (
-            protected_preservation.get("unprotected_connector_omission_count")
-            if dedicated_sos_historical_replacement else None
-        ),
-        "unprotected_day_omission_count": (
-            protected_preservation.get("unprotected_day_omission_count")
-            if dedicated_sos_historical_replacement else None
-        ),
-        "unprotected_omissions": (
-            protected_preservation.get("unprotected_omissions")
-            if dedicated_sos_historical_replacement else None
-        ),
-        "permitted_parent_metadata_rewrites": (
-            protected_preservation.get("permitted_parent_metadata_rewrites")
+        "sos_light": (
+            sos_light
             if dedicated_sos_historical_replacement else None
         ),
         "bypassed_stages": (
@@ -24154,10 +25002,9 @@ def select_sos_historical_replacement_route(
             f"connector_id=1; resolved_connector_ids={connector_ids}"
         )
     protected_ids = result["protected_connector_ids"]
-    if not protected_ids:
+    if protected_ids != [1]:
         raise RuntimeError(
-            "dedicated SOS historical replacement requires a non-empty "
-            "protected connector set"
+            "SOS-light currently requires protected connector IDs exactly [1]"
         )
     unprotected_selected = sorted(set(connector_ids) - set(protected_ids))
     if unprotected_selected:
@@ -26023,48 +26870,41 @@ def format_summary_md(s: dict[str, Any]) -> str:
         "",
     ]
 
-    preservation = (s.get("repair_flow") or {}).get(
-        "protected_connector_preservation"
-    ) or {}
-    if preservation:
-        omissions = list(preservation.get("unprotected_omissions") or [])
+    sos_light = (s.get("repair_flow") or {}).get("sos_light") or {}
+    if sos_light:
+        warnings = list(sos_light.get("dropbox_warnings") or [])
         lines.extend([
-            "## Protected connector preservation",
+            "## SOS-light complete-day replacement",
             "",
-            "- Protected connector IDs: "
-            + json.dumps(preservation.get("protected_connector_ids") or []),
-            "- Selected mutation connector IDs: "
-            + json.dumps(
-                preservation.get("selected_mutation_connector_ids") or []
-            ),
-            "- Protected validation: "
-            + str(preservation.get("protected_connector_validation_status")),
-            "- Healthy unprotected children preserved: "
-            + str(preservation.get("healthy_unprotected_children_preserved") or 0),
-            "- Unprotected pollutant omissions: "
-            + str(preservation.get("unprotected_pollutant_omission_count") or 0),
-            "- Unprotected connector omissions: "
-            + str(preservation.get("unprotected_connector_omission_count") or 0),
-            "- Unprotected day omissions: "
-            + str(preservation.get("unprotected_day_omission_count") or 0),
-            "- Omitted unprotected children mutated: "
-            + str(bool(preservation.get("omitted_unprotected_children_mutated"))),
-            "- Permitted parent metadata rewrites: "
-            + (", ".join(
-                preservation.get("permitted_parent_metadata_rewrites") or []
-            ) or "(none)"),
+            "- Mode: sos-light",
+            "- Assembly authorities: "
+            + ", ".join(sos_light.get("assembly_authorities") or []),
+            "- Old live R2 observation bodies used: "
+            + str(bool(sos_light.get("old_live_r2_observation_bodies_used"))),
+            "- Complete days: " + str(sos_light.get("complete_day_count") or 0),
+            "- Complete-day uploads: "
+            + str(sos_light.get("complete_day_upload_count") or 0),
+            "- Dropbox warnings: "
+            + str(sos_light.get("dropbox_warning_count") or 0),
+            "- Dropbox selected days absent: "
+            + str(sos_light.get("dropbox_day_absent_count") or 0),
+            "- Dropbox absent-day warnings: "
+            + str(sos_light.get("dropbox_day_warning_count") or 0),
+            "- Dropbox absent days: "
+            + (", ".join(sos_light.get("dropbox_day_absent_days") or []) or "(none)"),
+            "- Dropbox omissions: "
+            + str(sos_light.get("dropbox_omission_count") or 0),
         ])
-        if omissions:
-            lines.extend(["", "### Unprotected omission warnings", ""])
-            for omission in omissions:
+        if warnings:
+            lines.extend(["", "### Dropbox warnings", ""])
+            for warning in warnings:
                 lines.append(
                     "- WARNING "
-                    f"day={omission.get('day_utc')} "
-                    f"connector={omission.get('connector_id')} "
-                    f"pollutant={omission.get('pollutant_code') or '(connector)'} "
-                    f"key={omission.get('object_key')} "
-                    f"classification={omission.get('classification')} "
-                    f"reason={omission.get('reason')}"
+                    f"day={warning.get('day_utc')} "
+                    f"connector={warning.get('connector_id')} "
+                    f"key={warning.get('object_key')} "
+                    f"classification={warning.get('classification')} "
+                    f"reason={warning.get('reason')}"
                 )
         lines.append("")
 
@@ -26298,6 +27138,34 @@ def format_summary_md(s: dict[str, Any]) -> str:
                     f"- Error: {database_result.get('error') or '(none)'}",
                     "",
                 ])
+        canonical_apply = repair_flow.get("canonical_apply") or {}
+        if canonical_apply.get("status") == "failed":
+            failure_checkpoint = canonical_apply.get("failure_checkpoint") or {}
+            lines.extend([
+                "### Canonical apply failure evidence",
+                "",
+                f"- Original apply error: {canonical_apply.get('original_apply_error') or canonical_apply.get('error') or '(none)'}",
+                f"- Failure checkpoint attempted: {bool(failure_checkpoint.get('attempted'))}",
+                f"- Failure checkpoint succeeded: {bool(failure_checkpoint.get('succeeded'))}",
+                f"- Failure checkpoint error: {failure_checkpoint.get('error') or '(none)'}",
+                "- Last successful checkpoint: " + json.dumps(
+                    failure_checkpoint.get("last_successfully_written_checkpoint"),
+                    sort_keys=True,
+                    default=str,
+                ),
+                "- Failed operation: " + json.dumps(
+                    canonical_apply.get("failed_operation"),
+                    sort_keys=True,
+                    default=str,
+                ),
+                f"- Last completed publication level: {canonical_apply.get('last_completed_publication_level') or '(none)'}",
+                f"- Later selected days remained untouched: {bool(canonical_apply.get('later_selected_days_untouched'))}",
+                "- Untouched later selected days: " + json.dumps(
+                    canonical_apply.get("untouched_later_selected_days") or [],
+                    sort_keys=True,
+                ),
+                "",
+            ])
         final_verification = repair_flow.get("final_verification") or {}
         if final_verification:
             lines.extend([
@@ -26312,6 +27180,25 @@ def format_summary_md(s: dict[str, Any]) -> str:
                 f"- Remaining gap count: {final_verification.get('remaining_gap_count', '(not run)')}",
                 "",
             ])
+            persistence_artifacts = final_verification.get(
+                "apply_persistence_artifacts"
+            ) or {}
+            if persistence_artifacts:
+                lines.extend([
+                    f"- Apply persistence evidence: {persistence_artifacts.get('status') or '(none)'}",
+                    f"- Mutation journal: {persistence_artifacts.get('mutation_journal_path') or '(none)'}",
+                    f"- Mutation journal bytes: {int(persistence_artifacts.get('mutation_journal_bytes') or 0)}",
+                    f"- Mutation journal SHA-256: {persistence_artifacts.get('mutation_journal_sha256') or '(none)'}",
+                    f"- Mutation journal events: {int(persistence_artifacts.get('mutation_journal_event_count') or 0)}",
+                    f"- Mutation journal tail event SHA-256: {persistence_artifacts.get('mutation_journal_tail_event_sha256') or '(none)'}",
+                    f"- Mutation journal flushes: {int(persistence_artifacts.get('mutation_journal_flush_count') or 0)}",
+                    f"- Compact checkpoints: {int(persistence_artifacts.get('compact_checkpoint_count') or 0)}",
+                    f"- Node complete run-state writes: {int(persistence_artifacts.get('node_complete_run_state_write_count') or 0)}",
+                    f"- Coordinator complete run-state writes: {int(persistence_artifacts.get('coordinator_complete_run_state_write_count') or 0)}",
+                    f"- Total complete run-state writes: {int(persistence_artifacts.get('total_complete_run_state_write_count') or 0)}",
+                    f"- Deleted-key sidecars: {len(list(persistence_artifacts.get('deleted_key_sidecars') or []))}",
+                    "",
+                ])
             for scope in list(final_verification.get("remaining_scopes") or [])[:100]:
                 lines.append(
                     "- Remaining: " + json.dumps(scope, sort_keys=True, default=str)
@@ -27700,13 +28587,11 @@ def main(argv: list[str]) -> int:
             )
             repair_overlay["sos_historical_route"] = dict(sos_historical_route)
             if dedicated_sos_historical_replacement:
+                repair_overlay["mode"] = "sos-light"
                 repair_overlay["protected_connector_ids"] = list(
                     protected_connector_ids or []
                 )
                 repair_overlay["selected_mutation_connector_ids"] = [1]
-                repair_overlay["protected_connector_validation_status"] = (
-                    "pending_proposal_graph"
-                )
             repair_overlay["requested_from_day"] = from_day
             repair_overlay["requested_to_day"] = to_day
             repair_overlay["requested_repair_pollutants"] = list(
@@ -28080,9 +28965,7 @@ def main(argv: list[str]) -> int:
             ) or 0
         )
         warnings_count_total += int(
-            ((repair_flow.get("protected_connector_preservation") or {}).get(
-                "warning_count"
-            )) or 0
+            ((repair_flow.get("sos_light") or {}).get("warning_count")) or 0
         )
 
         metrics: dict[str, Any] = {
@@ -28386,6 +29269,16 @@ def main(argv: list[str]) -> int:
         log.info("report_md=%s", md_path)
         if repair_overlay is not None and status == "ok" and not args.dry_run:
             cleanup = cleanup_successful_repair_overlay(repair_overlay)
+            summary["repair_overlay_cleanup"] = cleanup
+            json_path, md_path = write_reports(
+                env["UK_AQ_HISTORY_INTEGRITY_REPORT_DIR"], run_compact, summary
+            )
+            log.info(
+                "reports refreshed after final complete-state cleanup write "
+                "report_json=%s report_md=%s",
+                json_path,
+                md_path,
+            )
             log.info("successful repair overlay cleanup=%s", json.dumps(cleanup, sort_keys=True))
         log.info("done status=%s runtime_seconds=%s", status, runtime_seconds)
         if daily_task_health_enabled:
