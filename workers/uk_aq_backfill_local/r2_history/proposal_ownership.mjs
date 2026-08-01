@@ -250,7 +250,7 @@ export async function inspectSourceDerivedObservationManifestOwner({
     dependencyIdentities[partKey] = {
       sha256: sha256Hex(ownedPart.body),
       bytes: ownedPart.body.byteLength,
-      source: "overlay",
+      source: "planned_overlay",
     };
   }
   const physicalSchema = combineObservationHistoryPhysicalSchemas(physicalSchemas);

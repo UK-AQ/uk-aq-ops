@@ -162,11 +162,32 @@ function publicationStageRank(stage) {
   return 750;
 }
 
-function scheduleScope(object, selectedDays) {
-  if (object.key.startsWith("history/_index_v2/")) return selectedDays.length;
-  const dayUtc = mutationContext(object.key).day_utc;
+function scheduleScope(object, selectedDays, publicationMode) {
+  if (publicationMode === "generic") {
+    if (objectPublicationStage(object) === "latest_snapshot") return [3, 0, 0];
+    if (object.key.startsWith("history/_index_v2/")) return [2, 0, 0];
+    const context = mutationContext(object.key);
+    const dayIndex = context.day_utc ? selectedDays.indexOf(context.day_utc) : -1;
+    if (dayIndex < 0) return [2, 0, 0];
+    if (context.connector_id) return [0, dayIndex, context.connector_id];
+    return [1, dayIndex, 0];
+  }
+  if (objectPublicationStage(object) === "latest_snapshot") return [selectedDays.length, 3, 0];
+  if (object.key.startsWith("history/_index_v2/")) return [selectedDays.length, 2, 0];
+  const context = mutationContext(object.key);
+  const dayUtc = context.day_utc;
   const dayIndex = dayUtc ? selectedDays.indexOf(dayUtc) : -1;
-  return dayIndex >= 0 ? dayIndex : selectedDays.length - 1;
+  if (dayIndex < 0) return [selectedDays.length, 1, 0];
+  if (context.connector_id) return [dayIndex, 0, context.connector_id];
+  return [dayIndex, 1, 0];
+}
+
+function compareScheduleScope(left, right) {
+  for (let index = 0; index < Math.max(left.length, right.length); index += 1) {
+    const difference = Number(left[index] || 0) - Number(right[index] || 0);
+    if (difference) return difference;
+  }
+  return 0;
 }
 
 function assertNoPlaceholderGeneratedParent(object) {
@@ -198,7 +219,15 @@ export function canonicalPublicationScheduleHashInput(schedule) {
   return Buffer.from(JSON.stringify(recursivelySortJsonValue(hashFields)), "utf8");
 }
 
-export function buildFrozenPublicationSchedule({ proposal, selectedDays = [] }) {
+export function buildFrozenPublicationSchedule({
+  proposal,
+  selectedDays = [],
+  publicationMode = "generic",
+  runState = null,
+}) {
+  if (!["generic", "sos_light"].includes(publicationMode)) {
+    throw new Error(`Unsupported publication schedule mode: ${publicationMode}`);
+  }
   const objects = proposal?.objects || [];
   const byKey = new Map(objects.map((object) => [object.key, object]));
   if (byKey.size !== objects.length) throw new Error("Publication schedule contains duplicate object keys");
@@ -209,24 +238,28 @@ export function buildFrozenPublicationSchedule({ proposal, selectedDays = [] }) 
   let edgeCount = 0;
   for (const object of objects) {
     assertNoPlaceholderGeneratedParent(object);
-    const dependencies = [...new Set(object.entry.dependencies || [])].sort(bytewiseKeyCompare);
+    const canonicalIdentities = canonicalDependencyIdentities(object.entry);
+    const dependencies = canonicalIdentities.map((identity) => identity.key);
     for (const dependencyKey of dependencies) {
       const dependency = byKey.get(dependencyKey);
       const identity = dependencyIdentity(object.entry, dependencyKey);
-      if (!identity) throw new Error(`Publication dependency identity is unresolved: ${object.key} -> ${dependencyKey}`);
       if (!dependency) {
-        if (!['dropbox', 'overlay'].includes(identity.source)) {
-          throw new Error(`Changed publication dependency is missing from write set: ${object.key} -> ${dependencyKey}`);
-        }
+        validateExternalDependencyRoot({
+          runState,
+          objectKey: object.key,
+          dependencyKey,
+          identity,
+        });
         externalDependencyCounts[identity.source] = (externalDependencyCounts[identity.source] || 0) + 1;
         continue;
       }
       const dependencyStage = objectPublicationStage(dependency);
       const parentStage = objectPublicationStage(object);
-      const dependencyScope = scheduleScope(dependency, dayOrder);
-      const parentScope = scheduleScope(object, dayOrder);
-      if (dependencyScope > parentScope
-        || (dependencyScope === parentScope
+      const dependencyScope = scheduleScope(dependency, dayOrder, publicationMode);
+      const parentScope = scheduleScope(object, dayOrder, publicationMode);
+      const scopeComparison = compareScheduleScope(dependencyScope, parentScope);
+      if (scopeComparison > 0
+        || (scopeComparison === 0
           && publicationStageRank(dependencyStage) > publicationStageRank(parentStage))) {
         throw new Error(`Publication stage conflict: ${dependencyKey} (${dependencyStage}) -> ${object.key} (${parentStage})`);
       }
@@ -236,25 +269,39 @@ export function buildFrozenPublicationSchedule({ proposal, selectedDays = [] }) 
     }
   }
   const ordered = [];
-  while (ordered.length < objects.length) {
-    const eligible = objects.filter((object) => !ordered.includes(object)
-      && indegree.get(object.key) === 0);
-    if (!eligible.length) {
-      const cycleKeys = objects.filter((object) => !ordered.includes(object)).map((object) => object.key).sort(bytewiseKeyCompare);
-      throw new Error(`Publication dependency cycle: ${cycleKeys.join(" -> ")}`);
-    }
-    eligible.sort((left, right) => scheduleScope(left, dayOrder) - scheduleScope(right, dayOrder)
+  const scheduledKeys = new Set();
+  const eligibleCompare = (left, right) => compareScheduleScope(
+    scheduleScope(left, dayOrder, publicationMode),
+    scheduleScope(right, dayOrder, publicationMode),
+  )
       || publicationStageRank(objectPublicationStage(left)) - publicationStageRank(objectPublicationStage(right))
-      || bytewiseKeyCompare(left.key, right.key));
-    const next = eligible[0];
+      || bytewiseKeyCompare(left.key, right.key);
+  const eligible = objects.filter((object) => indegree.get(object.key) === 0);
+  eligible.sort((left, right) => -eligibleCompare(left, right));
+  while (eligible.length) {
+    const next = eligible.pop();
     ordered.push(next);
-    for (const parentKey of outgoing.get(next.key)) indegree.set(parentKey, indegree.get(parentKey) - 1);
+    scheduledKeys.add(next.key);
+    let addedEligible = false;
+    for (const parentKey of outgoing.get(next.key)) {
+      indegree.set(parentKey, indegree.get(parentKey) - 1);
+      if (indegree.get(parentKey) === 0) {
+        eligible.push(byKey.get(parentKey));
+        addedEligible = true;
+      }
+    }
+    if (addedEligible) eligible.sort((left, right) => -eligibleCompare(left, right));
+  }
+  if (ordered.length !== objects.length) {
+    const cycleKeys = objects.filter((object) => !scheduledKeys.has(object.key)).map((object) => object.key).sort(bytewiseKeyCompare);
+    throw new Error(`Publication dependency cycle: ${cycleKeys.join(" -> ")}`);
   }
   const perStageCounts = {};
   const entries = ordered.map((object, index) => {
     const stage = objectPublicationStage(object);
     perStageCounts[stage] = (perStageCounts[stage] || 0) + 1;
-    const dependencies = [...new Set(object.entry.dependencies || [])].sort(bytewiseKeyCompare);
+    const canonicalIdentities = canonicalDependencyIdentities(object.entry);
+    const dependencies = canonicalIdentities.map((identity) => identity.key);
     return {
       position: index + 1,
       canonical_key: object.key,
@@ -263,11 +310,13 @@ export function buildFrozenPublicationSchedule({ proposal, selectedDays = [] }) 
       publication_stage: stage,
       direct_changed_dependencies: dependencies.filter((key) => byKey.has(key)),
       dependencies,
-      dependency_identities: Object.fromEntries(dependencies.map((key) => [key, dependencyIdentity(object.entry, key)])),
+      dependency_identities: Object.fromEntries(canonicalIdentities.map(({ key, ...identity }) => [key, identity])),
+      canonical_dependency_identities: canonicalIdentities,
     };
   });
   const schedule = {
     contract_version: PUBLICATION_SCHEDULE_CONTRACT_VERSION,
+    publication_mode: publicationMode,
     tie_breaker: "bytewise_utf8_key_among_eligible_nodes",
     day_barrier_order: dayOrder,
     total_positions: entries.length,
@@ -625,10 +674,8 @@ export function createCanonicalGeneratedIndexMutationAdapter({
         const sha256 = sha256Hex(body);
         const scheduled = scheduleByKey.get(key);
         if (!scheduled) throw new Error(`Generated callback attempted unscheduled changed key: ${key}`);
-        const dependencies = [...new Set(generated?.dependencies || [])].sort(bytewiseKeyCompare);
         if (body.byteLength !== Number(generated?.bytes) || sha256 !== generated?.sha256
-          || body.byteLength !== scheduled.proposed_bytes || sha256 !== scheduled.proposed_sha256
-          || JSON.stringify(dependencies) !== JSON.stringify(scheduled.dependencies)) {
+          || body.byteLength !== scheduled.proposed_bytes || sha256 !== scheduled.proposed_sha256) {
           throw new Error(`Generated generic index identity mismatch: ${key}`);
         }
         if (audit[key]?.status === "succeeded") {
@@ -636,6 +683,27 @@ export function createCanonicalGeneratedIndexMutationAdapter({
         }
         const entry = runState.objects?.[key];
         if (!entry) throw new Error(`Frozen generated proposal is unavailable: ${key}`);
+        const callbackSuppliedDependencyContract = Object.hasOwn(generated, "dependencies")
+          || Object.hasOwn(generated, "dependency_identities");
+        if (callbackSuppliedDependencyContract) {
+          if (!Object.hasOwn(generated, "dependencies")
+            || !Object.hasOwn(generated, "dependency_identities")) {
+            throw new Error(`Generated generic index dependency identities are incomplete: ${key}`);
+          }
+          assertFrozenScheduleOperation({
+            object: {
+              key,
+              body,
+              entry: {
+                ...entry,
+                dependencies: generated.dependencies,
+                dependency_identities: generated.dependency_identities,
+              },
+            },
+            scheduled,
+          });
+        }
+        assertFrozenScheduleOperation({ object: { key, entry, body }, scheduled });
         Object.assign(audit[key] ||= {}, entry, { included_in_write_set: true });
         await executeOperation({
           kind: "put",
@@ -846,13 +914,124 @@ function dependencyIdentity(entry, dependencyKey) {
   const identities = entry?.dependency_identities;
   if (!identities || typeof identities !== "object" || Array.isArray(identities)) return null;
   const identity = identities[dependencyKey];
-  if (!identity || typeof identity !== "object") return null;
+  if (!identity || typeof identity !== "object" || Array.isArray(identity)) return null;
   const sha256 = String(identity.sha256 || "").trim().toLowerCase();
   const bytes = Number(identity.bytes);
   if (!/^[a-f0-9]{64}$/.test(sha256) || !Number.isSafeInteger(bytes) || bytes < 0) return null;
-  const source = String(identity.source || "");
+  const source = String(identity.source || "").trim();
   if (!source) return null;
-  return { sha256, bytes, source };
+  if (Object.hasOwn(identity, "key")) return null;
+  return recursivelySortJsonValue({ ...identity, sha256, bytes, source });
+}
+
+export function canonicalDependencyIdentities(entry) {
+  if (entry?.dependencies != null && !Array.isArray(entry.dependencies)) {
+    throw new Error("Publication dependencies must be an array");
+  }
+  const dependencies = (entry?.dependencies || []).map((dependency) => safeKey(dependency));
+  if (new Set(dependencies).size !== dependencies.length) {
+    throw new Error("Publication dependency identity list contains a duplicate dependency key");
+  }
+  const identities = entry?.dependency_identities;
+  if (dependencies.length === 0 && identities == null) return [];
+  if (!identities || typeof identities !== "object" || Array.isArray(identities)) {
+    throw new Error("Publication dependency identities must be an object");
+  }
+  const dependencySet = new Set(dependencies);
+  const rawIdentityKeys = Object.keys(identities);
+  const identityKeys = rawIdentityKeys.map((key) => safeKey(key));
+  if (rawIdentityKeys.some((key, index) => key !== identityKeys[index])
+    || new Set(identityKeys).size !== identityKeys.length
+    || identityKeys.length !== dependencies.length) {
+    throw new Error("Publication dependency identity keys are not an exact unique dependency set");
+  }
+  const unexpected = identityKeys.filter((key) => !dependencySet.has(key));
+  if (unexpected.length) {
+    throw new Error(`Publication dependency identity is not declared: ${unexpected.sort(bytewiseKeyCompare)[0]}`);
+  }
+  const canonical = dependencies.map((dependencyKey) => {
+    const identity = dependencyIdentity(entry, dependencyKey);
+    if (!identity) {
+      throw new Error(`Publication dependency identity is unresolved: ${dependencyKey}`);
+    }
+    return { key: dependencyKey, ...identity };
+  });
+  canonical.sort((left, right) => bytewiseKeyCompare(left.key, right.key));
+  return canonical;
+}
+
+export function assertFrozenScheduleOperation({ object, scheduled, expectedPosition = null }) {
+  if (!scheduled) throw new Error(`Unscheduled changed PUT rejected: ${object?.key || "(unknown)"}`);
+  if (expectedPosition !== null && scheduled.position !== expectedPosition) {
+    throw new Error(`Out-of-order scheduled PUT rejected: expected position ${expectedPosition}, received ${scheduled.position} (${object.key})`);
+  }
+  const actualIdentities = canonicalDependencyIdentities(object.entry);
+  const frozenIdentities = recursivelySortJsonValue(scheduled.canonical_dependency_identities || []);
+  if (object.body.byteLength !== scheduled.proposed_bytes
+    || object.entry.sha256 !== scheduled.proposed_sha256
+    || objectPublicationStage(object) !== scheduled.publication_stage
+    || JSON.stringify(recursivelySortJsonValue(actualIdentities)) !== JSON.stringify(frozenIdentities)) {
+    throw new Error(`Frozen publication schedule identity mismatch: ${object.key}`);
+  }
+  return true;
+}
+
+function changedScopeDeclaresKey(runState, dependencyKey) {
+  const matches = (value) => {
+    if (typeof value === "string") return value === dependencyKey;
+    if (!value || typeof value !== "object") return false;
+    if (Array.isArray(value)) return value.some(matches);
+    if ([value.key, value.object_key, value.canonical_key].some((key) => key === dependencyKey)) return true;
+    return Object.values(value).some(matches);
+  };
+  return matches(runState?.changed_scopes || {});
+}
+
+function proposedDeletionPrefixes(runState) {
+  return (runState?.tombstone_prefixes || [])
+    .filter((entry) => entry?.proposed)
+    .map((entry) => `${safeKey(entry.prefix).replace(/\/+$/, "")}/`);
+}
+
+export function validateExternalDependencyRoot({
+  runState,
+  objectKey,
+  dependencyKey,
+  identity,
+}) {
+  const key = safeKey(dependencyKey);
+  if (!identity || !["dropbox", "overlay"].includes(identity.source)) {
+    throw new Error(`Changed publication dependency is missing from write set: ${objectKey} -> ${key}`);
+  }
+  if (!runState) {
+    throw new Error(`External dependency cannot be pinned without proposal state: ${objectKey} -> ${key}`);
+  }
+  if (runState.objects?.[key]) {
+    throw new Error(`External dependency is also present in the changed write set: ${objectKey} -> ${key}`);
+  }
+  if (changedScopeDeclaresKey(runState, key)) {
+    throw new Error(`Changed object was omitted from the write set: ${objectKey} -> ${key}`);
+  }
+  if (proposedDeletionPrefixes(runState).some((prefix) => key.startsWith(prefix))) {
+    throw new Error(`Proposed deletion would remove an unstaged dependency: ${objectKey} -> ${key}`);
+  }
+  const root = identity.source === "dropbox"
+    ? String(runState.base_dropbox_root || "")
+    : String(runState.overlay_root || "");
+  if (!root) {
+    throw new Error(`${identity.source} external dependency root is unavailable: ${objectKey} -> ${key}`);
+  }
+  const resolvedRoot = path.resolve(root);
+  const localPath = path.resolve(resolvedRoot, ...key.split("/"));
+  if (!localPath.startsWith(`${resolvedRoot}${path.sep}`)
+    || !fs.statSync(localPath, { throwIfNoEntry: false })?.isFile()) {
+    throw new Error(`${identity.source} external dependency is unavailable: ${objectKey} -> ${key}`);
+  }
+  const body = fs.readFileSync(localPath);
+  if (body.byteLength !== identity.bytes || sha256Hex(body) !== identity.sha256) {
+    throw new Error(`${identity.source} external dependency identity changed after planning: ${objectKey} -> ${key}`);
+  }
+  return { key, local_path: localPath, ...identity };
 }
 
 export function validateLocalProposal(runState) {
@@ -864,9 +1043,6 @@ export function validateLocalProposal(runState) {
   const prefixes = Array.isArray(runState.tombstone_prefixes) ? runState.tombstone_prefixes : [];
   if (!objects.length && !prefixes.length) throw new Error("canonical proposal has no planned operations");
   const normalizedObjects = [];
-  const proposedPrefixes = prefixes
-    .filter((entry) => entry?.proposed)
-    .map((entry) => `${safeKey(entry.prefix).replace(/\/+$/, "")}/`);
   for (const [rawKey, entry] of objects) {
     const key = safeKey(rawKey);
     if (!(key.startsWith("history/v2/") || key.startsWith("history/_index_v2/"))
@@ -884,38 +1060,28 @@ export function validateLocalProposal(runState) {
     if (body.byteLength !== Number(entry.bytes) || sha256Hex(body) !== entry.sha256) {
       throw new Error(`Local proposal identity changed after validation: ${key}`);
     }
-    for (const dependency of entry.dependencies || []) {
-      const dependencyKey = safeKey(dependency);
+    const canonicalIdentities = canonicalDependencyIdentities(entry);
+    for (const expectedIdentity of canonicalIdentities) {
+      const dependencyKey = expectedIdentity.key;
       const stagedDependency = runState.objects?.[dependencyKey];
       if (stagedDependency) {
         if (!stagedDependency.structurally_validated
           || !fs.statSync(String(stagedDependency.local_path || ""), { throwIfNoEntry: false })?.isFile()) {
           throw new Error(`Local proposal dependency is not structurally validated: ${key} -> ${dependencyKey}`);
         }
-        const expectedIdentity = dependencyIdentity(entry, dependencyKey);
         const dependencyBody = fs.readFileSync(String(stagedDependency.local_path));
-        if (!expectedIdentity
-          || !["planned_overlay", "overlay"].includes(expectedIdentity.source)
+        if (expectedIdentity.source !== "planned_overlay"
           || dependencyBody.byteLength !== expectedIdentity.bytes
           || sha256Hex(dependencyBody) !== expectedIdentity.sha256) {
           throw new Error(`Staged current-run dependency identity is invalid: ${key} -> ${dependencyKey}`);
         }
       } else {
-        const expectedIdentity = dependencyIdentity(entry, dependencyKey);
-        if (!expectedIdentity || expectedIdentity.source !== "dropbox") {
-          throw new Error(`Dropbox baseline dependency identity is not pinned: ${key} -> ${dependencyKey}`);
-        }
-        if (proposedPrefixes.some((prefix) => dependencyKey.startsWith(prefix))) {
-          throw new Error(`Proposed deletion would remove an unstaged dependency: ${key} -> ${dependencyKey}`);
-        }
-        const baselinePath = path.join(String(runState.base_dropbox_root || ""), dependencyKey);
-        if (!fs.statSync(baselinePath, { throwIfNoEntry: false })?.isFile()) {
-          throw new Error(`Dropbox baseline dependency is unavailable: ${key} -> ${dependencyKey}`);
-        }
-        const baselineBody = fs.readFileSync(baselinePath);
-        if (baselineBody.byteLength !== expectedIdentity.bytes || sha256Hex(baselineBody) !== expectedIdentity.sha256) {
-          throw new Error(`Dropbox baseline dependency identity changed after planning: ${key} -> ${dependencyKey}`);
-        }
+        validateExternalDependencyRoot({
+          runState,
+          objectKey: key,
+          dependencyKey,
+          identity: expectedIdentity,
+        });
       }
     }
     normalizedObjects.push({ key, entry, localPath, body, domain: objectDomain(key) });
@@ -1636,25 +1802,25 @@ function validateFinalParentReferences({ proposal, runState }) {
           differingField: "child_manifest_json",
         });
       } else {
-        const baselinePath = path.join(String(runState.base_dropbox_root || ""), key);
-        const baselineBody = fs.readFileSync(baselinePath);
+        const external = validateExternalDependencyRoot({
+          runState,
+          objectKey: object.key,
+          dependencyKey: key,
+          identity,
+        });
+        const baselineBody = fs.readFileSync(external.local_path);
         childPayload = parseFinalJsonBody({
           key,
           object,
           body: baselineBody,
           differingField: `preserved_child_json:${key}`,
         });
-        if (!identity || identity.source !== "dropbox"
-          || identity.sha256 !== sha256Hex(baselineBody)
-          || identity.bytes !== baselineBody.byteLength) {
-          throw finalProposalError({ key: object.key, object, differingFields: [`preserved_child_identity:${key}`] });
-        }
       }
       if (reference.manifest_hash !== childPayload.manifest_hash) {
         throw finalProposalError({ key: object.key, object, differingFields: [`child_manifest_hash:${key}`] });
       }
       if (child && (!identity || identity.sha256 !== child.entry.sha256 || identity.bytes !== child.body.byteLength
-        || !["overlay", "planned_overlay"].includes(identity.source))) {
+        || identity.source !== "planned_overlay")) {
         throw finalProposalError({ key: object.key, object, differingFields: [`child_dependency_identity:${key}`] });
       }
     }
@@ -1684,16 +1850,17 @@ function validateFinalParentReferences({ proposal, runState }) {
       manifestBody = fs.readFileSync(String(stagedManifest.local_path));
       if (!identity || identity.sha256 !== stagedManifest.sha256
         || identity.bytes !== Number(stagedManifest.bytes)
-        || !["overlay", "planned_overlay"].includes(identity.source)) {
+        || identity.source !== "planned_overlay") {
         throw finalProposalError({ key: object.key, object, differingFields: [`index_manifest_identity:${manifestKey}`] });
       }
     } else {
-      manifestBody = fs.readFileSync(path.join(String(runState.base_dropbox_root || ""), manifestKey));
-      if (!identity || identity.source !== "dropbox"
-        || identity.sha256 !== sha256Hex(manifestBody)
-        || identity.bytes !== manifestBody.byteLength) {
-        throw finalProposalError({ key: object.key, object, differingFields: [`index_manifest_identity:${manifestKey}`] });
-      }
+      const external = validateExternalDependencyRoot({
+        runState,
+        objectKey: object.key,
+        dependencyKey: manifestKey,
+        identity,
+      });
+      manifestBody = fs.readFileSync(external.local_path);
     }
     const manifest = parseFinalJsonBody({
       key: manifestKey,
@@ -2368,7 +2535,12 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
     ].filter(Boolean))].sort();
   let publicationSchedule;
   try {
-    publicationSchedule = buildFrozenPublicationSchedule({ proposal, selectedDays });
+    publicationSchedule = buildFrozenPublicationSchedule({
+      proposal,
+      selectedDays,
+      publicationMode: dedicatedSosProposal.dedicated ? "sos_light" : "generic",
+      runState,
+    });
   } catch (error) {
     runState.apply = {
       status: "failed",
@@ -2556,20 +2728,15 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
     const historyWriterClient = adapters.historyWriterClient;
     if (!historyWriterClient) throw new Error("canonical apply requires one retained PostgreSQL history-writer session");
     const operations = [];
-    const applyDomains = dedicatedSosProposal.dedicated
-      ? ["observations"]
-      : ["observations", "aqilevels"];
-    for (const domain of applyDomains) {
-      for (const prefixEntry of proposal.prefixes.filter((entry) => entry.domain === domain)) {
-        operations.push({ kind: "delete", key: prefixEntry.prefix, prefixEntry });
-      }
-      const objectByKey = new Map(proposal.objects.map((object) => [object.key, object]));
-      for (const scheduleEntry of publicationSchedule.entries) {
-        const object = objectByKey.get(scheduleEntry.canonical_key);
-        if (!object || object.domain !== domain) continue;
-        object.schedule = scheduleEntry;
-        operations.push({ kind: "put", key: object.key, object });
-      }
+    for (const prefixEntry of proposal.prefixes) {
+      operations.push({ kind: "delete", key: prefixEntry.prefix, prefixEntry });
+    }
+    const objectByKey = new Map(proposal.objects.map((object) => [object.key, object]));
+    for (const scheduleEntry of publicationSchedule.entries) {
+      const object = objectByKey.get(scheduleEntry.canonical_key);
+      if (!object) throw new Error(`Scheduled object is unavailable during apply setup: ${scheduleEntry.canonical_key}`);
+      object.schedule = scheduleEntry;
+      operations.push({ kind: "put", key: object.key, object });
     }
     const connectorGroups = new Map();
     const dayGroups = new Map();
@@ -2616,17 +2783,7 @@ export async function applyValidatedProposal({ runStatePath, r2, adapters = {} }
       } else {
         const { object } = operation;
         const scheduled = scheduleByKey.get(object.key);
-        const actualDependencies = [...new Set(object.entry.dependencies || [])].sort(bytewiseKeyCompare);
-        if (!scheduled) throw new Error(`Unscheduled changed PUT rejected: ${object.key}`);
-        if (scheduled.position !== nextSchedulePosition) {
-          throw new Error(`Out-of-order scheduled PUT rejected: expected position ${nextSchedulePosition}, received ${scheduled.position} (${object.key})`);
-        }
-        if (object.body.byteLength !== scheduled.proposed_bytes
-          || object.entry.sha256 !== scheduled.proposed_sha256
-          || objectPublicationStage(object) !== scheduled.publication_stage
-          || JSON.stringify(actualDependencies) !== JSON.stringify(scheduled.dependencies)) {
-          throw new Error(`Frozen publication schedule identity mismatch: ${object.key}`);
-        }
+        assertFrozenScheduleOperation({ object, scheduled, expectedPosition: nextSchedulePosition });
         assertPublicationDependenciesVerified({ object, runState });
         await verifyLiveObservationPartition({
           r2,
