@@ -63,9 +63,25 @@ config = {
 }
 
 out_path = Path(str(os.getenv("UKAQ_CONFIG_OUT_PATH", "dashboard/assets/config.js")))
+patch_paths = [
+    Path("dashboard/assets/storage_coverage_patch.js"),
+    Path("dashboard/assets/storage_coverage_missing_r2_hotfix.js"),
+    Path("dashboard/assets/storage_coverage_backup_only_style_patch.js"),
+]
+for patch_path in patch_paths:
+    if not patch_path.is_file():
+        raise SystemExit(f"Missing dashboard storage coverage patch: {patch_path}")
+
 out_path.parent.mkdir(parents=True, exist_ok=True)
 out_path.write_text(
-    "window.UKAQ_OPS_CONFIG = " + json.dumps(config, indent=2) + ";\n",
+    "window.UKAQ_OPS_CONFIG = "
+    + json.dumps(config, indent=2)
+    + ";\n\n"
+    + "\n\n".join(
+        patch_path.read_text(encoding="utf-8")
+        for patch_path in patch_paths
+    )
+    + "\n",
     encoding="utf-8",
 )
 print(f"Wrote dashboard config: {out_path.resolve()}")
@@ -76,6 +92,6 @@ generate_dashboard_config
 
 export DASHBOARD_UPSTREAM_BEARER_TOKEN=""
 
-exec "$PYTHON_BIN" local/dashboard/server/uk_aq_dashboard_api.py \
+exec "$PYTHON_BIN" local/dashboard/server/uk_aq_dashboard_direct_r2_patch.py \
   --host "${HOST:-127.0.0.1}" \
   --port "${PORT:-8000}"
