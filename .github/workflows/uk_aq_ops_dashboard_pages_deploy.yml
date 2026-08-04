@@ -20,11 +20,11 @@ jobs:
     env:
       UK_AQ_CF_ACCOUNT_ID_UKAQ: ${{ vars.UK_AQ_CF_ACCOUNT_ID_UKAQ || vars.UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID || '' }}
       UK_AQ_CF_API_TOKEN_UKAQ: ${{ secrets.UK_AQ_CF_API_TOKEN_UKAQ || secrets.UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN || '' }}
-      UK_AQ_OPS_DASHBOARD_PAGES_PROJECT: ${{ vars.UK_AQ_OPS_DASHBOARD_PAGES_PROJECT || 'uk-aq-ops-dashboard-test' }}
-      UKAQ_ENV_NAME: ${{ vars.UKAQ_ENV_NAME || 'test' }}
+      UK_AQ_OPS_DASHBOARD_PAGES_PROJECT: ${{ vars.UK_AQ_OPS_DASHBOARD_PAGES_PROJECT || 'uk-aq-ops-dashboard-live' }}
+      UKAQ_ENV_NAME: ${{ vars.UKAQ_ENV_NAME || 'live' }}
       UKAQ_API_BASE_URL: ${{ vars.UKAQ_API_BASE_URL || '/api' }}
-      UKAQ_DASHBOARD_TITLE: ${{ vars.UKAQ_DASHBOARD_TITLE || 'UK AQ Dashboard (Test)' }}
-      UKAQ_DASHBOARD_SUBTITLE: ${{ vars.UKAQ_DASHBOARD_SUBTITLE || 'Test dashboard on ukaq.co.uk' }}
+      UKAQ_DASHBOARD_TITLE: ${{ vars.UKAQ_DASHBOARD_TITLE || 'UK AQ Dashboard - LIVE' }}
+      UKAQ_DASHBOARD_SUBTITLE: ${{ vars.UKAQ_DASHBOARD_SUBTITLE || 'LIVE dashboard on ukaq.co.uk' }}
       UKAQ_DEFAULT_REFRESH_SECONDS: ${{ vars.UKAQ_DEFAULT_REFRESH_SECONDS || '300' }}
       UKAQ_CONFIG_OUT_PATH: dashboard/assets/config.js
     steps:
@@ -34,7 +34,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Validate Cloudflare settings
         run: |
