@@ -1,5 +1,6 @@
 import { errorEnvelope } from "../lib/http";
 import { handleDirectCompatRoute } from "../lib/direct";
+import { restoreObsAqiCoverage } from "../lib/obs_aqidb_coverage";
 import {
   enrichStorageCoverageFromMetrics,
   proxyR2ConnectorCounts,
@@ -84,7 +85,8 @@ export async function handleCompatRoute(
         });
 
     if (pathname === "/api/storage_coverage" || pathname === "/api/dashboard") {
-      return enrichStorageCoverageFromMetrics(response, request, env);
+      const metricsEnriched = await enrichStorageCoverageFromMetrics(response, request, env);
+      return restoreObsAqiCoverage(metricsEnriched, request, env);
     }
     return response;
   }
