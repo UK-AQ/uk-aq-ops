@@ -1,6 +1,6 @@
 import { errorEnvelope } from "../lib/http";
 import { handleDirectCompatRoute } from "../lib/direct";
-import { enrichStorageCoverageResponse } from "../lib/storage_coverage_enrichment";
+import { enrichStorageCoverageResponse } from "../lib/storage_coverage_http_enrichment";
 import { proxyToUpstream, shouldUseUpstream, type WorkerEnv } from "../lib/upstream";
 
 const GET_ROUTES = new Set([
