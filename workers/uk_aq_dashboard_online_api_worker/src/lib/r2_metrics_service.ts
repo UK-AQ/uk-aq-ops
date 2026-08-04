@@ -112,7 +112,9 @@ async function fetchMetrics(
     throw new Error(`No service binding or external URL configured for ${pathname}`);
   }
   const url = new URL(externalUrl);
-  for (const [key, value] of params.entries()) url.searchParams.set(key, value);
+  params.forEach((value, key) => {
+    url.searchParams.set(key, value);
+  });
   return fetch(url.toString(), { method: "GET", headers });
 }
 
