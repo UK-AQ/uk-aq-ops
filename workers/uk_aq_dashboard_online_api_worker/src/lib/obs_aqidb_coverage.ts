@@ -62,6 +62,23 @@ function latestObsAqiOldestDay(rows: unknown[]): string | null {
   return oldestDay;
 }
 
+function clearSupersededHttpErrors(object: JsonObject): JsonObject {
+  const source = object.storage_coverage_independent_sources;
+  if (!source || typeof source !== "object" || Array.isArray(source)) return object;
+
+  const independent = source as JsonObject;
+  if (String(independent.transport || "") !== "service_binding") return object;
+
+  const r2Healthy = !String(independent.r2_error || "").trim();
+  const backupHealthy = !String(independent.backup_error || "").trim();
+
+  return {
+    ...object,
+    r2_history_days_error: r2Healthy ? null : object.r2_history_days_error,
+    r2_backup_window_error: backupHealthy ? null : object.r2_backup_window_error,
+  };
+}
+
 async function loadBoundary(request: Request, env: MetricsEnv): Promise<BoundarySnapshot> {
   if (!shouldForceRefresh(request) && boundaryCache && Date.now() < boundaryCache.expiresAt) {
     return boundaryCache.value;
@@ -145,7 +162,7 @@ export async function restoreObsAqiCoverage(
   }
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return response;
 
-  const object = payload as JsonObject;
+  const object = clearSupersededHttpErrors(payload as JsonObject);
   if (!Array.isArray(object.storage_coverage_days)) return response;
 
   const boundary = await loadBoundary(request, env);
