@@ -18,12 +18,14 @@ chmod +x /Users/mikehinford/uk-aq-history-integrity/bin/run-live-2025-monthly.sh
 
 ```bash
 
-nohup /Users/mikehinford/uk-aq-history-integrity/bin/integrity-run-monthly.sh \
+nohup /Users/mikehinford/uk-aq-history-integrity/bin/integrity-run-monthly-CIC-Test.sh \
   > /Users/mikehinford/uk-aq-history-integrity/state/CIC-Test/logs/integrity-run-monthly-$(date -u +%Y%m%dT%H%M%SZ).log \
+  </dev/null \
   2>&1 &
 
 nohup /Users/mikehinford/uk-aq-history-integrity/bin/integrity-run-monthly-LIVE.sh \
   > /Users/mikehinford/uk-aq-history-integrity/state/LIVE/logs/integrity-run-monthly-$(date -u +%Y%m%dT%H%M%SZ).log \
+  </dev/null \
   2>&1 &
   
 
