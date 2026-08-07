@@ -62,11 +62,9 @@ import {
   readParentManifestForBoundedRecovery,
   runCanonicalDayFinalizer,
   runCanonicalConnectorDayWriter,
+  runCanonicalGlobalIndexFinalizer,
   withConnectorDayHistoryLock,
 } from "../shared/uk_aq_r2_history_writer.mjs";
-import {
-  runCanonicalObservationsGlobalFinalizer,
-} from "../shared/uk_aq_r2_observations_global_finalizer.mjs";
 import { validateCanonicalHistoryV2Manifest } from "../shared/uk_aq_r2_history_manifest_validation.mjs";
 import {
   buildHistoryV2ConnectorManifest as buildCanonicalHistoryV2ConnectorManifest,
@@ -6076,14 +6074,11 @@ export async function runPhaseBBackup({
       .map((state) => state.day_utc)
       .sort();
     if (finalizedDays.length > 0 && summary.status !== "stopped_budget") {
-      summary.global_index_finalization = await runCanonicalObservationsGlobalFinalizer({
+      summary.global_index_finalization = await runCanonicalGlobalIndexFinalizer({
         client: controlClient,
         diagnosticEnvironment: runtime.environment,
         timeoutMs: Math.min(15_000, Math.max(1, remainingBudgetMs(runtime) ?? 15_000)),
-        r2: runtime.r2,
-        observationsPrefix: runtime.committed_prefix,
-        affectedDaysUtc: finalizedDays,
-        finalizeExistingIndexes: async () => await updateFinalizedHistoryIndexes({
+        finalize: async () => await updateFinalizedHistoryIndexes({
           runtime,
           finalizedDays,
           updateIndexesAdapter: updateR2HistoryIndexesTargeted,
