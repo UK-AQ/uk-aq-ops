@@ -21,7 +21,7 @@ python scripts/who_2021/run_who_2021_months.py \
 ```bash
 python scripts/who_2021/run_who_2021_months.py \
   --from-month 2025-01 \
-  --to-month 2026-07 
+  --to-month 2025-12 
 
 ```
 
