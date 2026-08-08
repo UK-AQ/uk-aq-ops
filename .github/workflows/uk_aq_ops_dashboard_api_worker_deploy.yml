@@ -19,8 +19,8 @@ jobs:
       UK_AQ_CF_ACCOUNT_ID_UKAQ: ${{ vars.UK_AQ_CF_ACCOUNT_ID_UKAQ || vars.UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID || '' }}
       UK_AQ_CF_API_TOKEN_UKAQ: ${{ secrets.UK_AQ_CF_API_TOKEN_UKAQ || secrets.UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN || '' }}
       UK_AQ_OPS_ADMIN_ZONE_NAME: ${{ vars.UK_AQ_OPS_ADMIN_ZONE_NAME || 'ukaq.co.uk' }}
-      UK_AQ_OPS_ADMIN_HOSTNAME: ${{ vars.UK_AQ_OPS_ADMIN_HOSTNAME || 'admin.ukaq.co.uk' }}
-      UK_AQ_OPS_DASHBOARD_API_WORKER_NAME: ${{ vars.UK_AQ_OPS_DASHBOARD_API_WORKER_NAME || 'uk-aq-ops-dashboard-api-live' }}
+      UK_AQ_OPS_ADMIN_HOSTNAME: ${{ vars.UK_AQ_OPS_ADMIN_HOSTNAME || 'test-admin.ukaq.co.uk' }}
+      UK_AQ_OPS_DASHBOARD_API_WORKER_NAME: ${{ vars.UK_AQ_OPS_DASHBOARD_API_WORKER_NAME || 'uk-aq-ops-dashboard-api-test' }}
       DASHBOARD_UPSTREAM_BASE_URL: ${{ vars.DASHBOARD_UPSTREAM_BASE_URL || '' }}
       DASHBOARD_UPSTREAM_BEARER_TOKEN: ${{ secrets.DASHBOARD_UPSTREAM_BEARER_TOKEN || '' }}
       SUPABASE_URL: ${{ vars.SUPABASE_URL || '' }}
@@ -47,7 +47,7 @@ jobs:
       DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY || '' }}
       DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET || '' }}
       DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN || '' }}
-      UK_AQ_DROPBOX_ROOT: ${{ vars.UK_AQ_DROPBOX_ROOT || 'LIVE' }}
+      UK_AQ_DROPBOX_ROOT: ${{ vars.UK_AQ_DROPBOX_ROOT || 'CIC-Test' }}
       UK_AQ_R2_HISTORY_DROPBOX_DIR: ${{ vars.UK_AQ_R2_HISTORY_DROPBOX_DIR || 'R2_history_backup' }}
       UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH: ${{ vars.UK_AQ_R2_HISTORY_BACKUP_STATE_REL_PATH || '' }}
       CLEANAIRSURB_ST_ID: ${{ vars.CLEANAIRSURB_ST_ID || '' }}
