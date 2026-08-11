@@ -2,12 +2,17 @@ import { Client } from "pg";
 
 const MEASUREMENT = "node_pg_connection_stream_bytes_read_delta";
 const PATCH_MARKER = Symbol.for("uk_aq.phase_b_pg_source_egress_diagnostic");
+const DELETION_APPLICATION_NAME = "uk-aq-prune-source-identity-delete";
 
 const aggregate = {
   candidate_count: 0,
   measured_candidate_count: 0,
   source_row_count: 0,
   pg_source_socket_bytes_received: 0,
+  deletion_revalidation_count: 0,
+  measured_deletion_revalidation_count: 0,
+  deletion_revalidation_source_row_count: 0,
+  deletion_revalidation_pg_source_socket_bytes_received: 0,
 };
 
 let aggregateLogged = false;
@@ -61,10 +66,39 @@ function looksLikeCurrentPhaseBSourceRow(row) {
 
 function looksLikeCurrentPhaseBSourceQuery(cursor) {
   const text = typeof cursor?.text === "string" ? cursor.text : "";
-  return /from\s+uk_aq_ops\.uk_aq_phase_b_history_rows_v2\s*\(/i.test(text)
+  const canonicalSourceQuery = /from\s+uk_aq_ops\.uk_aq_phase_b_history_rows_v2\s*\(/i.test(text)
     && /\bstation_id\b/i.test(text)
-    && /\bpollutant_code\b/i.test(text)
-    && /\bstatus\b/i.test(text);
+    && /\bpollutant_code\b/i.test(text);
+  const compactSourceQuery = /from\s+uk_aq_ops\.uk_aq_phase_b_history_compact_rows_v1\s*\(/i.test(text)
+    && !/\bstation_id\b/i.test(text)
+    && !/\bpollutant_code\b/i.test(text);
+  return (canonicalSourceQuery || compactSourceQuery) && /\bstatus\b/i.test(text);
+}
+
+function queryText(config) {
+  if (typeof config === "string") {
+    return config;
+  }
+  if (config && typeof config.text === "string") {
+    return config.text;
+  }
+  return "";
+}
+
+function queryValues(config, args) {
+  if (config && typeof config === "object" && Array.isArray(config.values)) {
+    return config.values;
+  }
+  return Array.isArray(args?.[0]) ? args[0] : [];
+}
+
+function looksLikeDeletionRevalidationQuery(client, config) {
+  const applicationName = String(client?.connectionParameters?.application_name || "").trim();
+  if (applicationName !== DELETION_APPLICATION_NAME) {
+    return false;
+  }
+  const text = queryText(config);
+  return /^\s*select\s+connector_id\s*,\s*station_id\s*,\s*timeseries_id\s*,\s*pollutant_code\s*,\s*observed_at_utc\s*,\s*value\s*,\s*status\s+from\s+uk_aq_ops\.uk_aq_phase_b_history_rows_v2\s*\(/is.test(text);
 }
 
 function classifyFromCursor(state, cursor) {
@@ -198,17 +232,71 @@ function wrapCursorRead(client, cursor) {
   });
 }
 
+function finishDeletionRevalidationMeasurement(state, client, result) {
+  const endBytes = socketBytesRead(client);
+  const measured = state.start_bytes !== null
+    && endBytes !== null
+    && endBytes >= state.start_bytes;
+  const receivedBytes = measured ? endBytes - state.start_bytes : null;
+  const sourceRowCount = Array.isArray(result?.rows) ? result.rows.length : 0;
+
+  aggregate.deletion_revalidation_count += 1;
+  aggregate.deletion_revalidation_source_row_count += sourceRowCount;
+  if (measured) {
+    aggregate.measured_deletion_revalidation_count += 1;
+    aggregate.deletion_revalidation_pg_source_socket_bytes_received += receivedBytes;
+  }
+
+  emitInfo("phase_b_history_pg_deletion_revalidation_egress_diagnostic", {
+    day_utc: state.day_utc,
+    connector_id: state.connector_id,
+    source_row_count: sourceRowCount,
+    pg_source_socket_bytes_received: receivedBytes,
+    pg_source_socket_counter_available: measured,
+    measurement: MEASUREMENT,
+    diagnostic_scope: "phase_b_deletion_source_identity_revalidation",
+    exact_supabase_billing_meter: false,
+  });
+}
+
 if (!Client.prototype[PATCH_MARKER]) {
   const originalQuery = Client.prototype.query;
   Client.prototype.query = function patchedQuery(config, ...args) {
+    let deletionRevalidationState = null;
     try {
+      if (looksLikeDeletionRevalidationQuery(this, config)) {
+        const values = queryValues(config, args);
+        deletionRevalidationState = {
+          start_bytes: socketBytesRead(this),
+          connector_id: positiveIntegerOrNull(values[0]),
+          day_utc: dayUtcFromValue(values[1]),
+        };
+      }
       if (config && typeof config.read === "function" && typeof config.close === "function") {
         wrapCursorRead(this, config);
       }
     } catch (_diagnosticError) {
+      deletionRevalidationState = null;
       // Diagnostics must never affect PostgreSQL query behaviour.
     }
-    return originalQuery.call(this, config, ...args);
+
+    const result = originalQuery.call(this, config, ...args);
+    if (!deletionRevalidationState || !result || typeof result.then !== "function") {
+      return result;
+    }
+    return result.then(
+      (value) => {
+        try {
+          finishDeletionRevalidationMeasurement(deletionRevalidationState, this, value);
+        } catch (_diagnosticError) {
+          // Diagnostics must never affect source-identity revalidation or deletion behaviour.
+        }
+        return value;
+      },
+      (error) => {
+        throw error;
+      },
+    );
   };
 
   Object.defineProperty(Client.prototype, PATCH_MARKER, {
@@ -220,10 +308,25 @@ if (!Client.prototype[PATCH_MARKER]) {
 }
 
 process.once("beforeExit", () => {
-  if (aggregateLogged || aggregate.candidate_count === 0) {
+  if (
+    aggregateLogged
+    || (aggregate.candidate_count === 0 && aggregate.deletion_revalidation_count === 0)
+  ) {
     return;
   }
   aggregateLogged = true;
+
+  const allArchiveMeasurementsAvailable =
+    aggregate.candidate_count === aggregate.measured_candidate_count;
+  const allDeletionMeasurementsAvailable =
+    aggregate.deletion_revalidation_count === aggregate.measured_deletion_revalidation_count;
+  const combinedMeasurementComplete =
+    allArchiveMeasurementsAvailable && allDeletionMeasurementsAvailable;
+  const combinedBytes = combinedMeasurementComplete
+    ? aggregate.pg_source_socket_bytes_received
+      + aggregate.deletion_revalidation_pg_source_socket_bytes_received
+    : null;
+
   emitInfo("phase_b_history_pg_source_egress_run_summary", {
     measurement: MEASUREMENT,
     candidate_count: aggregate.candidate_count,
@@ -232,6 +335,15 @@ process.once("beforeExit", () => {
     pg_source_socket_bytes_received: aggregate.measured_candidate_count > 0
       ? aggregate.pg_source_socket_bytes_received
       : null,
+    deletion_revalidation_count: aggregate.deletion_revalidation_count,
+    measured_deletion_revalidation_count: aggregate.measured_deletion_revalidation_count,
+    deletion_revalidation_source_row_count: aggregate.deletion_revalidation_source_row_count,
+    deletion_revalidation_pg_source_socket_bytes_received:
+      aggregate.measured_deletion_revalidation_count > 0
+        ? aggregate.deletion_revalidation_pg_source_socket_bytes_received
+        : null,
+    combined_pg_source_socket_bytes_received: combinedBytes,
+    combined_pg_source_socket_counter_complete: combinedMeasurementComplete,
     exact_supabase_billing_meter: false,
   });
 });
