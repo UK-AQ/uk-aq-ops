@@ -11,9 +11,7 @@ const PROFILES = Object.freeze({
     index_root_prefix: "history/_index",
     observations_timeseries_index_prefix: "history/_index/observations_timeseries",
     aqilevels_timeseries_index_prefix: "history/_index/aqilevels_timeseries",
-    timeseries_binding_index_prefix: null,
-    backup_inventory_rel_path: "history/_index/backup_inventory_v1.json",
-    backup_state_rel_path: "_ops/checkpoints/r2_history_backup_state_v1.json"
+    timeseries_binding_index_prefix: null
   }),
   v2: Object.freeze({
     version: "v2",
@@ -25,9 +23,7 @@ const PROFILES = Object.freeze({
     index_root_prefix: "history/_index_v2",
     observations_timeseries_index_prefix: "history/_index_v2/observations_timeseries",
     aqilevels_timeseries_index_prefix: "history/_index_v2/aqilevels_hourly_data_timeseries",
-    timeseries_binding_index_prefix: "history/_index_v2/timeseries_binding",
-    backup_inventory_rel_path: "history/_index_v2/backup_inventory_v2.json",
-    backup_state_rel_path: "_ops/checkpoints/r2_history_backup_state_v2.json"
+    timeseries_binding_index_prefix: "history/_index_v2/timeseries_binding"
   })
 });
 
