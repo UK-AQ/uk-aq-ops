@@ -22,3 +22,5 @@ sync_to_live.sh
 /.aider.tags.cache.v4
 *.xlsx
 .venv*
+venv/
+./venv
