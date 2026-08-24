@@ -1,5 +1,6 @@
 import { buildJsonResponse, errorEnvelope } from "./http";
 import type { WorkerEnv } from "./upstream";
+import { recordDashboardSupabaseResponse } from "./service_egress_metrics";
 
 type JsonObject = Record<string, unknown>;
 
@@ -415,9 +416,14 @@ async function fetchJsonObject(
   url: string,
   init?: RequestInit,
   errLabel?: string,
+  metricEnv?: WorkerEnv,
 ): Promise<JsonObject> {
+  const startedAt = Date.now();
   const response = await fetch(url, init);
   const text = await response.text();
+  if (metricEnv) {
+    recordDashboardSupabaseResponse(metricEnv, url, response, text, Date.now() - startedAt);
+  }
   let parsed: unknown = null;
   try {
     parsed = text ? JSON.parse(text) : null;
@@ -441,9 +447,14 @@ async function fetchJsonArray(
   url: string,
   init?: RequestInit,
   errLabel?: string,
+  metricEnv?: WorkerEnv,
 ): Promise<unknown[]> {
+  const startedAt = Date.now();
   const response = await fetch(url, init);
   const text = await response.text();
+  if (metricEnv) {
+    recordDashboardSupabaseResponse(metricEnv, url, response, text, Date.now() - startedAt);
+  }
   let parsed: unknown = null;
   try {
     parsed = text ? JSON.parse(text) : null;
@@ -589,6 +600,8 @@ async function fetchAllRows(
   headers: Headers,
   params: Record<string, string>,
   pageSize = 1000,
+  metricEnv?: WorkerEnv,
+  maxRows = Number.POSITIVE_INFINITY,
 ): Promise<JsonObject[]> {
   const rows: JsonObject[] = [];
   let offset = 0;
@@ -602,9 +615,13 @@ async function fetchAllRows(
       buildUrl(restBase, tableOrView, query),
       { headers, method: "GET" },
       `Failed to fetch ${tableOrView}`,
+      metricEnv,
     );
     const safeBatch = batch.filter((row): row is JsonObject => !!row && typeof row === "object" && !Array.isArray(row));
     rows.push(...safeBatch);
+    if (rows.length >= maxRows) {
+      return rows.slice(0, maxRows);
+    }
     if (safeBatch.length < pageSize) {
       break;
     }
@@ -778,6 +795,7 @@ async function fetchR2BackupWindowFromSupabase(env: WorkerEnv): Promise<{ window
         body: JSON.stringify({}),
       },
       "R2 window RPC",
+      env,
     );
     const first = rows.find((row): row is JsonObject => !!row && typeof row === "object" && !Array.isArray(row));
     if (!first) {
@@ -1096,6 +1114,7 @@ async function fetchDbMetrics(env: WorkerEnv): Promise<{
         order: "bucket_hour.asc",
       },
       1000,
+      env,
     );
     const r2DomainRows = await fetchAllRows(
       restBase,
@@ -1107,6 +1126,7 @@ async function fetchDbMetrics(env: WorkerEnv): Promise<{
         order: "bucket_hour.asc",
       },
       1000,
+      env,
     );
     let obsDbRows: JsonObject[] = [];
     let obsSchemaRows: JsonObject[] = [];
@@ -1124,6 +1144,7 @@ async function fetchDbMetrics(env: WorkerEnv): Promise<{
           order: "bucket_hour.asc",
         },
         1000,
+        env,
       );
       obsSchemaRows = await fetchAllRows(
         obsBase,
@@ -1135,6 +1156,7 @@ async function fetchDbMetrics(env: WorkerEnv): Promise<{
           order: "bucket_hour.asc",
         },
         1000,
+        env,
       );
     } else {
       obsError = "OBS_AQIDB_SUPABASE_URL/OBS_AQIDB_SECRET_KEY not configured.";
@@ -1679,19 +1701,29 @@ function buildStorageCoverageRows(
 
 async function fetchServiceEgressMetrics(env: WorkerEnv): Promise<{ rows: unknown[]; error: string | null }> {
   try {
-    const restBase = ingestRestBase(env);
-    const key = requireServiceKey(env);
+    const restBase = obsRestBase(env);
+    const key = requireObsServiceKey(env);
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
     const rows = await fetchAllRows(
       restBase,
-      "uk_aq_endpoint_egress_metrics_24h_dashboard",
+      "uk_aq_service_egress_metrics_minute",
       postgrestHeaders(key, defaultPublicSchema(env)),
       {
-        select: "bucket_minute,endpoint,method,status_class,observed_requests,estimated_requests,response_bytes_sum,duration_ms_sum",
+        select: "bucket_minute,env_name,project_ref,service_name,source_type,source_name,route_name,query_name,window_label,status,request_count,response_rows,response_bytes_est,upstream_bytes_est,duration_ms,error_count,notes",
+        bucket_minute: `gte.${toPostgrestTimestamp(since)}`,
+        env_name: `eq.${String(env.UKAQ_ENV_NAME || "TEST").trim() || "TEST"}`,
         order: "bucket_minute.asc",
       },
       1000,
+      env,
+      10_000,
     );
-    return { rows, error: null };
+    return {
+      rows,
+      error: rows.length >= 10_000
+        ? "Service egress minute view reached the 10000-row dashboard bound"
+        : null,
+    };
   } catch (err) {
     return { rows: [], error: err instanceof Error ? err.message : String(err) };
   }
@@ -1735,6 +1767,7 @@ async function fetchDashboardBaseData(
         order: "connector_code.asc",
       },
       1000,
+      env,
     );
     for (const row of connectors) {
       const idValue = Number(row.id);
@@ -1766,6 +1799,7 @@ async function fetchDashboardBaseData(
           select: "id,connector_id,service_ref,removed_at",
         },
         1000,
+        env,
       ),
       fetchAllRows(
         ingestBase,
@@ -1775,6 +1809,7 @@ async function fetchDashboardBaseData(
           select: "station_id,attributes",
         },
         1000,
+        env,
       ),
     ]);
     const metadataByStation = new Map<number, JsonObject>();
@@ -1824,6 +1859,7 @@ async function fetchDashboardBaseData(
       }),
       { method: "GET", headers: headersCore },
       "ingest runs",
+      env,
     );
     const latestByConnector = new Map<number, JsonObject>();
     const normalizedRuns: JsonObject[] = [];
@@ -1930,6 +1966,7 @@ async function fetchDashboardBaseData(
       }),
       { method: "GET", headers: headersCore },
       "dispatcher settings",
+      env,
     );
     const row = dispatcherRows.find((item): item is JsonObject => !!item && typeof item === "object" && !Array.isArray(item));
     if (row) {
@@ -1954,6 +1991,7 @@ async function fetchDashboardBaseData(
         last_value: "not.is.null",
       },
       1000,
+      env,
     );
     const latestByPollutant: Record<string, Map<string, Date>> = {};
     const activeByPollutant: Record<string, Set<string>> = {};
@@ -2388,6 +2426,7 @@ export async function getDirectDailyTaskRunsPayload(
       headers: postgrestHeaders(key, defaultOpsSchema(env)),
     },
     "daily_task_runs_dashboard",
+    env,
   );
   return {
     day,
@@ -2538,6 +2577,7 @@ export async function getDirectSnapshotPayload(env: WorkerEnv, search: URLSearch
       }),
     },
     "station snapshot RPC",
+    env,
   );
   const payload = rows[0];
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
