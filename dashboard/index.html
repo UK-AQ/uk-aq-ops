@@ -1120,6 +1120,11 @@
         color: #2f8f5b;
       }
 
+      .status-pill.html-fallback {
+        background: rgba(245, 193, 74, 0.2);
+        color: #a56800;
+      }
+
       .status-pill.failed,
       .status-pill.error {
         background: rgba(211, 74, 63, 0.16);
@@ -2112,6 +2117,13 @@
         return String(value || "").trim().toLowerCase();
       }
 
+      function usedHtmlFallback(run) {
+        return (
+          normalizeConnectorCode(run && run.connector_code) === "sos" &&
+          String((run && run.run_message) || "").startsWith("UK-AIR HTML fallback")
+        );
+      }
+
       function escapeHtml(value) {
         return String(value || "")
           .replace(/&/g, "&amp;")
@@ -2542,38 +2554,16 @@
         if (payload && asBoolean(payload.rate_limit_stop)) {
           return "Rate-limit";
         }
-        if (payload && payload.partial === true) {
-          return "Budget Limit";
-        }
         if (budgetReasons.has(stoppedReason)) {
           return "Budget Limit";
         }
-        const gapRequestsSkippedBudget = payloadNumber(payload, ["gap_requests_skipped_budget"]);
-        if (gapRequestsSkippedBudget !== null && gapRequestsSkippedBudget > 0) {
-          return "Budget Limit";
-        }
-        const requestsTotal = payloadNumber(payload, ["requests_total"]);
-        const maxRequestsPerRun = payloadNumber(payload, ["max_requests_per_run"]);
-        if (
-          requestsTotal !== null &&
-          maxRequestsPerRun !== null &&
-          maxRequestsPerRun > 0 &&
-          requestsTotal >= maxRequestsPerRun
-        ) {
-          return "Budget Limit";
-        }
         const message = String(run && run.run_message || "").toLowerCase();
+		
         if (rateLimitReasons.has(message)) {
           return "Rate-limit";
         }
         if (message.includes("rate limit")) {
           return "Rate-limit";
-        }
-        if (budgetReasons.has(message)) {
-          return "Budget Limit";
-        }
-        if (message.includes("budget limit") || message.includes("request budget")) {
-          return "Budget Limit";
         }
         return null;
       }
@@ -2617,7 +2607,7 @@
           if (partialDetail === "HTTP 502 Gateway Failure") {
             return { className: "failed", label: "Failed", detail: partialDetail };
           }
-          return { className: "partial", label: "Partial Run", detail: partialDetail || "Budget Limit" };
+          return { className: "partial", label: "Partial Run", detail: partialDetail };
         }
         if (hasHttp502GatewayFailure(run)) {
           return { className: "failed", label: "Failed", detail: "HTTP 502 Gateway Failure" };
@@ -2674,11 +2664,11 @@
       }
 
       function formatSeries(run) {
-        if (run.series_polled !== null && run.series_polled !== undefined) {
-          return formatCount(run.series_polled);
-        }
         if (run.timeseries_updated !== null && run.timeseries_updated !== undefined) {
           return formatCount(run.timeseries_updated);
+        }
+        if (run.series_polled !== null && run.series_polled !== undefined) {
+          return formatCount(run.series_polled);
         }
         return "n/a";
       }
@@ -3185,6 +3175,9 @@
                   const minutes = formatMinutes(run.in_flight_minutes);
                   const durationMinutes = calcDurationMinutes(run);
                   const duration = durationMinutes === null ? null : formatDurationSeconds(durationMinutes * 60);
+                  const htmlFallbackBadge = usedHtmlFallback(run)
+                    ? `<span class="status-pill html-fallback" title="Primary UK-AIR SOS unavailable; observations recovered from UK-AIR website HTML.">HTML FALLBACK</span>`
+                    : "";
                   const runtimeBadge = minutes
                     ? `<span class="runtime-pill ${
                         Number(run.in_flight_minutes) >= 5 ? "overdue" : ""
@@ -3196,6 +3189,7 @@
                       <td>
                         <div class="status-stack">
                           <span class="status-pill ${status.className}">${status.label}${status.detail ? `<br><span class="status-detail">${status.detail}</span>` : ""}</span>
+                          ${htmlFallbackBadge}
                           ${runtimeBadge}
                         </div>
                       </td>
