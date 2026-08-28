@@ -105,10 +105,86 @@ LOCAL_ROOT="${UK_AQ_HISTORY_INTEGRITY_LOCAL_ROOT:-/Users/mikehinford/uk-aq-histo
 [[ "${LOCAL_ROOT}" = /* ]] || error "UK_AQ_HISTORY_INTEGRITY_LOCAL_ROOT must be absolute"
 reject_archive_path "UK_AQ_HISTORY_INTEGRITY_LOCAL_ROOT" "${LOCAL_ROOT}"
 
-set -a
-# shellcheck disable=SC1090
-source "${ROOT_ENV_FILE}"
-set +a
+load_env_file_safe() {
+  local env_path="${1}"
+  python3 - "${env_path}" <<'PYENV'
+import re
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+name_re = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+def strip_inline_comment(value: str) -> str:
+    in_single = False
+    in_double = False
+    escaped = False
+    out = []
+    prev = ""
+    for i, ch in enumerate(value):
+        if in_single:
+            if ch == "'":
+                in_single = False
+            out.append(ch)
+            prev = ch
+            continue
+        if in_double:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_double = False
+            out.append(ch)
+            prev = ch
+            continue
+        if ch == "'":
+            in_single = True
+            out.append(ch)
+            prev = ch
+            continue
+        if ch == '"':
+            in_double = True
+            out.append(ch)
+            prev = ch
+            continue
+        if ch == "#" and (i == 0 or prev.isspace()):
+            break
+        out.append(ch)
+        prev = ch
+    return "".join(out).strip()
+
+for raw in path.read_text(encoding="utf-8").splitlines():
+    line = raw.strip()
+    if not line or line.startswith("#") or "=" not in line:
+        continue
+    key, _, val = line.partition("=")
+    key = key.strip()
+    if key.startswith("export "):
+        key = key[len("export "):].strip()
+    if not name_re.match(key):
+        continue
+    val = strip_inline_comment(val)
+    if len(val) >= 2 and ((val[0] == '"' and val[-1] == '"') or (val[0] == "'" and val[-1] == "'")):
+        val = val[1:-1]
+    sys.stdout.buffer.write(key.encode("utf-8"))
+    sys.stdout.buffer.write(b"\0")
+    sys.stdout.buffer.write(val.encode("utf-8"))
+    sys.stdout.buffer.write(b"\0")
+PYENV
+}
+
+apply_env_file_safe() {
+  local env_path="${1}"
+  local key=""
+  local val=""
+  while IFS= read -r -d '' key && IFS= read -r -d '' val; do
+    printf -v "${key}" '%s' "${val}"
+    export "${key}"
+  done < <(load_env_file_safe "${env_path}")
+}
+
+apply_env_file_safe "${ROOT_ENV_FILE}"
 
 if [[ "$(printf '%s' "${UKAQ_ENV_NAME:-}" | sed 's/[[:space:]]*$//')" != "${ENV_NAME}" ]]; then
   error "UKAQ_ENV_NAME in the selected repository root .env does not match --env=${ENV_NAME}"
