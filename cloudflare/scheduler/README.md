@@ -8,12 +8,23 @@ This Worker runs once per minute and reads its schedule entirely from D1.
 - Worker: `cloudflare/scheduler/worker.mjs`
 - Shared runtime helpers: `cloudflare/scheduler/shared.mjs`
 - Wrangler config: `cloudflare/scheduler/wrangler.toml`
-- D1 migration: `cloudflare/scheduler/migrations/0001_scheduler_schema.sql`
+- D1 migrations: `cloudflare/scheduler/migrations/0001_scheduler_schema.sql` through
+  `cloudflare/scheduler/migrations/0003_worker_http_target.sql`
 - Seed data: `cloudflare/scheduler/seeds/0001_github_jobs.sql`
 - Sync script: `cloudflare/scheduler/scripts/sync_jobs.py`
 - Tests: `cloudflare/scheduler/tests/scheduler.test.mjs`
 - Config sync workflow: `.github/workflows/uk_aq_cloudflare_scheduler_ops_config_sync.yml`
 - Deploy workflow: `.github/workflows/uk_aq_cloudflare_scheduler_ops_deploy.yml`
+
+## CI sync and Wrangler version
+
+Scheduler workflows pin Wrangler v4 at `4.130.0`. Pull requests and relevant
+pushes validate the canonical scheduler configuration, but a push rewrites
+remote `scheduler_jobs` only when `jobs.toml` changed; `workflow_dispatch`
+remains an explicit manual sync. Script- or workflow-only pushes validate
+without mutating D1. Before a remote sync, the config workflow waits briefly
+for the remote table to contain every column required by the generated job
+manifest. Scheduler migrations remain owned by the deployment workflow.
 
 ## Worker name
 
@@ -23,10 +34,31 @@ This Worker runs once per minute and reads its schedule entirely from D1.
 
 - `SCHEDULER_DB`
 
-## Required secret
+## Required scheduler secrets
 
 - `UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT`
 - `UK_AQ_SCHEDULER_TRIGGER_SECRET` for authenticated `POST /run-if-due`
+- `UK_AQ_MEDIA_WORKER_HTTP_SECRET` for scheduler authentication to the UK AQ
+  Media discovery Worker
+
+## Deployment-managed Worker secrets
+
+The normal scheduler deployment manages these four Worker secrets:
+
+- `UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT`
+- `UK_AQ_EDGE_UPSTREAM_SECRET`
+- `UK_AQ_SCHEDULER_TRIGGER_SECRET`
+- `UK_AQ_MEDIA_WORKER_HTTP_SECRET`
+
+Their values are stored as encrypted GitHub Actions repository secrets. The
+scheduler deployment workflow passes them through its in-memory `jq` payload to
+`wrangler secret bulk`, which installs them on `uk-aq-cron-scheduler-ops` before
+the workflow redeploys the Worker.
+
+`UK_AQ_MEDIA_WORKER_HTTP_SECRET` authenticates scheduler requests to the UK AQ
+Media discovery Worker. Its value must never be stored in `jobs.toml`, D1,
+request bodies, repository source, or logs. The Media `worker_http` job refers
+only to the binding name `UK_AQ_MEDIA_WORKER_HTTP_SECRET`.
 
 ## Cloud Run authentication secret
 
@@ -35,6 +67,82 @@ This Worker runs once per minute and reads its schedule entirely from D1.
 The Worker sends the shared edge secret as `x-uk-aq-dispatch-secret`. Target
 services may also accept the same value through `x-uk-aq-upstream-auth`. Never
 put the value in `jobs.toml`, D1 headers, or D1 request bodies.
+
+## Supported targets
+
+The scheduler supports `github_workflow`, `cloud_run`, and `worker_http` jobs.
+The first two retain their existing request and authentication behavior.
+
+### Worker HTTP targets
+
+`worker_http` is a narrow authenticated target for invoking another UK AQ
+Worker. Its `jobs.toml` contract is:
+
+```toml
+[jobs.example_worker]
+enabled = true
+cron_expr = "5 * * * *"
+target_type = "worker_http"
+worker_http_url = "https://example-worker.example.workers.dev/run"
+worker_http_secret_binding = "UK_AQ_EXAMPLE_WORKER_HTTP_SECRET"
+dry_run = true
+
+[jobs.example_worker.worker_http_body]
+source = "scheduler"
+```
+
+`worker_http_url` is required and must be an absolute HTTPS URL.
+`worker_http_secret_binding` is required and stores only the scheduler Worker
+environment binding name. It must match
+`^UK_AQ_[A-Z0-9_]*WORKER_HTTP_SECRET$`; unrelated scheduler bindings are
+rejected. `worker_http_body` is optional, must be a TOML child table, and is
+stored as compact deterministic JSON. An omitted body becomes `{}`.
+
+At runtime, the scheduler resolves the named binding with `readSecret()` and
+sends exactly one HTTPS `POST` with:
+
+```text
+Accept: application/json
+Content-Type: application/json; charset=utf-8
+x-uk-aq-worker-http-secret: <resolved Worker secret>
+```
+
+The request body is `JSON.stringify(worker_http_body ?? {})`. Every HTTP 2xx
+response is successful; non-2xx responses use the normal bounded response
+preview and are recorded as failed scheduler dispatches. If a target echoes the
+secret, its exact value is redacted before the preview is stored. Arbitrary
+methods and arbitrary request headers are not supported for this target.
+
+The actual secret value must be installed as a secret on the scheduler Worker.
+Never store it in `jobs.toml`, D1, a configured request body, or logs. Different
+`worker_http` jobs may name and use dedicated Worker secrets.
+
+### Media discovery job
+
+`uk_aq_media_discovery` is configured as a live `worker_http` job calling the UK
+AQ Media discovery receiver at
+`https://uk-aq-media-discovery.uk-aq-media.workers.dev/scheduler/run`. It uses
+the dedicated `UK_AQ_MEDIA_WORKER_HTTP_SECRET` binding.
+
+The current steady-state cadence is `0 */2 * * *`. Before switching to that
+cadence, repeated real dispatches were proven at a temporary `*/5 * * * *`
+validation cadence. Those runs successfully reached the Media receiver, received
+HTTP 202 responses, enqueued Media Queue work and completed the Queue consumer.
+
+The Media account's native Cron trigger has been removed from Cloudflare and from
+the Media Wrangler configuration, so the LIVE central scheduler is the active
+scheduling authority during standalone operation. When Media moves to public/LIVE
+operation, this job moves to the LIVE central scheduler.
+
+### Media GDELT job
+
+`uk_aq_media_gdelt` is a live `github_workflow` job that dispatches
+`UK-AQ/uk-aq-media`'s `uk_aq_media_gdelt.yml` workflow on `main` at minutes
+10, and 40 each hour. The GDELT acquisition runs on the GitHub Actions
+runner; the scheduler only makes the workflow dispatch. The workflow has no native
+GitHub Actions Cron, so this Ops job is its sole scheduling authority. This is
+separate from `uk_aq_media_discovery`, which remains the two-hour `worker_http`
+RSS discovery job.
 
 ## Deployment-managed Cloud Run URLs
 
@@ -61,20 +169,35 @@ python3 -m unittest discover -s tests -p 'test*.py'
 
 1. Create the D1 database for the ops scheduler.
 2. Update `cloudflare/scheduler/wrangler.toml` with the new D1 database ID.
-3. Apply the scheduler migrations, including `0002_scheduler_minute_slot_claim.sql`.
+3. Apply the scheduler migrations in order, including
+   `0002_scheduler_minute_slot_claim.sql` and
+   `0003_worker_http_target.sql`.
 4. Sync `cloudflare/scheduler/jobs.toml` into D1 with the config sync workflow or the local sync script.
 5. Seed `cloudflare/scheduler/seeds/0001_github_jobs.sql` only if you need a bootstrap snapshot for a brand-new D1 database.
-6. Install `UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT` and
-   `UK_AQ_SCHEDULER_TRIGGER_SECRET` on the Worker.
+6. Install `UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT`,
+   `UK_AQ_EDGE_UPSTREAM_SECRET`, `UK_AQ_SCHEDULER_TRIGGER_SECRET`, and
+   `UK_AQ_MEDIA_WORKER_HTTP_SECRET` on the Worker.
 7. Deploy the Worker.
 8. Verify one-minute `scheduler_runs` rows and dry-run dispatch records.
+
+Normal GitHub-managed deployment installs the four secrets above automatically.
+For manual bootstrap or recovery, an operator may still install a binding with
+Wrangler. For each configured `worker_http` job, install the binding named in
+`worker_http_secret_binding` before enabling live dispatch. For example:
+
+```bash
+cd cloudflare/scheduler
+printf '%s' "${UK_AQ_EXAMPLE_WORKER_HTTP_SECRET}" | \
+  npx --yes wrangler@4.130.0 secret put UK_AQ_EXAMPLE_WORKER_HTTP_SECRET \
+    --name uk-aq-cron-scheduler-ops
+```
 
 Install the existing shared edge secret on the Worker:
 
 ```bash
 cd cloudflare/scheduler
 printf '%s' "${UK_AQ_EDGE_UPSTREAM_SECRET}" | \
-  npx --yes wrangler@4 secret put UK_AQ_EDGE_UPSTREAM_SECRET \
+  npx --yes wrangler@4.130.0 secret put UK_AQ_EDGE_UPSTREAM_SECRET \
     --name uk-aq-cron-scheduler-ops
 ```
 
