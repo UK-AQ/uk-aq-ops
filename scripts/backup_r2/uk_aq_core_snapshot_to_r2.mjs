@@ -16,19 +16,26 @@ import {
   r2PutObject,
   sha256Hex,
 } from "../../workers/shared/r2_sigv4.mjs";
-import { resolveR2HistoryVersion } from "../../workers/shared/uk_aq_r2_history_version.mjs";
+import { resolveObservationHistoryGeneration, assertObservationHistoryGenerationPrefixes } from "../../workers/shared/uk_aq_observation_history_generation.mjs";
+import { delegateBindingPublicationIfNeeded } from "./lib/observation_binding_publication_lock.mjs";
+import { refreshAndCommitTimeseriesBindingSource } from "./uk_aq_refresh_timeseries_binding_source_hierarchy.mjs";
 import {
   reconcileR2HistoryV2TimeseriesBindings,
   DEFAULT_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX,
 } from "../../workers/shared/uk_aq_r2_history_index.mjs";
 import { normalizeObservationPropertyCode } from "../../workers/shared/uk_aq_observation_property_code.mjs";
+import {
+  TIMESERIES_BINDING_SOURCE_FINGERPRINT_VERSION,
+  buildTimeseriesBindingSourceState,
+  validTimeseriesBindingSourceState,
+} from "./lib/timeseries_binding_source_state_v2.mjs";
+export { TIMESERIES_BINDING_SOURCE_FINGERPRINT_VERSION, buildTimeseriesBindingSourceState };
 
 export function resolveCoreSnapshotPrefix(env = process.env) {
-  const version = resolveR2HistoryVersion(env, { context: "R2 core snapshot" });
-  if (version === "v2") {
-    return normalizePrefix(env.UK_AQ_R2_HISTORY_V2_CORE_PREFIX || "history/v2/core");
-  }
-  return normalizePrefix(env.UK_AQ_R2_HISTORY_CORE_PREFIX || "history/v1/core");
+  const generation = resolveObservationHistoryGeneration(env);
+  const prefix = normalizePrefix(env.UK_AQ_R2_HISTORY_V2_CORE_PREFIX || generation.core_prefix);
+  assertObservationHistoryGenerationPrefixes(generation, { corePrefix: prefix });
+  return prefix;
 }
 
 const DEFAULT_SOURCE_SCHEMA = (process.env.UK_AQ_CORE_SNAPSHOT_SCHEMA || "uk_aq_core").trim();
@@ -100,8 +107,6 @@ export const DEFAULT_TABLES = Object.freeze([
   "sos_station_timeseries_site_refs",
 ]);
 const V2_ONLY_DEFAULT_TABLES = Object.freeze(["station_initial_metadata"]);
-export const TIMESERIES_BINDING_SOURCE_FINGERPRINT_VERSION = 2;
-const TIMESERIES_BINDING_SOURCE_STATE_SCHEMA_VERSION = 1;
 const TIMESERIES_BINDING_SOURCE_TABLES = Object.freeze(["timeseries", "phenomena", "observed_properties"]);
 
 export function buildTimeseriesBindingSourceFingerprint(tableArtifacts, continuityRows = []) {
@@ -138,21 +143,6 @@ export function buildTimeseriesBindingSourceFingerprint(tableArtifacts, continui
   return { fingerprint: createHash("sha256").update(canonical).digest("hex"), tables, continuity };
 }
 
-export function buildTimeseriesBindingSourceState({ bindingPrefix, sourceSchema, sourceFingerprint, sourceTables, authoritativeTimeseriesCount }) {
-  return {
-    schema_version: TIMESERIES_BINDING_SOURCE_STATE_SCHEMA_VERSION,
-    history_version: "v2",
-    state_kind: "timeseries_binding_source_state",
-    timeseries_binding_index_prefix: normalizePrefix(bindingPrefix),
-    fingerprint_algorithm: "sha256",
-    fingerprint_version: TIMESERIES_BINDING_SOURCE_FINGERPRINT_VERSION,
-    source_schema: String(sourceSchema || "").trim(),
-    source_fingerprint: sourceFingerprint,
-    source_tables: sourceTables,
-    authoritative_timeseries_count: authoritativeTimeseriesCount,
-  };
-}
-
 async function readTimeseriesContinuityRows(connectionString) {
   return withPgClient(connectionString, async (client) => {
     const result = await client.query(`
@@ -162,19 +152,6 @@ async function readTimeseriesContinuityRows(connectionString) {
     `);
     return result.rows || [];
   });
-}
-
-function validTimeseriesBindingSourceState(state, { bindingPrefix, sourceSchema }) {
-  return Boolean(state && typeof state === "object" && !Array.isArray(state)
-    && state.schema_version === TIMESERIES_BINDING_SOURCE_STATE_SCHEMA_VERSION
-    && state.history_version === "v2"
-    && state.state_kind === "timeseries_binding_source_state"
-    && state.fingerprint_algorithm === "sha256"
-    && state.fingerprint_version === TIMESERIES_BINDING_SOURCE_FINGERPRINT_VERSION
-    && state.timeseries_binding_index_prefix === normalizePrefix(bindingPrefix)
-    && state.source_schema === String(sourceSchema || "").trim()
-    && /^[a-f0-9]{64}$/.test(String(state.source_fingerprint || ""))
-    && Array.isArray(state.source_tables));
 }
 
 function usage() {
@@ -193,7 +170,7 @@ function usage() {
       "",
       "Optional:",
       "  --day-utc <YYYY-MM-DD>       Default: today UTC",
-      "  --prefix <r2-prefix>         Default: selected by UK_AQ_R2_HISTORY_VERSION (v1 history/v1/core; v2 history/v2/core)",
+      "  --prefix <r2-prefix>         Default: selected by UK_AQ_R2_HISTORY_VERSION (v2 history/v2/core; v3 history/v3/core)",
       "  --table <name>               Repeatable table filter",
       "  --tables <a,b,c>             Comma-separated table filter",
       "  --cursor-batch-rows <N>      Default: 5000",
@@ -408,15 +385,20 @@ function parseArgs(argv) {
     throw new Error(`Unknown arg: ${arg}`);
   }
 
-  if (!args.prefix) {
-    args.prefix = resolveCoreSnapshotPrefix(process.env);
-  }
+  const generation = resolveObservationHistoryGeneration(process.env);
+  const corePrefix = resolveCoreSnapshotPrefix(process.env);
+  if (!args.prefix) args.prefix = corePrefix;
+  assertObservationHistoryGenerationPrefixes(generation, {
+    corePrefix: args.prefix,
+    bindingPrefix: normalizePrefix(process.env.UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX || generation.timeseries_binding_index_prefix),
+    inventoryPrefix: normalizePrefix(process.env.UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX || generation.backup_inventory_prefix),
+  });
 
   if (!args.prefix) {
     throw new Error("--prefix resolved to an empty value");
   }
 
-  const defaultTables = resolveR2HistoryVersion(process.env, { context: "R2 core snapshot" }) === "v2"
+  const defaultTables = ["v2", "v3"].includes(resolveObservationHistoryGeneration(process.env).version)
     ? [...DEFAULT_TABLES, ...V2_ONLY_DEFAULT_TABLES]
     : [...DEFAULT_TABLES];
   const requestedTables = args.tables.length ? Array.from(new Set(args.tables)) : defaultTables;
@@ -827,7 +809,7 @@ async function main(args) {
     }
 
     try {
-      if (resolveR2HistoryVersion(process.env, { context: "R2 core snapshot" }) === "v2") {
+      if (["v2", "v3"].includes(resolveObservationHistoryGeneration(process.env).version)) {
         const artifactByTable = new Map(tableArtifacts.map((entry) => [entry.table, entry]));
         const timeseriesFile = artifactByTable.get("timeseries")?.temp_file;
         const phenomenaFile = artifactByTable.get("phenomena")?.temp_file;
@@ -838,8 +820,7 @@ async function main(args) {
             reason: "required_core_binding_tables_not_exported",
           };
         } else {
-          const bindingPrefix = normalizePrefix(process.env.UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX
-            || DEFAULT_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX);
+          const bindingPrefix = resolveObservationHistoryGeneration(process.env).timeseries_binding_index_prefix;
           const sourceStateKey = `${bindingPrefix}/_source_state.json`;
           const continuityRows = await retryTransient(
             () => readTimeseriesContinuityRows(ingestDbUrl),
@@ -891,12 +872,22 @@ async function main(args) {
           };
           if (!args.dry_run && reconciliation.status === "succeeded" && reconciliation.invalid_binding_count === 0) {
             const state = buildTimeseriesBindingSourceState({ bindingPrefix, sourceSchema, sourceFingerprint: source.fingerprint, sourceTables: source.tables, authoritativeTimeseriesCount: reconciliation.authoritative_timeseries_count });
-            const body = `${JSON.stringify(state, null, 2)}\n`;
-            await r2PutObject({ r2, key: sourceStateKey, body, content_type: "application/json; charset=utf-8" });
-            const verified = await r2GetObject({ r2, key: sourceStateKey });
-            if (verified.body.toString("utf8") !== body) throw new Error("timeseries_binding_source_state_verification_failed");
-            report.timeseries_binding_reconciliation.source_state_status = "written";
+            // The hierarchy command commits this proposal only after range, root
+            // and refresh-state publication has completed successfully.
+            report.timeseries_binding_reconciliation.proposed_source_state = state;
+            report.timeseries_binding_reconciliation.source_state_status = "awaiting_hierarchy_commit";
           }
+          }
+          if (!args.dry_run && report.timeseries_binding_reconciliation?.status !== "failed") {
+            report.timeseries_binding_source_hierarchy = await refreshAndCommitTimeseriesBindingSource({
+              r2, bindingPrefix,
+              backupInventoryRootPrefix: resolveObservationHistoryGeneration(process.env).backup_inventory_prefix,
+              sourceFingerprint: source.fingerprint, coreSnapshotReport: report,
+              // Completion is recorded only after this in-process finalisation.
+              inProcessCoreSnapshotReport: true,
+              forceRebuild: false, dryRun: false,
+            });
+            if (report.timeseries_binding_source_hierarchy.ok !== true) throw new Error("Binding source hierarchy publication failed");
           }
         }
       }
@@ -923,6 +914,10 @@ function isMainModule(moduleUrl) {
 
 if (isMainModule(import.meta.url)) {
 try {
+  if (!process.argv.includes("--help") && !process.argv.includes("-h")) {
+    const delegated = await delegateBindingPublicationIfNeeded(import.meta.url);
+    if (delegated !== null) process.exit(delegated);
+  }
   const args = parseArgs(process.argv.slice(2));
   reportOutPath = args.report_out || reportOutPath;
   const report = await main(args);

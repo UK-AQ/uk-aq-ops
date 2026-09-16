@@ -1,3 +1,4 @@
+import { assertHistoryPayload, historyResolution, type HistoryResolution } from "./history_generation";
 import { buildJsonResponse, errorEnvelope } from "./http";
 import type { WorkerEnv } from "./upstream";
 import { recordDashboardSupabaseResponse } from "./service_egress_metrics";
@@ -52,14 +53,7 @@ type R2DaySets = {
   aqilevels: Set<string>;
 };
 
-type R2HistoryReadVersionResolution = {
-  version: "v1" | "v2" | null;
-  label: string;
-  source: "env" | "missing_env" | "invalid_env";
-  warning: string | null;
-  valid: boolean;
-  raw: string;
-};
+type R2HistoryReadVersionResolution = HistoryResolution;
 
 type DropboxStatePathResolution = {
   path: string;
@@ -126,13 +120,6 @@ const R2_FREE_ACTION_TYPES = new Set([
   "DeleteBucket",
   "AbortMultipartUpload",
 ]);
-const R2_HISTORY_VERSION_ENV = "UK_AQ_R2_HISTORY_VERSION";
-const R2_HISTORY_READ_VERSION_ACCEPTED = new Set(["v1", "v2"]);
-const DEPRECATED_R2_HISTORY_VERSION_ENVS = [
-  "UK_AQ_R2_HISTORY_READ_VERSION",
-  "UK_AQ_R2_HISTORY_WRITE_VERSION",
-  "UK_AQ_R2_HISTORY_BACKUP_VERSION",
-];
 const DEFAULT_HIERARCHICAL_STATE_PREFIX =
   "_ops/checkpoints/r2_history_backup_state_v2";
 const HIERARCHICAL_STATE_ROOT_KIND =
@@ -205,42 +192,7 @@ function clearStorageCoverageCaches(): void {
 }
 
 function resolveR2HistoryReadVersion(env: WorkerEnv): R2HistoryReadVersionResolution {
-  const presentDeprecated = DEPRECATED_R2_HISTORY_VERSION_ENVS.filter((name) =>
-    Object.prototype.hasOwnProperty.call(env, name)
-  );
-  if (presentDeprecated.length > 0) {
-    return {
-      version: null,
-      label: "R2 invalid",
-      source: "invalid_env",
-      warning: `Deprecated R2 history version env var(s) ${presentDeprecated.join(", ")} are no longer supported. Use ${R2_HISTORY_VERSION_ENV}=v1|v2 and delete the old split vars.`,
-      valid: false,
-      raw: "",
-    };
-  }
-  const raw = String(env.UK_AQ_R2_HISTORY_VERSION || "").trim();
-  const normalized = raw.toLowerCase();
-  if (!normalized) {
-    return {
-      version: null,
-      label: "R2 invalid",
-      source: "missing_env",
-      warning: `Missing ${R2_HISTORY_VERSION_ENV}; set ${R2_HISTORY_VERSION_ENV}=v1 or ${R2_HISTORY_VERSION_ENV}=v2.`,
-      valid: false,
-      raw,
-    };
-  }
-  if (R2_HISTORY_READ_VERSION_ACCEPTED.has(normalized)) {
-    return { version: normalized as "v1" | "v2", label: `R2_${normalized}`, source: "env", warning: null, valid: true, raw };
-  }
-  return {
-    version: null,
-    label: "R2 invalid",
-    source: "invalid_env",
-    warning: `Invalid ${R2_HISTORY_VERSION_ENV}=${JSON.stringify(raw)}; expected v1 or v2. R2 history checks are disabled until this is fixed.`,
-    valid: false,
-    raw,
-  };
+  return historyResolution(env);
 }
 
 function r2HistoryReadVersionCacheKey(env: WorkerEnv): string {
@@ -702,10 +654,10 @@ function parseHistoryDaySets(payload: JsonObject): R2DaySets {
   return sets;
 }
 
-function buildR2Window(daySets: R2DaySets): JsonObject {
+function buildR2Window(daySets: R2DaySets, env: WorkerEnv): JsonObject {
   const overlap: string[] = [];
   for (const day of daySets.observations) {
-    if (daySets.aqilevels.has(day)) {
+    if (historyResolution(env).version === "v3" || daySets.aqilevels.has(day)) {
       overlap.push(day);
     }
   }
@@ -718,7 +670,7 @@ function buildR2Window(daySets: R2DaySets): JsonObject {
     day_count: overlap.length,
     observations_day_count: observations.length,
     aqilevels_day_count: aqilevels.length,
-    count_basis: "explicit_overlap_both_domains",
+    count_basis: historyResolution(env).version === "v3" ? "explicit_observation_days" : "explicit_overlap_both_domains",
   };
 }
 
@@ -761,10 +713,11 @@ async function fetchR2HistoryDays(
       { method: "GET", headers },
       "R2 history-days API",
     );
+    assertHistoryPayload(payload, env);
     const daySets = parseHistoryDaySets(payload);
     const value = {
       daySets,
-      window: buildR2Window(daySets),
+      window: buildR2Window(daySets, env),
       bucket: String(payload.bucket || "").trim() || null,
       error: null,
       readVersion: resolveR2HistoryReadVersion(env),
@@ -1074,7 +1027,7 @@ async function fetchDbMetrics(env: WorkerEnv): Promise<{
     }
     try {
       const payload = await fetchJsonObject(
-        appendQueryParams(externalUrl, { lookback_days: String(lookbackDays) }),
+        appendQueryParams(externalUrl, addR2HistoryReadVersionParam({ lookback_days: String(lookbackDays) }, env)),
         { method: "GET", headers },
         "DB size API",
       );
@@ -1231,23 +1184,7 @@ function resolveDropboxStatePath(env: WorkerEnv): DropboxStatePathResolution {
       readVersion,
     };
   }
-  if (readVersion.version !== "v2") {
-    const warning =
-      "Dropbox backup coverage is available only from the hierarchical v2 checkpoint.";
-    return {
-      path: "",
-      attemptedPaths: [],
-      source: "disabled_non_v2",
-      cacheKey: `dropbox:${r2HistoryReadVersionCacheKey(env)}:disabled_non_v2`,
-      warning,
-      fallbackAttempted: false,
-      readVersion,
-    };
-  }
-  const statePrefix = String(
-    env.UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX
-      || DEFAULT_HIERARCHICAL_STATE_PREFIX,
-  ).trim().replace(/^\/+|\/+$/g, "");
+  const statePrefix = historyResolution(env).generation.backup_state_prefix;
   if (!statePrefix) {
     const warning = "Hierarchical Dropbox state prefix is empty.";
     return {
@@ -1381,7 +1318,9 @@ async function fetchDropboxStateJson(env: WorkerEnv): Promise<{
   }
   try {
     const root = await fetchDropboxJson(token, remotePath);
+    if (root.observation_generation !== historyResolution(env).version) throw new Error("Dropbox checkpoint generation mismatch");
     const references = parseHierarchicalStateMonthReferences(root);
+    if (references.some(ref => !ref.stateKey.startsWith(historyResolution(env).generation.backup_state_prefix + "/"))) throw new Error("Dropbox shard outside selected generation");
     const days = emptyDays();
     const shardErrors: string[] = [];
     await mapWithConcurrency(references, 6, async (reference) => {
@@ -1587,13 +1526,13 @@ function filterDropboxBackupDaysForReadVersion(
   r2Days: R2DaySets | null,
   readVersion: R2HistoryReadVersionResolution,
 ): { days: R2DaySets; warning: string | null } {
-  if (readVersion.version !== "v2") {
+  if (!["v2", "v3"].includes(readVersion.version)) {
     return { days: dropboxDays, warning: null };
   }
   if (!r2Days) {
     return {
       days: { observations: new Set<string>(), aqilevels: new Set<string>() },
-      warning: "Active R2 history version is v2 but explicit v2 history-days data is unavailable; ignoring Dropbox checkpoint day coverage because it is not verified.",
+      warning: `Active R2 history version is ${readVersion.version} but explicit ${readVersion.version} history-days data is unavailable; ignoring Dropbox checkpoint day coverage because it is not verified.`,
     };
   }
 
@@ -1611,12 +1550,12 @@ function filterDropboxBackupDaysForReadVersion(
     }
     if (r2Bounds.earliest && dropboxBounds.earliest && dropboxBounds.earliest < r2Bounds.earliest) {
       warnings.push(
-        `Dropbox v2 ${domainName} checkpoint claims ${dropboxBounds.earliest} before explicit v2 R2 history starts at ${r2Bounds.earliest}; earlier Dropbox days ignored.`,
+        `Dropbox ${domainName} checkpoint claims ${dropboxBounds.earliest} before explicit ${readVersion.version} R2 history starts at ${r2Bounds.earliest}; earlier Dropbox days ignored.`,
       );
     }
     const ignoredCount = dropboxSet.size - filtered[domainName].size;
     if (ignoredCount > 0) {
-      warnings.push(`Ignored ${ignoredCount} unverified Dropbox v2 ${domainName} day(s).`);
+      warnings.push(`Ignored ${ignoredCount} unverified Dropbox ${domainName} day(s) for the ${readVersion.version} serving generation.`);
     }
   }
   return { days: filtered, warning: warnings.length ? warnings.join(" ") : null };
@@ -2029,7 +1968,7 @@ async function fetchDashboardBaseData(
         ? `${dropbox_backup_state_warning} ${filteredDropbox.warning}`
         : filteredDropbox.warning;
     }
-    if (!r2_backup_window && r2_history_read_version.version !== "v2") {
+    if (!r2_backup_window && !["v2", "v3"].includes(r2_history_read_version.version)) {
       const fallbackWindow = await fetchR2BackupWindowFromSupabase(env);
       r2_backup_window = fallbackWindow.window;
       r2_backup_window_error = fallbackWindow.error;
@@ -2038,9 +1977,9 @@ async function fetchDashboardBaseData(
           ? `${r2_history_days_error}; ${r2_backup_window_error}`
           : r2_history_days_error;
       }
-    } else if (!r2_backup_window && r2_history_read_version.version === "v2") {
+    } else if (!r2_backup_window && ["v2", "v3"].includes(r2_history_read_version.version)) {
       r2_backup_window_error = r2_history_days_error ||
-        "R2 history-days API did not return a v2 window; version-blind Supabase window fallback disabled for v2.";
+        `R2 history-days API did not return a ${r2_history_read_version.version} window; version-blind Supabase window fallback disabled for the selected serving generation.`;
     }
     if (options.includeStorageCoverage) {
       storage_coverage_days = buildStorageCoverageRows(
@@ -2114,7 +2053,7 @@ function dashboardCacheKey(search: URLSearchParams, env: WorkerEnv): string {
   const includeMetric = asBoolFlag(search.get("include_metric_context"), true) ? "1" : "0";
   const includeIngest = asBoolFlag(search.get("include_ingest_context"), true) ? "1" : "0";
   const storageKey = includeStorage === "1" ? storageCoverageCacheKey(env) : "storage_coverage:disabled";
-  return `storage=${includeStorage}|metric=${includeMetric}|ingest=${includeIngest}|${storageKey}`;
+  return `${r2HistoryReadVersionCacheKey(env)}|storage=${includeStorage}|metric=${includeMetric}|ingest=${includeIngest}|${storageKey}`;
 }
 
 export async function getDirectDashboardPayload(
@@ -2137,6 +2076,10 @@ export async function getDirectDashboardPayload(
     dispatchCursor: null,
     forceRefresh,
   });
+  if (historyResolution(env).version === "v3") {
+    payload.r2_domain_size_metrics = [];
+    payload.r2_domain_size_metrics_error = "Historical domain byte metrics have no generation identity; unavailable for v3";
+  }
   dashboardCache.set(cacheKey, { value: payload, expiresAt: Date.now() + DASHBOARD_TTL_MS });
   return payload;
 }
@@ -2220,10 +2163,10 @@ export async function getDirectR2MetricsPayload(
     fetchR2Usage(env, forceRefresh),
     fetchR2HistoryDays(env, forceRefresh),
   ]);
-  const fallbackWindow = r2History.readVersion.version === "v2"
+  const fallbackWindow = ["v2", "v3"].includes(r2History.readVersion.version)
     ? {
       window: null,
-      error: "Version-blind Supabase window fallback disabled for v2.",
+      error: `Version-blind Supabase window fallback disabled for the ${r2History.readVersion.version} serving generation.`,
     }
     : await fetchR2BackupWindowFromSupabase(env);
   const window = r2History.window || fallbackWindow.window;
@@ -2269,7 +2212,9 @@ export async function getDirectR2ConnectorCountsPayload(
     }
   }
   params = addR2HistoryReadVersionParam(params, env);
-  return fetchJsonObject(appendQueryParams(apiUrl, params), { method: "GET", headers }, "R2 history-counts API");
+  const payload = await fetchJsonObject(appendQueryParams(apiUrl, params), { method: "GET", headers }, "R2 history-counts API");
+  assertHistoryPayload(payload, env);
+  return payload;
 }
 
 export async function getDirectDailyTaskRunsPayload(

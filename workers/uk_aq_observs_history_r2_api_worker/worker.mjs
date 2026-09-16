@@ -1,3 +1,5 @@
+import observationHistoryV3 from "./worker_v3.mjs";
+import { resolveObservationHistoryGeneration } from "../shared/uk_aq_observation_history_generation.mjs";
 import { parquetMetadataAsync, parquetRead, parquetSchema } from "hyparquet";
 import { compressors } from "hyparquet-compressors";
 import {
@@ -21,7 +23,9 @@ const UPSTREAM_AUTH_HEADER = "x-uk-aq-upstream-auth";
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const OBS_HISTORY_MUTABLE_WINDOW_MS = 24 * HOUR_MS;
+const DAILY_PROVENANCE_PATH = "/v1/daily-validation-provenance";
 const VALID_PATHS = new Set(["/", "/v1/observations", "/v1/timeseries-binding"]);
+const MAX_PROVENANCE_RANGE_MS = 366 * DAY_MS;
 
 function corsHeaders() {
   return {
@@ -498,9 +502,9 @@ async function fetchFilteredParquetRowsFromR2(
         chunkStart,
         chunkEnd,
       );
-      const verificationStatusColumn = schemaColumns.includes(
-        "verification_status",
-      )
+      const verificationStatusColumn = schemaColumns.includes("vstatus")
+        ? "vstatus"
+        : schemaColumns.includes("verification_status")
         ? "verification_status"
         : schemaColumns.includes("status")
         ? "status"
@@ -521,7 +525,7 @@ async function fetchFilteredParquetRowsFromR2(
         outRows.push({
           observed_at: observedAtValues[idx],
           value: valueValues[idx],
-          verification_status:
+          vstatus:
             idx < verificationStatusValues.length &&
               verificationStatusValues[idx] != null
             ? String(verificationStatusValues[idx])
@@ -585,6 +589,11 @@ function appendFilteredRows(rows, {
     outByObservedAt.set(observedAt, {
       observed_at: observedAt,
       value: normalizeValue(row?.value),
+      vstatus: row?.vstatus === "R" || row?.verification_status === "R"
+        ? "R"
+        : row?.vstatus === "P" || row?.verification_status === "P"
+        ? "P"
+        : null,
     });
   }
 }
@@ -700,6 +709,60 @@ function parseObservationsRequest(url) {
     sinceIso,
     limit,
   };
+}
+
+
+function parseDailyProvenanceRequest(url) {
+  if (url.pathname !== DAILY_PROVENANCE_PATH) {
+    return { ok: false, status: 404, error: "Not found." };
+  }
+  const parsed = parseObservationsRequest(new URL(
+    `/v1/observations?${url.searchParams.toString()}`,
+    url,
+  ));
+  if (!parsed.ok) return parsed;
+  if (parsed.connectorId !== 1) {
+    return { ok: false, status: 400, error: "daily provenance is limited to connector_id=1." };
+  }
+  if (Date.parse(parsed.endIso) - Date.parse(parsed.startIso) > MAX_PROVENANCE_RANGE_MS) {
+    return { ok: false, status: 400, error: "daily provenance range must not exceed 366 days." };
+  }
+  return { ...parsed, limit: MAX_LIMIT, sinceIso: null };
+}
+
+function aggregateDailyProvenance(rows) {
+  const daily = new Map();
+  for (const row of rows) {
+    if (row?.value === null || row?.value === undefined ||
+      !Number.isFinite(Number(row.value))) continue;
+    const observedAt = toIsoOrNull(row.observed_at);
+    if (!observedAt) continue;
+    const dayUtc = observedAt.slice(0, 10);
+    const status = row.vstatus === "R" ? "R" : "P";
+    if (status === "P" || !daily.has(dayUtc)) daily.set(dayUtc, status);
+  }
+  return [...daily].sort(([left], [right]) => left.localeCompare(right))
+    .map(([day_utc, vstatus]) => ({ day_utc, vstatus }));
+}
+
+async function handleDailyProvenanceV2(params, env) {
+  const observations = await handleRequest(params, env);
+  const payload = await observations.json();
+  if (!observations.ok || payload.response_complete !== true || payload.has_gap === true) {
+    return jsonResponse({ ok: false, error: "observation provenance is incomplete" }, { status: 502, noStore: true });
+  }
+  const rows = aggregateDailyProvenance(payload.rows);
+  return jsonResponse({
+    ok: true,
+    timeseries_id: params.timeseriesId,
+    connector_id: 1,
+    pollutant: params.pollutantKey,
+    start_utc: params.startIso,
+    end_utc: params.endIso,
+    response_complete: true,
+    has_gap: false,
+    rows,
+  }, { noStore: true });
 }
 
 function parseTimeseriesBindingRequest(url) {
@@ -1442,6 +1505,32 @@ async function handleTimeseriesBindingRequest(requestParams, env) {
 
 export default {
   async fetch(request, env, ctx) {
+    try {
+      const generation = resolveObservationHistoryGeneration(env);
+      for (const [name, expected] of Object.entries({
+        UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX: generation.observations_prefix,
+        UK_AQ_R2_HISTORY_INDEX_V2_PREFIX: generation.index_root_prefix,
+        UK_AQ_R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX: generation.observations_timeseries_index_prefix,
+        UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX: generation.timeseries_binding_index_prefix,
+      })) {
+        if (env[name] && normalizePrefix(env[name]) !== expected) throw new Error(`${name} conflicts with selected generation`);
+      }
+      if (new URL(request.url).pathname === "/v1/history-generation") {
+        const auth = authorized(request, env);
+        if (!auth.ok) return jsonResponse({ ok: false, error: auth.error }, { status: auth.status, noStore: true });
+        if (request.method !== "GET") return jsonResponse({ ok: false, error: "Only GET is supported" }, { status: 405, noStore: true });
+        if (!env.UK_AQ_HISTORY_BUCKET) throw new Error("Missing UK_AQ_HISTORY_BUCKET");
+        return jsonResponse({
+          ok: true, kind: "uk_aq_observation_history_generation", schema_version: 1,
+          read_version: generation.version, source: "stable_observations_history_service",
+          selector: "UK_AQ_R2_HISTORY_VERSION", resolved_at: new Date().toISOString(), generation,
+        }, { noStore: true });
+      }
+      if (generation.version === "v3") return await observationHistoryV3.fetch(request, env, ctx);
+    } catch (error) {
+      return jsonResponse({ ok: false, error: error.message }, { status: 500, noStore: true });
+    }
+
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
@@ -1467,6 +1556,15 @@ export default {
     }
 
     const requestUrl = new URL(request.url);
+    if (requestUrl.pathname === DAILY_PROVENANCE_PATH) {
+      const requestParams = parseDailyProvenanceRequest(requestUrl);
+      if (!requestParams.ok) {
+        return jsonResponse({ ok: false, error: requestParams.error }, {
+          status: requestParams.status, noStore: true,
+        });
+      }
+      return handleDailyProvenanceV2(requestParams, env);
+    }
     if (requestUrl.pathname === "/v1/timeseries-binding") {
       const requestParams = parseTimeseriesBindingRequest(requestUrl);
       if (!requestParams.ok) {

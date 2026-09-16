@@ -1,3 +1,4 @@
+import { resolveHistoryEnvironment } from "../lib/history_generation";
 import { errorEnvelope, okEnvelope } from "../lib/http";
 import { getDirectDashboardPayload } from "../lib/direct";
 import { UpstreamError, type WorkerEnv } from "../lib/upstream";
@@ -40,7 +41,7 @@ async function fetchDashboardPayload(
 ): Promise<DashboardPayload> {
   const params = new URLSearchParams(incomingSearch);
   params.set("include_storage_coverage", includeStorageCoverage ? "1" : "0");
-  const payload = await getDirectDashboardPayload(env, params);
+  const payload = await getDirectDashboardPayload(await resolveHistoryEnvironment(env), params);
   return payload as DashboardPayload;
 }
 

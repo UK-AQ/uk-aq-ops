@@ -43,7 +43,7 @@ import urllib.request
 from collections import Counter
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Callable, Iterable, Literal
+from typing import Any, Callable, Iterable, Literal, Sequence
 
 # The entrypoint is also loaded directly by focused tests, where Python does
 # not automatically place this script directory on sys.path.
@@ -79,6 +79,7 @@ from integrity.current_state.audit import (
     start_target_attempt,
 )
 from integrity.runtime import CANONICAL_REPAIR_STAGE_ORDER
+from integrity.timeseries_binding_provider import binding_backup_view
 
 
 REQUIRED_ENV_VARS = (
@@ -5552,9 +5553,7 @@ def _record_backfill_core_snapshot_identity_audits(
 
 
 def _load_env_file(path: Path) -> dict[str, str]:
-    """Parse a bash-style KEY=VALUE env file. Strips matching surrounding
-    single or double quotes. Skips blank lines and #-comments. Tolerates an
-    optional leading 'export '."""
+    """Parse dotenv KEY=VALUE data without evaluating shell syntax."""
     def _strip_inline_comment(value: str) -> str:
         in_single = False
         in_double = False
@@ -5595,7 +5594,7 @@ def _load_env_file(path: Path) -> dict[str, str]:
         return "".join(out).strip()
 
     out: dict[str, str] = {}
-    with path.open() as fh:
+    with path.open(encoding="utf-8") as fh:
         for raw in fh:
             line = raw.strip()
             if not line or line.startswith("#") or "=" not in line:
@@ -5604,14 +5603,15 @@ def _load_env_file(path: Path) -> dict[str, str]:
             key = key.strip()
             if key.startswith("export "):
                 key = key[len("export "):].strip()
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+                continue
             val = _strip_inline_comment(val)
             if len(val) >= 2 and (
                 (val.startswith('"') and val.endswith('"'))
                 or (val.startswith("'") and val.endswith("'"))
             ):
                 val = val[1:-1]
-            if key:
-                out[key] = val
+            out[key] = val
     return out
 
 
@@ -18263,7 +18263,9 @@ def _observation_rows_from_local_parquet_for_shared_hash(
                 + ",".join(missing)
             )
         status_column = (
-            "verification_status"
+            "vstatus"
+            if "vstatus" in columns
+            else "verification_status"
             if "verification_status" in columns
             else "status"
             if "status" in columns
@@ -22480,19 +22482,14 @@ def _validate_changed_timeseries_metadata(
     return gaps
 
 
-def _validate_v2_timeseries_bindings(
-    *, conn: sqlite3.Connection | None, view_root: Path, config: HistoryPathConfig,
-) -> list[dict[str, Any]]:
-    """Validate stable bindings against the imported v2 core snapshot.
-
-    Bindings are deliberately independent of daily observation/AQI coverage.
-    Missing or stale objects are reported only; this integrity path never
-    deletes R2 objects.  The dedicated core-snapshot reconciliation command
-    is the repair mechanism.
-    """
+def _expected_v2_core_timeseries_bindings(
+    conn: sqlite3.Connection | None,
+    *,
+    allowed_connector_ids: set[int] | None = None,
+) -> dict[int, dict[str, Any]]:
     authoritative = _authoritative_v2_core_timeseries_bindings(conn)
     if not authoritative:
-        return []
+        return {}
     expected_by_id: dict[int, dict[str, Any]] = {}
     for raw in authoritative:
         try:
@@ -22501,6 +22498,11 @@ def _validate_v2_timeseries_bindings(
         except (KeyError, TypeError, ValueError):
             continue
         if timeseries_id <= 0 or connector_id <= 0:
+            continue
+        if (
+            allowed_connector_ids is not None
+            and connector_id not in allowed_connector_ids
+        ):
             continue
         expected = {
             "timeseries_id": timeseries_id,
@@ -22516,6 +22518,28 @@ def _validate_v2_timeseries_bindings(
                 expected[field] = value
         if expected["pollutant_code"]:
             expected_by_id[timeseries_id] = expected
+    return expected_by_id
+
+
+def _validate_v2_timeseries_bindings(
+    *,
+    conn: sqlite3.Connection | None,
+    view_root: Path,
+    config: HistoryPathConfig,
+    allowed_connector_ids: set[int] | None = None,
+) -> list[dict[str, Any]]:
+    """Validate stable bindings against the imported v2 core snapshot.
+
+    Bindings are deliberately independent of daily observation/AQI coverage.
+    Missing or stale objects are reported only; this integrity path never
+    deletes R2 objects.  The dedicated core-snapshot reconciliation command
+    is the repair mechanism.  The optional connector scope lets SOS-light use
+    the same semantics without assuming unrelated physical bindings exist.
+    """
+    expected_by_id = _expected_v2_core_timeseries_bindings(
+        conn,
+        allowed_connector_ids=allowed_connector_ids,
+    )
     if not expected_by_id:
         return []
 
@@ -22528,7 +22552,19 @@ def _validate_v2_timeseries_bindings(
         "connector_id", "pollutant_code", "station_id", "phenomenon_id",
         "observed_property_id", "continuity",
     }
-    for path in sorted(binding_root.glob("timeseries_id=*.json")) if binding_root.is_dir() else []:
+    binding_paths = (
+        [
+            binding_root / f"timeseries_id={timeseries_id}.json"
+            for timeseries_id in sorted(expected_by_id)
+            if (binding_root / f"timeseries_id={timeseries_id}.json").is_file()
+        ]
+        if allowed_connector_ids is not None
+        else (
+            sorted(binding_root.glob("timeseries_id=*.json"))
+            if binding_root.is_dir() else []
+        )
+    )
+    for path in binding_paths:
         relative_key = path.relative_to(view_root).as_posix()
         match = re.fullmatch(r"timeseries_id=([1-9]\d*)\.json", path.name)
         if not match:
@@ -22586,6 +22622,90 @@ def _validate_v2_timeseries_bindings(
             "gap_type": "timeseries_binding_missing_reconcile_from_core",
         })
     return gaps
+
+
+def run_sos_timeseries_binding_verification(
+    *,
+    conn: sqlite3.Connection,
+    config: HistoryPathConfig,
+    individual_root: Path,
+    backup_mode: str,
+    pack_root: Path | None,
+    stage: str,
+    log: logging.Logger | None = None,
+) -> dict[str, Any]:
+    """Run established connector-1 semantics through one physical provider."""
+    connector_ids = {1}
+    expected = _expected_v2_core_timeseries_bindings(
+        conn,
+        allowed_connector_ids=connector_ids,
+    )
+    required_ids = set(expected)
+    provider_audit: dict[str, Any]
+    with binding_backup_view(
+        mode=backup_mode,
+        individual_root=individual_root,
+        pack_root=pack_root,
+        required_timeseries_ids=required_ids,
+    ) as (view_root, mutable_audit):
+        provider_audit = mutable_audit
+        gaps = _validate_v2_timeseries_bindings(
+            conn=conn,
+            view_root=view_root,
+            config=config,
+            allowed_connector_ids=connector_ids,
+        )
+    result = {
+        "stage": stage,
+        "status": "ok" if not gaps else "fail",
+        "connector_ids": [1],
+        "required_binding_count": len(required_ids),
+        "semantic_binding_count_checked": len(required_ids),
+        "gap_count": len(gaps),
+        "gaps": gaps,
+        "provider": dict(provider_audit),
+    }
+    if log is not None:
+        log.info(
+            "SOS timeseries binding verification stage=%s mode=%s status=%s "
+            "required=%s gaps=%s ranges_verified=%s members_verified=%s "
+            "materialised=%s non_sos_materialised=%s cleanup=%s",
+            stage,
+            backup_mode,
+            result["status"],
+            result["required_binding_count"],
+            result["gap_count"],
+            provider_audit.get("ranges_verified"),
+            provider_audit.get("total_pack_members_verified"),
+            provider_audit.get("sos_bindings_materialised"),
+            provider_audit.get("non_sos_bindings_materialised"),
+            provider_audit.get("cleanup_outcome"),
+        )
+    return result
+
+
+def run_pack_mode_sos_timeseries_binding_verification(
+    *,
+    conn: sqlite3.Connection,
+    config: HistoryPathConfig,
+    individual_root: Path,
+    backup_mode: str,
+    pack_root: Path | None,
+    stage: str,
+    log: logging.Logger | None = None,
+) -> dict[str, Any] | None:
+    """Route Phase 3 SOS binding verification only for explicit pack mode."""
+    if backup_mode != "pack":
+        return None
+    return run_sos_timeseries_binding_verification(
+        conn=conn,
+        config=config,
+        individual_root=individual_root,
+        backup_mode=backup_mode,
+        pack_root=pack_root,
+        stage=stage,
+        log=log,
+    )
 
 
 def _resolve_run_scoped_apply_artifact(
@@ -23997,6 +24117,149 @@ def resolve_history_writer_database_url(env: Mapping[str, str]) -> str:
         except OSError:
             pass
     return str(resolved.get("SUPABASE_DB_URL") or resolved.get("DATABASE_URL") or "").strip()
+
+
+def observations_global_operation_lock_context(
+    env: Mapping[str, str],
+) -> dict[str, Any]:
+    held = str(
+        env.get("UK_AQ_OBSERVATIONS_GLOBAL_OPERATION_LOCK_HELD") or ""
+    ).strip().lower() == "true"
+    owner = str(
+        env.get("UK_AQ_OBSERVATIONS_GLOBAL_OPERATION_LOCK_OWNER") or ""
+    ).strip()
+    run_id = str(
+        env.get("UK_AQ_OBSERVATIONS_GLOBAL_OPERATION_LOCK_RUN_ID") or ""
+    ).strip()
+    logical_identity = str(
+        env.get("UK_AQ_OBSERVATIONS_GLOBAL_OPERATION_LOCK_IDENTITY") or ""
+    ).strip()
+    nonce = str(
+        env.get("UK_AQ_OBSERVATIONS_GLOBAL_OPERATION_LOCK_NONCE") or ""
+    ).strip()
+    acquired = str(
+        env.get("UK_AQ_OBSERVATIONS_GLOBAL_OPERATION_LOCK_ACQUIRED") or ""
+    ).strip().lower() == "true"
+    try:
+        wait_ms = int(
+            env.get("UK_AQ_OBSERVATIONS_GLOBAL_OPERATION_LOCK_WAIT_MS") or "0"
+        )
+    except (TypeError, ValueError):
+        wait_ms = -1
+    outcome = str(
+        env.get("UK_AQ_OBSERVATIONS_GLOBAL_OPERATION_LOCK_OUTCOME") or ""
+    ).strip()
+    valid = bool(
+        held
+        and acquired
+        and owner == "integrity"
+        and run_id
+        and nonce
+        and logical_identity
+        and wait_ms >= 0
+        and outcome == "held"
+    )
+    return {
+        "held": held,
+        "valid": valid,
+        "owner": owner or None,
+        "run_id": run_id or None,
+        "logical_identity": logical_identity or None,
+        "acquired": acquired,
+        "wait_ms": wait_ms if wait_ms >= 0 else None,
+        "outcome": outcome or ("held" if valid else "not_held"),
+    }
+
+
+def run_integrity_under_global_operation_lock(
+    *,
+    argv: Sequence[str],
+    args: argparse.Namespace,
+    env: Mapping[str, str],
+    run_compact: str,
+) -> int:
+    repo_root = _repo_root_for_integrity_script(env)
+    node_bin = str(env.get("UK_AQ_BACKFILL_NODE_BIN") or shutil.which("node") or "node")
+    database_url = resolve_history_writer_database_url(env)
+    if not database_url:
+        raise RuntimeError(
+            "SUPABASE_DB_URL (or DATABASE_URL) is required for the Integrity observations global operation lock"
+        )
+    lock_run_id = f"integrity:{args.env}:{run_compact}"
+    command = [
+        node_bin,
+        str(
+            repo_root
+            / "scripts/operations/uk_aq_with_observations_global_operation_lock.mjs"
+        ),
+        "--owner", "integrity",
+        "--run-id", lock_run_id,
+        "--",
+        sys.executable,
+        str(Path(__file__).resolve()),
+        *[str(value) for value in argv],
+    ]
+    completed = subprocess.run(
+        command,
+        cwd=repo_root,
+        env={
+            **os.environ,
+            **{str(key): str(value) for key, value in env.items()},
+            "SUPABASE_DB_URL": database_url,
+        },
+        check=False,
+    )
+    return int(completed.returncode)
+
+
+def run_integrity_dropbox_currentness_gate(
+    *,
+    env: Mapping[str, str],
+    dropbox_root: str | Path,
+    observations_prefix: str,
+    timeseries_binding_backup_mode: str,
+) -> dict[str, Any]:
+    repo_root = _repo_root_for_integrity_script(env)
+    node_bin = str(env.get("UK_AQ_BACKFILL_NODE_BIN") or shutil.which("node") or "node")
+    command = [
+        node_bin,
+        str(
+            repo_root
+            / "scripts/backup_r2/uk_aq_check_integrity_dropbox_currentness.mjs"
+        ),
+        "--dropbox-root", str(dropbox_root),
+        "--observation-generation", "v2",
+        "--observations-prefix", observations_prefix,
+        "--timeseries-binding-backup-mode", timeseries_binding_backup_mode,
+    ]
+    completed = subprocess.run(
+        command,
+        cwd=repo_root,
+        env={**os.environ, **{str(key): str(value) for key, value in env.items()}},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    try:
+        output = json.loads(completed.stdout) if completed.stdout.strip() else {}
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            "Integrity Dropbox currentness gate returned invalid JSON"
+        ) from exc
+    if completed.returncode not in {0, 2}:
+        raise RuntimeError(
+            _truncate_text(
+                completed.stderr
+                or completed.stdout
+                or "Integrity Dropbox currentness gate failed",
+                4000,
+            )
+        )
+    if not isinstance(output, dict) or not isinstance(output.get("allowed"), bool):
+        raise RuntimeError(
+            "Integrity Dropbox currentness gate returned an unexpected result"
+        )
+    return output
 
 
 def run_integrity_ingest_boundary_check(
@@ -25704,6 +25967,8 @@ def run_v2_integrity_repair_flow(
     repair_pollutants: Iterable[str] | None = None,
     dedicated_sos_historical_replacement: bool = False,
     protected_connector_ids: Iterable[int] | None = None,
+    timeseries_binding_backup_mode: str = "individual",
+    timeseries_binding_pack_root: Path | None = None,
 ) -> dict[str, Any]:
     """Build one canonical local proposal, then optionally apply and verify it."""
     validate_run_state_core_snapshot_identity(
@@ -26352,6 +26617,29 @@ def run_v2_integrity_repair_flow(
             run_state=run_state,
             apply_result=apply_result,
         )
+        binding_final = run_pack_mode_sos_timeseries_binding_verification(
+            conn=conn,
+            config=final_verification_config,
+            individual_root=Path(str(run_state["base_dropbox_root"])),
+            backup_mode=timeseries_binding_backup_mode,
+            pack_root=timeseries_binding_pack_root,
+            stage="repair_final",
+            log=log,
+        )
+        if binding_final is not None:
+            run_state["timeseries_binding_final_verification"] = binding_final
+            write_run_state(run_state)
+            final_verification["timeseries_binding"] = binding_final
+            binding_gaps = list(binding_final.get("gaps") or [])
+            if binding_gaps:
+                final_verification["remaining_scopes"].extend(binding_gaps)
+                final_verification["remaining_gap_count"] = len(
+                    final_verification["remaining_scopes"]
+                )
+                final_verification["status"] = "failed"
+                final_verification[
+                    "final_sos_light_r2_verification_status"
+                ] = "failed"
     else:
         final_verification = run_v2_final_verification(
             run_state=run_state,
@@ -26728,7 +27016,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         prog="uk-aq-history-integrity",
         description="UK-AQ History Integrity entrypoint (Phase 1).",
     )
-    p.add_argument("--env", required=True, choices=["CIC-Test", "LIVE"])
+    p.add_argument("--env", required=True, choices=["TEST", "LIVE"])
     p.add_argument(
         "--profile",
         default="manual",
@@ -26814,6 +27102,23 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--timeseries-binding-backup-mode",
+        choices=["individual", "pack"],
+        default="individual",
+        help=(
+            "Physical Dropbox binding representation for source=sos "
+            "(default: individual)."
+        ),
+    )
+    p.add_argument(
+        "--timeseries-binding-pack-root",
+        default=None,
+        help=(
+            "Absolute local Dropbox root containing packed bindings; defaults "
+            "to the normal R2 history Dropbox root in pack mode."
+        ),
+    )
+    p.add_argument(
         "--check-aqi-debug",
         action="store_true",
         default=_parse_bool(os.environ.get("UK_AQ_R2_HISTORY_INTEGRITY_CHECK_AQI_DEBUG"), False),
@@ -26850,6 +27155,24 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         )
     if parsed.env == "LIVE" and parsed.enable_historical_identity_repair:
         p.error("historical identity repair must remain disabled in LIVE")
+    if parsed.timeseries_binding_pack_root:
+        pack_root = Path(parsed.timeseries_binding_pack_root)
+        if parsed.timeseries_binding_backup_mode != "pack":
+            p.error("--timeseries-binding-pack-root requires pack mode")
+        if not pack_root.is_absolute():
+            p.error("--timeseries-binding-pack-root must be absolute")
+        if "archive" in pack_root.parts:
+            p.error("--timeseries-binding-pack-root must not point into archive")
+        other_environment = "LIVE" if parsed.env == "TEST" else "TEST"
+        if f"/{other_environment}/" in pack_root.as_posix():
+            p.error(
+                "--timeseries-binding-pack-root points at the other environment"
+            )
+    if parsed.timeseries_binding_backup_mode == "pack":
+        if parsed.source != "sos":
+            p.error("pack binding mode is currently supported only with --source sos")
+        if parsed.env != "TEST":
+            p.error("pack binding mode is currently TEST-only")
     return parsed
 
 
@@ -27185,41 +27508,8 @@ def run_scheduled_backup_gate(args: argparse.Namespace, started_iso: str) -> dic
     )
 
 
-def _parse_env_assignment_line(raw_line: str) -> tuple[str, str] | None:
-    line = raw_line.strip()
-    if not line or line.startswith("#"):
-        return None
-    if line.startswith("export "):
-        line = line[len("export "):].lstrip()
-    if "=" not in line:
-        return None
-    key, raw_value = line.split("=", 1)
-    key = key.strip()
-    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key):
-        return None
-    value_part = raw_value.strip()
-    if not value_part:
-        return key, ""
-    try:
-        pieces = shlex.split(value_part, comments=True, posix=True)
-    except ValueError:
-        pieces = [value_part.strip().strip("'\"")]
-    if not pieces:
-        return key, ""
-    return key, pieces[0]
-
-
 def load_env_file_assignments(path: str | Path) -> dict[str, str]:
-    env_path = Path(path).expanduser()
-    values: dict[str, str] = {}
-    with env_path.open("r", encoding="utf-8") as handle:
-        for raw_line in handle:
-            parsed = _parse_env_assignment_line(raw_line)
-            if parsed is None:
-                continue
-            key, value = parsed
-            values[key] = value
-    return values
+    return _load_env_file(Path(path).expanduser())
 
 
 def load_backfill_env_file_if_set(*, override_existing: bool = False) -> dict[str, Any]:
@@ -27279,7 +27569,7 @@ def validate_guardrails(cli_env: str, env: dict[str, str]) -> None:
         )
         sys.exit(4)
 
-    other = "LIVE" if cli_env == "CIC-Test" else "CIC-Test"
+    other = "LIVE" if cli_env == "TEST" else "TEST"
     fragment = f"/{other}/"
     for var in PATH_VARS_FOR_GUARDRAILS:
         val = os.environ.get(var, "")
@@ -27734,7 +28024,7 @@ def _collect_guardrail_errors(cli_env: str, env: dict[str, str]) -> list[str]:
         errors.append(
             f"--env={cli_env} but UK_AQ_ENV_NAME={env['UK_AQ_ENV_NAME']}. Refusing to run.",
         )
-    other = "LIVE" if cli_env == "CIC-Test" else "CIC-Test"
+    other = "LIVE" if cli_env == "TEST" else "TEST"
     fragment = f"/{other}/"
     for var in PATH_VARS_FOR_GUARDRAILS:
         val = os.environ.get(var, "")
@@ -27946,7 +28236,7 @@ def collect_preflight_errors(
                 loaded_daily_env = _load_env_file(env_file_path)
 
         if env_file_raw:
-            other_env = "LIVE" if args.env == "CIC-Test" else "CIC-Test"
+            other_env = "LIVE" if args.env == "TEST" else "TEST"
             if f"/{other_env}/" in env_file_raw:
                 errors.append(
                     f"--env {args.env} but UK_AQ_BACKFILL_ENV_FILE contains /{other_env}/. Refusing to run.",
@@ -28001,7 +28291,7 @@ def collect_preflight_errors(
                 loaded_backfill_env = _load_env_file(env_file_path)
 
         if env_file_raw:
-            other_env = "LIVE" if args.env == "CIC-Test" else "CIC-Test"
+            other_env = "LIVE" if args.env == "TEST" else "TEST"
             if f"/{other_env}/" in env_file_raw:
                 errors.append(
                     f"--env {args.env} but UK_AQ_BACKFILL_ENV_FILE contains /{other_env}/. Refusing to run.",
@@ -28038,7 +28328,7 @@ def collect_preflight_errors(
                 errors.append(
                     f"UK_AQ_BACKFILL_WRAPPER in UK_AQ_BACKFILL_ENV_FILE is not executable: {nested_wrapper_path}",
                 )
-            if f"/{'LIVE' if args.env == 'CIC-Test' else 'CIC-Test'}/" in nested_wrapper:
+            if f"/{'LIVE' if args.env == 'TEST' else 'TEST'}/" in nested_wrapper:
                 errors.append(
                     f"--env {args.env} but nested UK_AQ_BACKFILL_WRAPPER contains the other env path: {nested_wrapper}",
                 )
@@ -29536,6 +29826,8 @@ def format_summary_md(s: dict[str, Any]) -> str:
                     first_value_evidence = (
                         obs.get("first_value_at_evidence") or {}
                     )
+                    binding_check = hvr.get("timeseries_bindings") or {}
+                    binding_provider = binding_check.get("provider") or {}
                     source_scope_line = "all connectors"
                     if source_scope.get("scope") == "source":
                         connector_ids = source_scope.get("connector_ids") or []
@@ -29569,6 +29861,26 @@ def format_summary_md(s: dict[str, Any]) -> str:
                         f"- Checked AQI hourly data partitions: {aqi.get('checked_partitions', 0)}",
                         f"- AQI hourly data gaps: {aqi.get('gap_count', len(aqi.get('gaps') or []))}",
                     ])
+                    if binding_check:
+                        lines.extend([
+                            "",
+                            "### SOS timeseries binding input",
+                            "",
+                            f"- Stage: {binding_check.get('stage') or '(none)'}",
+                            f"- Status: {binding_check.get('status') or '(none)'}",
+                            f"- Mode: {binding_provider.get('mode') or '(none)'}",
+                            f"- Pack root SHA-256: {binding_provider.get('pack_root_sha256') or '(not applicable)'}",
+                            f"- Source root hash: {binding_provider.get('source_root_hash') or '(not applicable)'}",
+                            f"- Ranges verified: {binding_provider.get('ranges_verified', 0)}",
+                            f"- Pack bytes verified: {binding_provider.get('total_pack_bytes_verified', 0)}",
+                            f"- Pack members verified: {binding_provider.get('total_pack_members_verified', 0)}",
+                            f"- SOS bindings selected: {binding_provider.get('sos_bindings_selected', 0)}",
+                            f"- SOS bindings materialised: {binding_provider.get('sos_bindings_materialised', 0)}",
+                            f"- Non-SOS bindings materialised: {binding_provider.get('non_sos_bindings_materialised', 0)}",
+                            f"- Temporary path: {binding_provider.get('temporary_path') or '(none)'}",
+                            f"- Cleanup: {binding_provider.get('cleanup_outcome') or '(none)'}",
+                            f"- Semantic binding gaps: {binding_check.get('gap_count', 0)}",
+                        ])
                     if source_resolution:
                         source_resolution_sample = next(
                             iter(source_resolution.values())
@@ -29879,9 +30191,11 @@ def main(argv: list[str]) -> int:
     log = logging.getLogger("uk-aq-history-integrity")
 
     log.info(
-        "start env=%s profile=%s source=%s dry_run=%s check_only=%s run_backfill=%s",
+        "start env=%s profile=%s source=%s dry_run=%s check_only=%s "
+        "run_backfill=%s timeseries_binding_backup_mode=%s",
         args.env, args.profile, args.source,
         args.dry_run, args.check_only, args.run_backfill,
+        args.timeseries_binding_backup_mode,
     )
     log.info("db=%s", env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"])
     log.info("log_file=%s", log_path)
@@ -29900,6 +30214,8 @@ def main(argv: list[str]) -> int:
         "backup_gate_checked": False,
         "blocked_reason": "awaiting_ingestdb_boundary",
     }
+    global_operation_lock = observations_global_operation_lock_context(os.environ)
+    dropbox_currentness: dict[str, Any] | None = None
 
     preflight_summary: dict[str, Any] | None = None
     repair_overlay: dict[str, Any] | None = None
@@ -29957,6 +30273,15 @@ def main(argv: list[str]) -> int:
                 dedicated_sos_historical_replacement
             ),
             "dropbox_baseline": resolve_r2_history_root(os.environ),
+            "timeseries_binding_backup_mode": (
+                args.timeseries_binding_backup_mode
+            ),
+            "timeseries_binding_pack_root": (
+                args.timeseries_binding_pack_root
+                or resolve_r2_history_root(os.environ)
+                if args.timeseries_binding_backup_mode == "pack"
+                else None
+            ),
             "repair_mode": bool(args.run_backfill),
             "db_path": env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"],
             "log_path": str(log_path),
@@ -30081,6 +30406,79 @@ def main(argv: list[str]) -> int:
         write_reports(env["UK_AQ_HISTORY_INTEGRITY_REPORT_DIR"], run_compact, summary)
         return 2
 
+    if global_operation_lock.get("held") and not global_operation_lock.get("valid"):
+        raise RuntimeError(
+            "Integrity received an invalid observations global operation lock context"
+        )
+    if not global_operation_lock.get("valid"):
+        return run_integrity_under_global_operation_lock(
+            argv=argv,
+            args=args,
+            env=env,
+            run_compact=run_compact,
+        )
+
+    # The child process is now inside the retained PostgreSQL session lock.
+    # Load the existing optional backfill environment before resolving live R2
+    # credentials, then pin the complete Dropbox checkpoint to the locked live
+    # observations root. This gate cannot be bypassed by --allow-stale-dropbox.
+    load_backfill_env_file_if_set()
+    dropbox_root = resolve_r2_history_root(os.environ)
+    if not dropbox_root:
+        dropbox_currentness = {
+            "allowed": False,
+            "status": "blocked_dropbox_root_unavailable",
+            "checkpoint_live_root_match": False,
+        }
+    else:
+        dropbox_currentness = run_integrity_dropbox_currentness_gate(
+            env={**env, **os.environ},
+            dropbox_root=dropbox_root,
+            observations_prefix=history_path_configs["v2"].observations_data_prefix,
+            timeseries_binding_backup_mode=(
+                args.timeseries_binding_backup_mode
+            ),
+        )
+    log.info(
+        "observations global operation lock: %s",
+        json.dumps(global_operation_lock, sort_keys=True, default=str),
+    )
+    log.info(
+        "Dropbox checkpoint/live observations root gate: %s",
+        json.dumps(dropbox_currentness, sort_keys=True, default=str),
+    )
+    if not dropbox_currentness.get("allowed"):
+        summary = {
+            "env": args.env,
+            "profile": args.profile,
+            "source": args.source,
+            "from_day": from_day,
+            "to_day": to_day,
+            "date_selection": selection_summary,
+            "started_at_utc": started_iso,
+            "finished_at_utc": fmt_iso(utc_now()),
+            "status": "blocked_dropbox_checkpoint_not_current",
+            "dry_run": bool(args.dry_run),
+            "check_only": bool(args.check_only),
+            "run_backfill": bool(args.run_backfill),
+            "effective_mode": effective_mode,
+            "dropbox_baseline": str(dropbox_root or ""),
+            "repair_mode": bool(args.run_backfill),
+            "allow_stale_dropbox": bool(args.allow_stale_dropbox),
+            "db_path": env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"],
+            "log_path": str(log_path),
+            "history_version_mode": history_version_mode,
+            "checked_versions": checked_history_versions,
+            "history_path_configs": serialized_history_path_configs,
+            "observations_global_operation_lock": global_operation_lock,
+            "dropbox_currentness": dropbox_currentness,
+            "backup_readiness": backup_gate_summary,
+            "ingestdb_boundary": ingest_boundary,
+            "metrics": {},
+        }
+        write_reports(env["UK_AQ_HISTORY_INTEGRITY_REPORT_DIR"], run_compact, summary)
+        return 2
+
     backup_gate_summary = run_scheduled_backup_gate(args, started_iso)
     log.info("dropbox backup gate: %s", json.dumps(backup_gate_summary, sort_keys=True, default=str))
     if not backup_gate_summary.get("backup_ready"):
@@ -30109,6 +30507,8 @@ def main(argv: list[str]) -> int:
             "history_path_configs": serialized_history_path_configs,
             "backup_readiness": backup_gate_summary,
             "ingestdb_boundary": ingest_boundary,
+            "observations_global_operation_lock": global_operation_lock,
+            "dropbox_currentness": dropbox_currentness,
             "metrics": {},
         }
         write_reports(env["UK_AQ_HISTORY_INTEGRITY_REPORT_DIR"], run_compact, summary)
@@ -30333,6 +30733,7 @@ def main(argv: list[str]) -> int:
         sc_metrics: dict[str, Any] = dict(empty_metrics)
         sos_metrics: dict[str, Any] = dict(empty_metrics)
         cross_check_metrics: dict[str, Any] = dict(empty_metrics)
+        sos_binding_verification: dict[str, Any] | None = None
         verified_first_value_at_connector_days: list[dict[str, Any]] = []
         lookup_source_counts: dict[str, dict[str, int]] = (
             collect_lookup_active_counts_by_source(conn)
@@ -30580,6 +30981,50 @@ def main(argv: list[str]) -> int:
                 "cross_checks_mismatch": int(v2_obs.get("gap_count", 0) or 0) + int(v2_aqi.get("gap_count", 0) or 0) + int((v2_aqi.get("debug") or {}).get("gap_count", 0) or 0),
                 "discrepancy_total": int(v2_obs.get("gap_count", 0) or 0) + int(v2_aqi.get("gap_count", 0) or 0) + int((v2_aqi.get("debug") or {}).get("gap_count", 0) or 0),
             }
+        if args.source == "sos" and snapshot_ok:
+            individual_binding_root = Path(
+                str(resolve_r2_history_root(os.environ) or "")
+            )
+            packed_binding_root = Path(
+                args.timeseries_binding_pack_root
+                or str(individual_binding_root)
+            )
+            sos_binding_verification = run_pack_mode_sos_timeseries_binding_verification(
+                conn=conn,
+                config=history_path_configs["v2"],
+                individual_root=individual_binding_root,
+                backup_mode=args.timeseries_binding_backup_mode,
+                pack_root=packed_binding_root,
+                stage="check_only" if effective_mode == "check_only" else "pre_repair",
+                log=log,
+            )
+            if sos_binding_verification is not None:
+                binding_gap_count = int(
+                    sos_binding_verification.get("gap_count") or 0
+                )
+                cross_check_metrics["v2_timeseries_bindings"] = (
+                    sos_binding_verification
+                )
+                cross_check_metrics["cross_checks_total"] = int(
+                    cross_check_metrics.get("cross_checks_total") or 0
+                ) + int(
+                    sos_binding_verification.get("required_binding_count") or 0
+                )
+                cross_check_metrics["cross_checks_ok"] = int(
+                    cross_check_metrics.get("cross_checks_ok") or 0
+                ) + (
+                    int(
+                        sos_binding_verification.get("required_binding_count")
+                        or 0
+                    )
+                    if binding_gap_count == 0 else 0
+                )
+                cross_check_metrics["cross_checks_mismatch"] = int(
+                    cross_check_metrics.get("cross_checks_mismatch") or 0
+                ) + binding_gap_count
+                cross_check_metrics["discrepancy_total"] = int(
+                    cross_check_metrics.get("discrepancy_total") or 0
+                ) + binding_gap_count
         if cross_check_metrics.get("ran"):
             v2_backfill_metrics = run_v2_gap_backfills(
                 conn=conn,
@@ -30648,7 +31093,19 @@ def main(argv: list[str]) -> int:
                 result=current_state_plan,
             )
 
-        if mode_creates_repair_overlay(effective_mode):
+        if (
+            mode_creates_repair_overlay(effective_mode)
+            and sos_binding_verification is not None
+            and sos_binding_verification.get("status") == "fail"
+        ):
+            repair_flow = {
+                "status": "blocked_dependency",
+                "reason": "sos_timeseries_binding_semantic_verification_failed",
+                "r2_write_attempted": False,
+                "stage_order": list(CANONICAL_REPAIR_STAGE_ORDER),
+                "timeseries_binding": sos_binding_verification,
+            }
+        elif mode_creates_repair_overlay(effective_mode):
             dropbox_root = resolve_r2_history_root({**os.environ, **env})
             if not dropbox_root:
                 raise RuntimeError("UK_AQ_R2_HISTORY_DROPBOX_ROOT is required for the v2 repair overlay")
@@ -30661,6 +31118,22 @@ def main(argv: list[str]) -> int:
             repair_overlay["effective_mode"] = effective_mode
             repair_overlay["dropbox_baseline"] = str(dropbox_root)
             repair_overlay["allow_stale_dropbox"] = bool(args.allow_stale_dropbox)
+            if sos_binding_verification is not None:
+                repair_overlay["timeseries_binding_backup_mode"] = (
+                    args.timeseries_binding_backup_mode
+                )
+                repair_overlay["timeseries_binding_pack_root"] = (
+                    args.timeseries_binding_pack_root or str(dropbox_root)
+                )
+                repair_overlay[
+                    "timeseries_binding_pre_repair_verification"
+                ] = sos_binding_verification
+            repair_overlay["observations_global_operation_lock"] = dict(
+                global_operation_lock
+            )
+            repair_overlay["dropbox_currentness"] = dict(
+                dropbox_currentness or {}
+            )
             repair_overlay["execution_path"] = sos_historical_route.get(
                 "execution_path"
             )
@@ -30743,6 +31216,14 @@ def main(argv: list[str]) -> int:
                         dedicated_sos_historical_replacement
                     ),
                     protected_connector_ids=protected_connector_ids,
+                    timeseries_binding_backup_mode=(
+                        args.timeseries_binding_backup_mode
+                    ),
+                    timeseries_binding_pack_root=(
+                        Path(args.timeseries_binding_pack_root)
+                        if args.timeseries_binding_pack_root
+                        else Path(str(dropbox_root))
+                    ),
                 )
             aqi_stage = next(
                 (
@@ -30801,6 +31282,7 @@ def main(argv: list[str]) -> int:
             int((cross_check_metrics.get("v2_observations") or {}).get("gap_count", 0) or 0)
             + int((cross_check_metrics.get("v2_aqilevels") or {}).get("gap_count", 0) or 0)
             + int(((cross_check_metrics.get("v2_aqilevels") or {}).get("debug") or {}).get("gap_count", 0) or 0 if ((cross_check_metrics.get("v2_aqilevels") or {}).get("debug") or {}).get("required") else 0)
+            + int((sos_binding_verification or {}).get("gap_count") or 0)
         )
         coordinator_failed = repair_flow.get("status") in {"failed", "blocked_dependency"}
         final_verification = repair_flow.get("final_verification") or {}
@@ -31290,10 +31772,19 @@ def main(argv: list[str]) -> int:
         v2_result: dict[str, Any] = {
             "history_version": CURRENT_INTEGRITY_HISTORY_VERSION,
             "checks_implemented": True,
-            "status": "fail" if v2_obs.get("status") == "fail" or v2_aqi.get("status") == "fail" else "ok",
+            "status": "fail" if (
+                v2_obs.get("status") == "fail"
+                or v2_aqi.get("status") == "fail"
+                or (
+                    sos_binding_verification is not None
+                    and sos_binding_verification.get("status") == "fail"
+                )
+            ) else "ok",
             "observations": v2_obs,
             "aqilevels": v2_aqi,
         }
+        if sos_binding_verification is not None:
+            v2_result["timeseries_bindings"] = sos_binding_verification
         final_result = repair_flow.get("final_verification") or {}
         if args.run_backfill and not args.dry_run and final_result.get("ran"):
             recheck = final_result.get("recheck") or {}
@@ -31305,6 +31796,12 @@ def main(argv: list[str]) -> int:
                 "observations": recheck.get("observations") or v2_obs,
                 "aqilevels": recheck.get("aqilevels") or v2_aqi,
             })
+            final_binding_result = (
+                final_result.get("timeseries_binding")
+                or sos_binding_verification
+            )
+            if final_binding_result is not None:
+                v2_result["timeseries_bindings"] = final_binding_result
         elif args.run_backfill and args.dry_run:
             v2_result["final_verified"] = False
             v2_result["final_verification"] = {"status": "planned", "reason": "dry_run"}
@@ -31398,12 +31895,23 @@ def main(argv: list[str]) -> int:
                 dedicated_sos_historical_replacement
             ),
             "dropbox_baseline": resolve_r2_history_root(os.environ),
+            "timeseries_binding_backup_mode": (
+                args.timeseries_binding_backup_mode
+            ),
+            "timeseries_binding_pack_root": (
+                args.timeseries_binding_pack_root
+                or resolve_r2_history_root(os.environ)
+                if args.timeseries_binding_backup_mode == "pack"
+                else None
+            ),
             "repair_mode": args.run_backfill,
             "force_snapshot_import": args.force_snapshot_import,
             "skip_snapshot_import": args.skip_snapshot_import,
             "skip_cross_check": args.skip_cross_check,
             "allow_stale_dropbox": bool(args.allow_stale_dropbox),
             "backup_readiness": backup_gate_summary,
+            "observations_global_operation_lock": global_operation_lock,
+            "dropbox_currentness": dropbox_currentness,
             "repair_flow": repair_flow,
             "current_state_reconciliation": current_state_summary,
             "r2_history_status": current_state_summary.get("r2_history_status"),
@@ -31523,6 +32031,8 @@ def main(argv: list[str]) -> int:
                 "runtime_seconds": runtime_seconds,
                 "report_json_path": str(json_path),
                 "backup_readiness": backup_gate_summary,
+                "observations_global_operation_lock": global_operation_lock,
+                "dropbox_currentness": dropbox_currentness,
                 "report_md_path": str(md_path),
                 "log_path": str(log_path),
             }

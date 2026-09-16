@@ -3,7 +3,13 @@ import {
   helperRowsToNormalizedAqiV1Rows,
   pivotNarrowRowsToHelperRows,
 } from "../../../lib/aqi/aqi_levels.mjs";
-import { readR2Observations } from "./r2_observations.mjs";
+import {
+  createStationHistoryV3ReadBudget,
+  readR2Observations,
+  STATION_HISTORY_V3_OBSERVATION_ROW_BUDGET_REASON,
+  STATION_HISTORY_V3_PHYSICAL_PAGE_BUDGET_REASON,
+  usesV3PhysicalObservationPages,
+} from "./r2_observations.mjs";
 import { publicContinuity, selectContinuitySegments } from "./continuity.mjs";
 
 const HOUR_MS = 60 * 60 * 1000;
@@ -151,18 +157,43 @@ function missingRanges(expected, present) {
   }));
 }
 
-export async function buildCalculatedHistory({ request, continuity, env, outputStartMs, outputEndMs, ingestRows = [], ingestComplete = false, ingestFetchCount = 0, guideline = null } = {}) {
+export async function buildCalculatedHistory({ request, continuity, env, outputStartMs, outputEndMs, ingestRows = [], ingestComplete = false, ingestFetchCount = 0, guideline = null, observationReadBudget = null } = {}) {
   const includeObservations = request.includeObservations !== false;
   const contextHours = request.includeAqi && ["pm25", "pm10"].includes(request.pollutant) ? 23 : 0;
   const requiredStartMs = outputStartMs - contextHours * HOUR_MS;
-  const requiredEndExclusiveMs = outputEndMs + 1;
+  const requiredEndExclusiveMs = request.includeAqi ? outputEndMs + 1 : outputEndMs;
   const selection = selectContinuitySegments(continuity, requiredStartMs, requiredEndExclusiveMs);
   const visibleSelection = selectContinuitySegments(continuity, outputStartMs, requiredEndExclusiveMs);
   if (!selection.segments.length) throw new Error("station_history_continuity_member_missing");
-  const reads = await Promise.all(selection.segments.map(async (segment) => ({
-    segment,
-    result: await readR2Observations({ env, identity: identityForSegment(segment), startMs: segment.startMs, endMs: segment.endMs }),
-  })));
+  let reads;
+  if (usesV3PhysicalObservationPages(env)) {
+    const readBudget = observationReadBudget || createStationHistoryV3ReadBudget();
+    reads = [];
+    for (const segment of selection.segments) {
+      const result = await readR2Observations({
+        env,
+        identity: identityForSegment(segment),
+        startMs: segment.startMs,
+        endMs: segment.endMs,
+        readBudget,
+      });
+      reads.push({ segment, result });
+      if (result.partial_reasons.some((reason) => [
+        STATION_HISTORY_V3_PHYSICAL_PAGE_BUDGET_REASON,
+        STATION_HISTORY_V3_OBSERVATION_ROW_BUDGET_REASON,
+      ].includes(reason))) break;
+    }
+  } else {
+    reads = await Promise.all(selection.segments.map(async (segment) => ({
+      segment,
+      result: await readR2Observations({
+        env,
+        identity: identityForSegment(segment),
+        startMs: segment.startMs,
+        endMs: segment.endMs,
+      }),
+    })));
+  }
   const r2Rows = reads.flatMap((entry) => entry.result.rows);
   const rows = mergePhysicalObservations(r2Rows, ingestRows, continuity);
   const visibleRows = rows.filter((row) => {
@@ -171,7 +202,12 @@ export async function buildCalculatedHistory({ request, continuity, env, outputS
   });
   const aqiRows = request.includeAqi ? calculateLogicalAqi(rows, request, continuity, outputStartMs, outputEndMs) : [];
   const expected = hourEndpoints(outputStartMs, outputEndMs);
-  const observationPresent = new Set(visibleRows.map((row) => Date.parse(row.observed_at)).filter(Number.isFinite));
+  // Raw-observation completeness uses containing half-open hourly intervals:
+  // exact-hour and sub-hour readings both cover the interval's next endpoint.
+  const observationPresent = new Set(visibleRows
+    .map((row) => Date.parse(row.observed_at))
+    .filter(Number.isFinite)
+    .map((timestamp) => Math.floor(timestamp / HOUR_MS) * HOUR_MS + HOUR_MS));
   const aqiPresent = new Set(aqiRows.map((row) => Date.parse(row.timestamp_hour_utc)).filter(Number.isFinite));
   // Hidden PM context affects AQI only. A continuity gap before the visible
   // range must never make an otherwise complete observation response partial.
@@ -181,17 +217,25 @@ export async function buildCalculatedHistory({ request, continuity, env, outputS
   const aqiGaps = request.includeAqi
     ? [...visibleSelection.gaps, ...missingRanges(expected, aqiPresent)]
     : [];
-  const r2Complete = reads.every((entry) => entry.result.response_complete === true);
-  const sourceComplete = r2Complete || ingestComplete === true;
+  const r2PartialReasons = [...new Set(reads.flatMap((entry) => entry.result.partial_reasons))];
+  const readBudgetExceeded = r2PartialReasons.some((reason) => [
+    STATION_HISTORY_V3_PHYSICAL_PAGE_BUDGET_REASON,
+    STATION_HISTORY_V3_OBSERVATION_ROW_BUDGET_REASON,
+  ].includes(reason));
+  const r2Complete = reads.length === selection.segments.length
+    && reads.every((entry) => entry.result.response_complete === true);
+  const sourceComplete = !readBudgetExceeded && (r2Complete || ingestComplete === true);
   const observationsComplete = includeObservations && sourceComplete && observationGaps.length === 0;
   const aqiStatusesComplete = !request.includeAqi || aqiRows.every((row) => row.daqi_calculation_status === "ok" && row.eaqi_calculation_status === "ok");
   const aqiContextComplete = selection.gaps.length === 0;
   const aqiComplete = request.includeAqi && sourceComplete && aqiContextComplete && aqiGaps.length === 0 && aqiStatusesComplete;
   const observationPartialReasons = observationsComplete ? [] : Array.from(new Set([
+    ...r2PartialReasons,
     ...(sourceComplete ? [] : ["required_observation_source_incomplete"]),
     ...(observationGaps.length ? ["missing_visible_observation_hours"] : []),
   ]));
   const aqiPartialReasons = aqiComplete ? [] : Array.from(new Set([
+    ...r2PartialReasons,
     ...(sourceComplete ? [] : ["required_observation_source_incomplete"]),
     ...(aqiContextComplete ? [] : ["required_aqi_context_incomplete"]),
     ...(aqiGaps.length ? ["missing_visible_aqi_hours"] : []),
@@ -247,7 +291,7 @@ export async function buildCalculatedHistory({ request, continuity, env, outputS
     source: {
       mode: "continuity_calculated_observations",
       ingest_fetch_count: ingestFetchCount,
-      r2_observation_fetch_count: reads.length,
+      r2_observation_fetch_count: reads.reduce((sum, entry) => sum + entry.result.fetch_count, 0),
       required_context_start_utc: new Date(requiredStartMs).toISOString(),
       output_start_utc: new Date(outputStartMs).toISOString(),
       output_end_utc: new Date(outputEndMs).toISOString(),

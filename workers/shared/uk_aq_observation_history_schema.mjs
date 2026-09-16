@@ -17,9 +17,14 @@ export const OBSERVATION_HISTORY_COLUMNS_V2_STATUS = Object.freeze([
   "status",
 ]);
 
-export const OBSERVATION_HISTORY_COLUMNS_V3 = Object.freeze([
+export const OBSERVATION_HISTORY_COLUMNS_V3_LEGACY = Object.freeze([
   ...OBSERVATION_HISTORY_COLUMNS_V2,
   "verification_status",
+]);
+
+export const OBSERVATION_HISTORY_COLUMNS_V3 = Object.freeze([
+  ...OBSERVATION_HISTORY_COLUMNS_V2,
+  "vstatus",
 ]);
 
 function sameColumns(left, right) {
@@ -37,10 +42,13 @@ function cloneDescriptor(descriptor) {
 }
 
 export function observationHistoryPhysicalSchemaForColumns(columns) {
-  if (sameColumns(columns, OBSERVATION_HISTORY_COLUMNS_V3)) {
+  if (
+    sameColumns(columns, OBSERVATION_HISTORY_COLUMNS_V3) ||
+    sameColumns(columns, OBSERVATION_HISTORY_COLUMNS_V3_LEGACY)
+  ) {
     return cloneDescriptor({
       history_schema_version: OBSERVATION_HISTORY_SCHEMA_VERSION_V3,
-      columns: OBSERVATION_HISTORY_COLUMNS_V3,
+      columns,
       writer_version: OBSERVATION_HISTORY_WRITER_VERSION_V3,
     });
   }

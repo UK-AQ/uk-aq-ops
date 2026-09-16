@@ -20,6 +20,14 @@ on:
         required: false
         default: false
         type: boolean
+      timeseries_binding_backup_mode:
+        description: "Timeseries binding Dropbox backup representation"
+        required: false
+        default: "individual"
+        type: choice
+        options:
+          - individual
+          - pack
 
 permissions:
   contents: read
@@ -38,28 +46,24 @@ jobs:
       CFLARE_R2_REGION: ${{ vars.CFLARE_R2_REGION || 'auto' }}
       CFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CFLARE_R2_ACCESS_KEY_ID }}
       CFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CFLARE_R2_SECRET_ACCESS_KEY }}
+      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
 
       DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
       DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
       DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
 
-      UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX || 'history/v2/observations' }}
-      UK_AQ_R2_HISTORY_V2_RUNS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_RUNS_PREFIX || 'history/v2/_ops/observations/runs' }}
-      UK_AQ_R2_HISTORY_V2_CORE_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_CORE_PREFIX || 'history/v2/core' }}
-      UK_AQ_R2_HISTORY_INDEX_V2_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_INDEX_V2_PREFIX || 'history/_index_v2' }}
-      UK_AQ_R2_HISTORY_TIMESERIES_BINDING_V2_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_TIMESERIES_BINDING_V2_PREFIX || 'history/_index_v2/timeseries_binding' }}
-      UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX || 'history/_index_v2/backup_inventory_v2' }}
-      UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX || '_ops/checkpoints/r2_history_backup_state_v2' }}
+      UK_AQ_R2_HISTORY_VERSION: ${{ vars.UK_AQ_R2_HISTORY_VERSION || '' }}
 
       UK_AQ_R2_HISTORY_BACKUP_MAX_DAYS_PER_RUN: ${{ vars.UK_AQ_R2_HISTORY_BACKUP_MAX_DAYS_PER_RUN || '0' }}
       UK_AQ_R2_HISTORY_CHECKPOINT_BATCH_UNITS: ${{ vars.UK_AQ_R2_HISTORY_CHECKPOINT_BATCH_UNITS || '10' }}
       UK_AQ_R2_HISTORY_CHECKPOINT_FLUSH_SECONDS: ${{ vars.UK_AQ_R2_HISTORY_CHECKPOINT_FLUSH_SECONDS || '60' }}
-      UK_AQ_DROPBOX_ROOT: ${{ vars.UK_AQ_DROPBOX_ROOT || 'CIC-Test' }}
+      UK_AQ_DROPBOX_ROOT: ${{ vars.UK_AQ_DROPBOX_ROOT || 'TEST' }}
       UK_AQ_R2_HISTORY_DROPBOX_DIR: ${{ vars.UK_AQ_R2_HISTORY_DROPBOX_DIR || 'R2_history_backup' }}
 
       INPUT_DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
       INPUT_MAX_DAYS_PER_RUN: ${{ github.event.inputs.max_days_per_run || '' }}
       INPUT_FORCE_PRUNE_RECHECK: ${{ github.event.inputs.force_prune_recheck || 'false' }}
+      INPUT_TIMESERIES_BINDING_BACKUP_MODE: ${{ github.event.inputs.timeseries_binding_backup_mode || 'individual' }}
 
     steps:
       - name: Checkout
@@ -69,6 +73,9 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "20"
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
 
       - name: Report daily task health (started)
         id: daily_task_health_started
@@ -92,17 +99,12 @@ jobs:
             CFLARE_R2_BUCKET
             CFLARE_R2_ACCESS_KEY_ID
             CFLARE_R2_SECRET_ACCESS_KEY
+            SUPABASE_DB_URL
             DROPBOX_APP_KEY
             DROPBOX_APP_SECRET
             DROPBOX_REFRESH_TOKEN
             UK_AQ_DROPBOX_ROOT
             UK_AQ_R2_HISTORY_DROPBOX_DIR
-            UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX
-            UK_AQ_R2_HISTORY_V2_RUNS_PREFIX
-            UK_AQ_R2_HISTORY_V2_CORE_PREFIX
-            UK_AQ_R2_HISTORY_TIMESERIES_BINDING_V2_PREFIX
-            UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX
-            UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX
           )
 
           missing=0
@@ -167,32 +169,20 @@ jobs:
           chmod 600 "${RCLONE_CONFIG}"
           echo "RCLONE_CONFIG=${RCLONE_CONFIG}" >> "$GITHUB_ENV"
 
-      - name: Build hierarchical R2 history backup inventory
-        # Always writes current small inventory control files, including when the
-        # Dropbox sync itself is a dry run. This keeps the dry-run plan current.
+      - name: Run locked hierarchical Dropbox backup
+        # The retained PostgreSQL session lock spans source-root inventory
+        # selection, copy/verification and checkpoint-root publication.
         run: |
           set -euo pipefail
           mkdir -p tmp
 
-          cmd=(
-            node scripts/backup_r2/build_backup_inventory.mjs
-            --source-root "uk_aq_r2:${CFLARE_R2_BUCKET}"
-            --observations-prefix "${UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX}"
-            --runs-prefix "${UK_AQ_R2_HISTORY_V2_RUNS_PREFIX}"
-            --core-prefix "${UK_AQ_R2_HISTORY_V2_CORE_PREFIX}"
-            --timeseries-binding-prefix "${UK_AQ_R2_HISTORY_TIMESERIES_BINDING_V2_PREFIX}"
-            --latest-timeseries-key "${UK_AQ_R2_HISTORY_INDEX_V2_PREFIX}/observations_timeseries_latest.json"
-            --inventory-root-prefix "${UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX}"
-            --report-out "tmp/r2_backup_inventory_report.json"
-          )
-
-          echo "Running: ${cmd[*]}"
-          "${cmd[@]}"
-
-      - name: Run hierarchical Dropbox sync
-        run: |
-          set -euo pipefail
-          mkdir -p tmp
+          case "${UK_AQ_R2_HISTORY_VERSION}" in
+            v2|v3) ;;
+            *)
+              echo "UK_AQ_R2_HISTORY_VERSION must be exactly v2 or v3" >&2
+              exit 1
+              ;;
+          esac
 
           max_days="${INPUT_MAX_DAYS_PER_RUN:-}"
           if [ -z "${max_days}" ]; then
@@ -201,6 +191,15 @@ jobs:
           case "${max_days}" in
             ''|*[!0-9]*)
               echo "max_days_per_run must be a non-negative integer" >&2
+              exit 1
+              ;;
+          esac
+
+          selected_mode="${INPUT_TIMESERIES_BINDING_BACKUP_MODE:-individual}"
+          case "${selected_mode}" in
+            individual|pack) ;;
+            *)
+              echo "timeseries_binding_backup_mode must be exactly individual or pack" >&2
               exit 1
               ;;
           esac
@@ -221,16 +220,24 @@ jobs:
           fi
 
           cmd=(
-            node scripts/backup_r2/sync_history_to_dropbox.mjs
+            node scripts/operations/uk_aq_with_observations_global_operation_lock.mjs
+            --owner r2_history_dropbox_backup
+            --run-id "r2-history-dropbox-backup:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}"
+            --
+            node scripts/backup_r2/uk_aq_run_locked_history_backup.mjs
             --source-root "uk_aq_r2:${CFLARE_R2_BUCKET}"
             --dest-root "uk_aq_dropbox:${dropbox_backup_root}"
-            --inventory-root-prefix "${UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX}"
-            --state-root-prefix "${UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX}"
+            --timeseries-binding-backup-mode "${selected_mode}"
             --max-days-per-run "${max_days}"
             --checkpoint-batch-units "${UK_AQ_R2_HISTORY_CHECKPOINT_BATCH_UNITS}"
             --checkpoint-flush-seconds "${UK_AQ_R2_HISTORY_CHECKPOINT_FLUSH_SECONDS}"
-            --report-out "tmp/r2_history_dropbox_backup_report.json"
+            --inventory-report-out "tmp/r2_backup_inventory_report.json"
+            --backup-report-out "tmp/r2_history_dropbox_backup_report.json"
           )
+
+          if [ "${selected_mode}" = "pack" ]; then
+            cmd+=(--allow-experimental-pack-only)
+          fi
 
           if [ "${INPUT_DRY_RUN}" = "true" ]; then
             cmd+=(--dry-run)
@@ -252,6 +259,15 @@ jobs:
             tmp/r2_history_dropbox_backup_report.json
           if-no-files-found: ignore
 
+      - name: Build daily task health supplemental summary
+        if: always()
+        continue-on-error: true
+        run: |
+          node scripts/backup_r2/build_history_backup_task_summary.mjs \
+            --inventory-report "tmp/r2_backup_inventory_report.json" \
+            --backup-report "tmp/r2_history_dropbox_backup_report.json" \
+            --output "tmp/r2_history_dropbox_backup_task_summary.json"
+
       - name: Report daily task health
         if: always()
         env:
@@ -260,5 +276,6 @@ jobs:
           DAILY_TASK_KEY: ops.r2_history_dropbox_backup
           DAILY_TASK_HEALTH_REPORT_STAGE: final
           DAILY_TASK_HEALTH_RUN_ID: ${{ steps.daily_task_health_started.outputs.health_run_id }}
+          DAILY_TASK_HEALTH_SUPPLEMENTAL_SUMMARY_FILE: tmp/r2_history_dropbox_backup_task_summary.json
           JOB_STATUS: ${{ job.status }}
         run: node scripts/report_daily_task_health.mjs

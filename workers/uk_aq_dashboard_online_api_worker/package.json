@@ -9,6 +9,9 @@
   },
   "devDependencies": {
     "typescript": "^5.9.2",
-    "wrangler": "^4.42.0"
+    "wrangler": "4.130.0"
+  },
+  "overrides": {
+    "sharp": "0.35.4"
   }
 }

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { resolveObservationHistoryGeneration, assertObservationHistoryGenerationPrefixes, assertObservationHistoryGenerationKey } from "../../workers/shared/uk_aq_observation_history_generation.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -30,6 +31,9 @@ import {
   stateYearEntry,
   upsertStateMonthSummary,
   validateHierarchicalInventoryRoot,
+  assertSelectedBackupInventory,
+  assertSelectedBackupState,
+  assertSelectedObservationInventoryShard,
   validateHierarchicalStateRoot,
   validateLatestTimeseriesState,
   validateObservationMonthInventoryShard,
@@ -44,8 +48,18 @@ import {
   syncCoreToDropbox,
 } from "./lib/hierarchical_core_backup_v2.mjs";
 import {
+  syncTimeseriesBindingPacksToDropbox,
+} from "./lib/hierarchical_timeseries_binding_pack_sync_v1.mjs";
+import {
+  assertExperimentalPackOnlyDestination,
+  normalizeTimeseriesBindingBackupMode,
+} from "./lib/timeseries_binding_pack_inventory_v1.mjs";
+import {
   pruneStaleParquetForUnit,
 } from "./lib/stale_parquet_prune.mjs";
+import {
+  requireLockedHistoryBackupMutation,
+} from "./uk_aq_run_locked_history_backup.mjs";
 
 const DEFAULT_RCLONE_BIN =
   String(process.env.UK_AQ_R2_HISTORY_BACKUP_RCLONE_BIN || "").trim() || "rclone";
@@ -55,11 +69,12 @@ const DEFAULT_INVENTORY_ROOT_PREFIX = String(
 ).trim().replace(/^\/+|\/+$/g, "");
 const DEFAULT_STATE_ROOT_PREFIX = String(
   process.env.UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX
-  || "_ops/checkpoints/r2_history_backup_state_v2",
+  || "_ops/checkpoints/r2_history_backup_state_v2/observation_generation=v2",
 ).trim().replace(/^\/+|\/+$/g, "");
 const DEFAULT_REPORT_OUT = String(
   process.env.UK_AQ_R2_HISTORY_HIERARCHICAL_SYNC_REPORT_OUT || "",
 ).trim();
+const DEFAULT_TIMESERIES_BINDING_BACKUP_MODE = "individual";
 const DEFAULT_MAX_DAYS = parseNonNegativeInt(
   process.env.UK_AQ_R2_HISTORY_BACKUP_MAX_DAYS_PER_RUN,
   0,
@@ -116,11 +131,14 @@ function usage() {
     "",
     "Required:",
     "  --source-root <root>          Example: uk_aq_r2_test:uk-aq-history-cic-test",
-    "  --dest-root <root>            Example: uk_aq_dropbox:CIC-Test/R2_history_backup",
+    "  --dest-root <root>            Example: uk_aq_dropbox:TEST/R2_history_backup",
     "",
     "Options:",
     `  --inventory-root-prefix <p>  Default: ${DEFAULT_INVENTORY_ROOT_PREFIX}`,
     `  --state-root-prefix <p>      Default: ${DEFAULT_STATE_ROOT_PREFIX}`,
+    `  --timeseries-binding-backup-mode <individual|dual|pack> Default: ${DEFAULT_TIMESERIES_BINDING_BACKUP_MODE}`,
+    "  --allow-experimental-pack-only Required for pack mode; isolated TEST destination only",
+    "  --timeseries-binding-packs-only Proving path: sync no other backup domain",
     `  --max-days-per-run <N>       Default: ${DEFAULT_MAX_DAYS}; 0 = unlimited`,
     `  --checkpoint-batch-units <N> Default: ${DEFAULT_CHECKPOINT_BATCH_UNITS}`,
     `  --checkpoint-flush-seconds <N> Default: ${DEFAULT_CHECKPOINT_FLUSH_SECONDS}`,
@@ -139,6 +157,9 @@ function parseArgs(argv) {
     dest_root: "",
     inventory_root_prefix: DEFAULT_INVENTORY_ROOT_PREFIX,
     state_root_prefix: DEFAULT_STATE_ROOT_PREFIX,
+    timeseries_binding_backup_mode: DEFAULT_TIMESERIES_BINDING_BACKUP_MODE,
+    allow_experimental_pack_only: false,
+    timeseries_binding_packs_only: false,
     max_days_per_run: DEFAULT_MAX_DAYS,
     checkpoint_batch_units: DEFAULT_CHECKPOINT_BATCH_UNITS,
     checkpoint_flush_seconds: DEFAULT_CHECKPOINT_FLUSH_SECONDS,
@@ -170,6 +191,21 @@ function parseArgs(argv) {
       args.state_root_prefix = String(argv[index + 1] || "")
         .trim().replace(/^\/+|\/+$/g, "");
       index += 1;
+      continue;
+    }
+    if (arg === "--timeseries-binding-backup-mode") {
+      args.timeseries_binding_backup_mode = normalizeTimeseriesBindingBackupMode(
+        argv[index + 1],
+      );
+      index += 1;
+      continue;
+    }
+    if (arg === "--allow-experimental-pack-only") {
+      args.allow_experimental_pack_only = true;
+      continue;
+    }
+    if (arg === "--timeseries-binding-packs-only") {
+      args.timeseries_binding_packs_only = true;
       continue;
     }
     if (arg === "--max-days-per-run") {
@@ -227,6 +263,10 @@ function parseArgs(argv) {
     }
     throw new Error(`Unknown argument: ${arg}`);
   }
+  const generation = resolveObservationHistoryGeneration(process.env);
+  if (!argv.includes("--inventory-root-prefix")) args.inventory_root_prefix = process.env.UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX || generation.backup_inventory_prefix;
+  if (!argv.includes("--state-root-prefix")) args.state_root_prefix = process.env.UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX || generation.backup_state_prefix;
+  assertObservationHistoryGenerationPrefixes(generation, { inventoryPrefix: args.inventory_root_prefix, statePrefix: args.state_root_prefix });
   if (!args.source_root) throw new Error("--source-root is required");
   if (!args.dest_root) throw new Error("--dest-root is required");
   if (!args.inventory_root_prefix) {
@@ -235,6 +275,17 @@ function parseArgs(argv) {
   if (!args.state_root_prefix) throw new Error("--state-root-prefix is required");
   if (args.force_prune_recheck && !args.prune_stale_parquet) {
     throw new Error("--force-prune-recheck cannot be combined with --no-prune-stale-parquet");
+  }
+  assertExperimentalPackOnlyDestination({
+    mode: args.timeseries_binding_backup_mode,
+    destRoot: args.dest_root,
+    allowExperimentalPackOnly: args.allow_experimental_pack_only,
+  });
+  if (
+    args.timeseries_binding_packs_only
+    && args.timeseries_binding_backup_mode !== "pack"
+  ) {
+    throw new Error("--timeseries-binding-packs-only requires pack backup mode");
   }
   return args;
 }
@@ -412,6 +463,57 @@ function copyAndVerifyJsonFile({
   };
 }
 
+function readRemoteFileIdentity(rcloneBin, root, relativePath) {
+  const result = rcloneCatMaybe(
+    rcloneBin,
+    joinTargetPath(root, relativePath),
+    DROPBOX_READ_RETRY,
+  );
+  if (!result.found) {
+    return { exists: false, sha256: null, size: null, verified: false };
+  }
+  return {
+    exists: true,
+    sha256: sha256Hex(result.text),
+    size: Buffer.byteLength(result.text, "utf8"),
+    verified: true,
+  };
+}
+
+function syncTimeseriesBindingPackDomain({ args, inventoryRoot, stateRoot }) {
+  return syncTimeseriesBindingPacksToDropbox({
+    inventoryRoot,
+    stateRoot,
+    stateRootPrefix: args.state_root_prefix,
+    dryRun: args.dry_run,
+    readStateJsonMaybe: (relativePath) => readJsonMaybe(
+      args.rclone_bin,
+      args.dest_root,
+      relativePath,
+      DROPBOX_READ_RETRY,
+    ),
+    writeStateJson: (relativePath, payload) => uploadJson({
+      rcloneBin: args.rclone_bin,
+      root: args.dest_root,
+      relativePath,
+      payload,
+      dryRun: args.dry_run,
+    }),
+    copyAndVerifyFile: (relativePath) => copyAndVerifyJsonFile({
+      rcloneBin: args.rclone_bin,
+      sourceRoot: args.source_root,
+      destRoot: args.dest_root,
+      relativePath,
+      dryRun: args.dry_run,
+    }),
+    readDestinationFileIdentity: (relativePath) => readRemoteFileIdentity(
+      args.rclone_bin,
+      args.dest_root,
+      relativePath,
+    ),
+  });
+}
+
 function parseDayManifestHash(text, relativePath) {
   let manifest;
   try {
@@ -427,6 +529,15 @@ function parseDayManifestHash(text, relativePath) {
     throw new Error(`Destination day manifest has invalid manifest_hash: ${relativePath}`);
   }
   return hash;
+}
+
+function readSelectedInventoryJson(args, relativePath, domain) {
+  const generation = resolveObservationHistoryGeneration(process.env);
+  assertObservationHistoryGenerationKey(generation, relativePath, "backup_inventory");
+  const value = readJsonRequired(args.rclone_bin, args.source_root, relativePath).parsed;
+  const prefix = domain === "core" ? generation.core_prefix : generation.timeseries_binding_index_prefix;
+  if (value.source_prefix !== prefix) throw new Error("Inventory shard source prefix contradicts selected generation");
+  return value;
 }
 
 function copyAndVerifyObservationDay({ args, day }) {
@@ -571,6 +682,7 @@ function runForcedObservationPruneRecheck(args, inventoryRoot, report) {
           inventoryMonth.inventory_shard_key,
         ).parsed,
       );
+      assertSelectedObservationInventoryShard(resolveObservationHistoryGeneration(process.env), inventoryShard);
       if (inventoryShard.source_month_hash !== inventoryMonth.content_hash) {
         failures.push({
           day_utc: `${inventoryYear.year}-${inventoryMonth.month}`,
@@ -608,6 +720,10 @@ function runForcedObservationPruneRecheck(args, inventoryRoot, report) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  requireLockedHistoryBackupMutation({
+    dryRun: args.dry_run,
+    env: process.env,
+  });
   const startedAt = new Date().toISOString();
   const inventoryResult = readJsonRequired(
     args.rclone_bin,
@@ -616,8 +732,14 @@ async function main() {
   );
   const inventoryRoot = validateHierarchicalInventoryRoot(
     inventoryResult.parsed,
+    {
+      validateTimeseriesBindingPacks:
+        args.timeseries_binding_backup_mode !== "individual",
+    },
   );
 
+  const generation = resolveObservationHistoryGeneration(process.env);
+  assertSelectedBackupInventory(generation, inventoryRoot);
   const runManifestInventoryPointer =
     inventoryRoot.global_units.observation_run_manifests;
   const runManifestInventoryResult = readJsonRequired(
@@ -629,6 +751,7 @@ async function main() {
     validateObservationRunManifestInventoryShard(
       runManifestInventoryResult.parsed,
     );
+  for (const unit of runManifestInventoryShard.units) assertObservationHistoryGenerationKey(generation, unit.relative_path, "runs");
   const actualRunManifestShardHash = sha256Hex(
     stableJson(runManifestInventoryShard),
   );
@@ -647,15 +770,21 @@ async function main() {
     DROPBOX_READ_RETRY,
   );
   let stateRoot = validateHierarchicalStateRoot(
-    existingStateResult?.parsed || emptyHierarchicalStateRoot(args.state_root_prefix),
+    existingStateResult?.parsed || emptyHierarchicalStateRoot(args.state_root_prefix, generation),
     args.state_root_prefix,
+    generation,
   );
+
+  assertSelectedBackupState(generation, stateRoot);
+  stateRoot.observation_generation = generation.version;
 
   const report = {
     ok: true,
     started_at: startedAt,
     completed_at: null,
     dry_run: args.dry_run,
+    timeseries_binding_backup_mode: args.timeseries_binding_backup_mode,
+    timeseries_binding_packs_only: args.timeseries_binding_packs_only,
     source_root: args.source_root,
     dest_root: args.dest_root,
     inventory_root_key: inventoryRootKey(args),
@@ -682,6 +811,7 @@ async function main() {
       incomplete_years: [],
     },
     timeseries_binding: null,
+    timeseries_binding_packs: null,
     core: null,
     run_manifests: {
       listed: runManifestInventoryShard.units.length,
@@ -720,6 +850,49 @@ async function main() {
   let copiedDayBudget = args.max_days_per_run;
   let stateRootDirty = existingStateResult === null;
 
+  if (args.timeseries_binding_packs_only) {
+    try {
+      const packSync = syncTimeseriesBindingPackDomain({
+        args,
+        inventoryRoot,
+        stateRoot,
+      });
+      report.timeseries_binding = {
+        mode: "pack",
+        skipped: true,
+        reason: "isolated_pack_transport_proof",
+      };
+      report.timeseries_binding_packs = packSync.report;
+      stateRootDirty = stateRootDirty || packSync.state_root_dirty;
+    } catch (error) {
+      if (!args.dry_run) {
+        uploadJson({
+          rcloneBin: args.rclone_bin,
+          root: args.dest_root,
+          relativePath: stateRootKey(args),
+          payload: stateRoot,
+          dryRun: false,
+        });
+      }
+      throw error;
+    }
+    if (stateRootDirty) {
+      uploadJson({
+        rcloneBin: args.rclone_bin,
+        root: args.dest_root,
+        relativePath: stateRootKey(args),
+        payload: stateRoot,
+        dryRun: args.dry_run,
+      });
+    }
+    report.completed_at = new Date().toISOString();
+    report.complete = report.timeseries_binding_packs.complete;
+    report.ok = true;
+    writeReport(args.report_out, report);
+    console.log(JSON.stringify(report, null, 2));
+    return;
+  }
+
   for (const inventoryYear of inventoryRoot.observations.years) {
     const existingStateYear = stateYearEntry(stateRoot, inventoryYear.year);
     if (
@@ -753,6 +926,7 @@ async function main() {
       const inventoryShard = validateObservationMonthInventoryShard(
         inventoryShardResult.parsed,
       );
+      assertSelectedObservationInventoryShard(resolveObservationHistoryGeneration(process.env), inventoryShard);
       if (inventoryShard.source_month_hash !== inventoryMonth.content_hash) {
         throw new Error(
           `Inventory month shard hash mismatch for `
@@ -935,53 +1109,88 @@ async function main() {
     }
   }
 
-  try {
-    const bindingSync = syncTimeseriesBindingsToDropbox({
-      inventoryRoot,
-      stateRoot,
-      stateRootPrefix: args.state_root_prefix,
-      dryRun: args.dry_run,
-      checkpointBatchUnits: args.checkpoint_batch_units,
-      checkpointFlushSeconds: args.checkpoint_flush_seconds,
-      readInventoryJson: (relativePath) => readJsonRequired(
-        args.rclone_bin,
-        args.source_root,
-        relativePath,
-      ).parsed,
-      readStateJsonMaybe: (relativePath) => readJsonMaybe(
-        args.rclone_bin,
-        args.dest_root,
-        relativePath,
-        DROPBOX_READ_RETRY,
-      ),
-      writeStateJson: (relativePath, payload) => uploadJson({
-        rcloneBin: args.rclone_bin,
-        root: args.dest_root,
-        relativePath,
-        payload,
+  if (args.timeseries_binding_backup_mode !== "pack") {
+    try {
+      const bindingSync = syncTimeseriesBindingsToDropbox({
+        inventoryRoot,
+        stateRoot,
+        stateRootPrefix: args.state_root_prefix,
         dryRun: args.dry_run,
-      }),
-      copyAndVerifyFile: (relativePath) => copyAndVerifyJsonFile({
-        rcloneBin: args.rclone_bin,
-        sourceRoot: args.source_root,
-        destRoot: args.dest_root,
-        relativePath,
-        dryRun: args.dry_run,
-      }),
-    });
-    report.timeseries_binding = bindingSync.report;
-    stateRootDirty = stateRootDirty || bindingSync.state_root_dirty;
-  } catch (error) {
-    if (!args.dry_run) {
-      uploadJson({
-        rcloneBin: args.rclone_bin,
-        root: args.dest_root,
-        relativePath: stateRootKey(args),
-        payload: stateRoot,
-        dryRun: false,
+        checkpointBatchUnits: args.checkpoint_batch_units,
+        checkpointFlushSeconds: args.checkpoint_flush_seconds,
+        readInventoryJson: (relativePath) => readSelectedInventoryJson(args, relativePath, "bindings"),
+        readStateJsonMaybe: (relativePath) => readJsonMaybe(
+          args.rclone_bin,
+          args.dest_root,
+          relativePath,
+          DROPBOX_READ_RETRY,
+        ),
+        writeStateJson: (relativePath, payload) => uploadJson({
+          rcloneBin: args.rclone_bin,
+          root: args.dest_root,
+          relativePath,
+          payload,
+          dryRun: args.dry_run,
+        }),
+        copyAndVerifyFile: (relativePath) => copyAndVerifyJsonFile({
+          rcloneBin: args.rclone_bin,
+          sourceRoot: args.source_root,
+          destRoot: args.dest_root,
+          relativePath,
+          dryRun: args.dry_run,
+        }),
       });
+      report.timeseries_binding = bindingSync.report;
+      stateRootDirty = stateRootDirty || bindingSync.state_root_dirty;
+    } catch (error) {
+      if (!args.dry_run) {
+        uploadJson({
+          rcloneBin: args.rclone_bin,
+          root: args.dest_root,
+          relativePath: stateRootKey(args),
+          payload: stateRoot,
+          dryRun: false,
+        });
+      }
+      throw error;
     }
-    throw error;
+  } else {
+    report.timeseries_binding = {
+      mode: "pack",
+      skipped: true,
+      reason: "pack_only_mode",
+      incomplete_ranges: [],
+    };
+  }
+
+  if (args.timeseries_binding_backup_mode !== "individual") {
+    try {
+      const packSync = syncTimeseriesBindingPackDomain({
+        args,
+        inventoryRoot,
+        stateRoot,
+      });
+      report.timeseries_binding_packs = packSync.report;
+      stateRootDirty = stateRootDirty || packSync.state_root_dirty;
+    } catch (error) {
+      if (!args.dry_run) {
+        uploadJson({
+          rcloneBin: args.rclone_bin,
+          root: args.dest_root,
+          relativePath: stateRootKey(args),
+          payload: stateRoot,
+          dryRun: false,
+        });
+      }
+      throw error;
+    }
+  } else {
+    report.timeseries_binding_packs = {
+      mode: "individual",
+      skipped: true,
+      required: false,
+      complete: true,
+    };
   }
 
   try {
@@ -992,11 +1201,7 @@ async function main() {
       dryRun: args.dry_run,
       checkpointBatchUnits: args.checkpoint_batch_units,
       checkpointFlushSeconds: args.checkpoint_flush_seconds,
-      readInventoryJson: (relativePath) => readJsonRequired(
-        args.rclone_bin,
-        args.source_root,
-        relativePath,
-      ).parsed,
+      readInventoryJson: (relativePath) => readSelectedInventoryJson(args, relativePath, "core"),
       readStateJsonMaybe: (relativePath) => readJsonMaybe(
         args.rclone_bin,
         args.dest_root,
@@ -1207,6 +1412,7 @@ async function main() {
   report.complete = report.observations.incomplete_months.length === 0
     && report.observations.incomplete_years.length === 0
     && report.timeseries_binding.incomplete_ranges.length === 0
+    && report.timeseries_binding_packs.complete
     && report.core.complete
     && report.run_manifests.complete
     && !report.latest_timeseries.incomplete;

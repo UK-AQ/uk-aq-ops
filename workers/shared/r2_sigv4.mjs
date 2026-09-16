@@ -2,10 +2,64 @@ import { createHash, createHmac } from "node:crypto";
 import { Buffer } from "node:buffer";
 
 const R2_RETRYABLE_STATUS_CODES = new Set([408, 429, 500, 502, 503, 504]);
-const R2_REQUEST_MAX_ATTEMPTS = 4;
-const R2_REQUEST_RETRY_BASE_MS = 500;
-const R2_REQUEST_RETRY_MAX_MS = 5000;
-const DEFAULT_FETCH_TIMEOUT_MS = 30_000;
+export const R2_REQUEST_MAX_ATTEMPTS = 4;
+export const R2_REQUEST_RETRY_BASE_MS = 500;
+export const R2_REQUEST_RETRY_MAX_MS = 5000;
+export const R2_REQUEST_TIMEOUT_MS = 30_000;
+export const R2_PUBLICATION_SAFETY_MARGIN_MS = 5_000;
+const DEFAULT_FETCH_TIMEOUT_MS = R2_REQUEST_TIMEOUT_MS;
+
+export const R2_REQUEST_RETRY_DELAYS_MS = Object.freeze(
+  Array.from({ length: Math.max(0, R2_REQUEST_MAX_ATTEMPTS - 1) }, (_, index) =>
+    Math.min(
+      R2_REQUEST_RETRY_MAX_MS,
+      R2_REQUEST_RETRY_BASE_MS * (2 ** index),
+    )
+  ),
+);
+export const R2_REQUEST_WORST_CASE_DURATION_MS =
+  // Four complete request-and-response-body attempts plus 500+1000+2000ms backoff.
+  (R2_REQUEST_MAX_ATTEMPTS * R2_REQUEST_TIMEOUT_MS) +
+  R2_REQUEST_RETRY_DELAYS_MS.reduce((sum, delayMs) => sum + delayMs, 0);
+export const R2_CHECKSUM_PUT_HEAD_WORST_CASE_DURATION_MS =
+  // One complete checksum-aware object is PUT followed by HEAD verification.
+  (2 * R2_REQUEST_WORST_CASE_DURATION_MS) + R2_PUBLICATION_SAFETY_MARGIN_MS;
+const R2_REQUEST_ERROR_CAUSE_MAX_DEPTH = 8;
+const R2_RETRYABLE_ERROR_CODES = new Set([
+  "ECONNABORTED",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EAI_AGAIN",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "EPIPE",
+  "ETIMEDOUT",
+  "UND_ERR_BODY_TIMEOUT",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_SOCKET",
+]);
+const R2_RETRYABLE_ERROR_TOKENS = [
+  "connection reset",
+  "connection closed",
+  "broken pipe",
+  "socket hang up",
+  "socket closed",
+  "socket reset",
+  "econnreset",
+  "econnrefused",
+  "ehostunreach",
+  "enetunreach",
+  "etimedout",
+  "timed out",
+  "timeout",
+  "networkerror",
+  "network error",
+  "sendrequest",
+  "temporarily unavailable",
+  "tls",
+  "eof",
+];
 
 export function encodeRfc3986(value) {
   return encodeURIComponent(value).replace(/[!'()*]/g, (ch) => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`);
@@ -13,6 +67,29 @@ export function encodeRfc3986(value) {
 
 function awsSha256Hex(value) {
   return createHash("sha256").update(value).digest("hex");
+}
+
+export function normalizeR2Sha256Checksum(value) {
+  if (value === null || value === undefined || value === "") return null;
+  if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {
+    const bytes = value instanceof ArrayBuffer
+      ? Buffer.from(value)
+      : Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+    return bytes.byteLength === 32 ? bytes.toString("hex") : null;
+  }
+  const text = String(value).trim();
+  if (/^[0-9a-f]{64}$/i.test(text)) return text.toLowerCase();
+  if (!/^[A-Za-z0-9+/]{43}=$/.test(text)) return null;
+  const bytes = Buffer.from(text, "base64");
+  return bytes.byteLength === 32 && bytes.toString("base64") === text
+    ? bytes.toString("hex")
+    : null;
+}
+
+function sha256HexToBase64(value) {
+  const normalized = normalizeR2Sha256Checksum(value);
+  if (!normalized) throw new Error("R2 SHA-256 checksum must be 64 hex characters");
+  return Buffer.from(normalized, "hex").toString("base64");
 }
 
 function awsHmac(key, value) {
@@ -178,6 +255,7 @@ export async function fetchWithTimeout(
   init = {},
   timeoutMs = DEFAULT_FETCH_TIMEOUT_MS,
   fetchImpl = globalThis.fetch,
+  consumeResponse = null,
 ) {
   const boundedTimeoutMs = Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
     ? Math.trunc(Number(timeoutMs))
@@ -191,10 +269,13 @@ export async function fetchWithTimeout(
   }, boundedTimeoutMs);
 
   try {
-    return await fetchImpl(url, {
+    const response = await fetchImpl(url, {
       ...init,
       signal: controller.signal,
     });
+    return typeof consumeResponse === "function"
+      ? await consumeResponse(response)
+      : response;
   } catch (error) {
     if (timedOut) {
       let target = "external service";
@@ -219,30 +300,55 @@ function isRetryableR2Status(status) {
   return R2_RETRYABLE_STATUS_CODES.has(status);
 }
 
-function isRetryableR2RequestError(error) {
-  const message = String(error instanceof Error ? error.message : error || "")
-    .toLowerCase();
-  if (!message) {
-    return false;
+function r2RequestErrorField(error, field) {
+  try {
+    const value = error?.[field];
+    return typeof value === "string" || typeof value === "number"
+      ? String(value).trim()
+      : "";
+  } catch {
+    return "";
   }
-  return [
-    "connection reset",
-    "connection closed",
-    "broken pipe",
-    "socket hang up",
-    "econnreset",
-    "econnrefused",
-    "ehostunreach",
-    "etimedout",
-    "timed out",
-    "timeout",
-    "networkerror",
-    "network error",
-    "sendrequest",
-    "temporarily unavailable",
-    "tls",
-    "eof",
-  ].some((token) => message.includes(token));
+}
+
+function isRetryableR2RequestError(error) {
+  const seen = new Set();
+  let current = error;
+  for (let depth = 0; depth < R2_REQUEST_ERROR_CAUSE_MAX_DEPTH; depth += 1) {
+    const isObject = (
+      current !== null &&
+      (typeof current === "object" || typeof current === "function")
+    );
+    if (isObject) {
+      if (seen.has(current)) break;
+      seen.add(current);
+    }
+    const name = isObject ? r2RequestErrorField(current, "name") : "";
+    const message = isObject
+      ? r2RequestErrorField(current, "message")
+      : String(current ?? "").trim();
+    const code = isObject ? r2RequestErrorField(current, "code") : "";
+    if (R2_RETRYABLE_ERROR_CODES.has(code.toUpperCase())) {
+      return true;
+    }
+    // Node/Undici uses this exact TypeError as its generic transport wrapper,
+    // including when the underlying cause was not preserved by the caller.
+    if (name.toLowerCase() === "typeerror" && message.toLowerCase() === "fetch failed") {
+      return true;
+    }
+    const description = `${name} ${message} ${code}`.toLowerCase();
+    if (R2_RETRYABLE_ERROR_TOKENS.some((token) => description.includes(token))) {
+      return true;
+    }
+    if (!isObject) break;
+    try {
+      current = current.cause;
+    } catch {
+      break;
+    }
+    if (current === null || current === undefined) break;
+  }
+  return false;
 }
 
 function computeR2RetryDelayMs(attempt) {
@@ -252,21 +358,53 @@ function computeR2RetryDelayMs(attempt) {
   );
 }
 
-async function fetchR2WithRetry({ method, buildRequest, body = undefined }) {
+function cancelResponseBody(response) {
+  try {
+    const cancelled = response?.body?.cancel?.();
+    if (cancelled && typeof cancelled.catch === "function") {
+      void cancelled.catch(() => {});
+    }
+  } catch {
+    // A retry does not depend on best-effort disposal of the failed response.
+  }
+}
+
+async function fetchR2WithRetry({
+  method,
+  buildRequest,
+  body = undefined,
+  consumeResponse = null,
+}) {
   for (let attempt = 1; attempt <= R2_REQUEST_MAX_ATTEMPTS; attempt += 1) {
     const request = buildRequest();
     try {
-      const response = await fetchWithTimeout(request.url, {
-        method,
-        headers: request.headers,
-        body,
-      });
-      if (
-        response.ok ||
-        !isRetryableR2Status(response.status) ||
-        attempt === R2_REQUEST_MAX_ATTEMPTS
-      ) {
-        return response;
+      const attemptResult = await fetchWithTimeout(
+        request.url,
+        {
+          method,
+          headers: request.headers,
+          body,
+        },
+        R2_REQUEST_TIMEOUT_MS,
+        globalThis.fetch,
+        async (response) => {
+          if (
+            isRetryableR2Status(response.status) &&
+            attempt < R2_REQUEST_MAX_ATTEMPTS
+          ) {
+            cancelResponseBody(response);
+            return { retry: true, value: null };
+          }
+          return {
+            retry: false,
+            value: typeof consumeResponse === "function"
+              ? await consumeResponse(response)
+              : response,
+          };
+        },
+      );
+      if (!attemptResult.retry) {
+        return attemptResult.value;
       }
     } catch (error) {
       if (
@@ -282,13 +420,31 @@ async function fetchR2WithRetry({ method, buildRequest, body = undefined }) {
   throw new Error("R2 request retry loop exhausted unexpectedly.");
 }
 
-export async function r2PutObject({ r2, key, body, content_type = "application/octet-stream" }) {
+export async function r2PutObject({
+  r2,
+  key,
+  body,
+  content_type = "application/octet-stream",
+  sha256 = null,
+}) {
+  const expectedSha256 = normalizeR2Sha256Checksum(sha256);
+  if (sha256 !== null && !expectedSha256) {
+    throw new Error(`R2 PUT SHA-256 is invalid: ${key}`);
+  }
+  if (expectedSha256 && awsSha256Hex(body) !== expectedSha256) {
+    throw new Error(`R2 PUT body SHA-256 mismatch: ${key}`);
+  }
   if (r2?.adapter?.putObject) {
-    return r2.adapter.putObject({ key, body, content_type });
+    return r2.adapter.putObject({
+      key,
+      body,
+      content_type,
+      ...(expectedSha256 ? { sha256: expectedSha256 } : {}),
+    });
   }
   const bufferBody = body instanceof Uint8Array ? body : Buffer.from(body);
   const payloadHash = createHash("sha256").update(bufferBody).digest("hex");
-  const response = await fetchR2WithRetry({
+  const { response, errorText } = await fetchR2WithRetry({
     method: "PUT",
     body: bufferBody,
     buildRequest: () => buildAwsSignedRequest({
@@ -303,24 +459,33 @@ export async function r2PutObject({ r2, key, body, content_type = "application/o
       headers: {
         "content-type": content_type,
         "content-length": String(bufferBody.byteLength),
+        ...(expectedSha256
+          ? { "x-amz-checksum-sha256": sha256HexToBase64(expectedSha256) }
+          : {}),
       },
+    }),
+    consumeResponse: async (response) => ({
+      response,
+      errorText: response.ok ? "" : await readResponseText(response, 4000),
     }),
   });
   if (!response.ok) {
-    const text = await readResponseText(response, 4000);
-    throw new Error(`R2 PUT failed (${response.status}) key=${key}: ${text}`);
+    throw new Error(`R2 PUT failed (${response.status}) key=${key}: ${errorText}`);
   }
 
   return {
     key,
     bytes: bufferBody.byteLength,
     etag: response.headers.get("etag") || null,
+    sha256: normalizeR2Sha256Checksum(
+      response.headers.get("x-amz-checksum-sha256"),
+    ) || expectedSha256,
   };
 }
 
 export async function r2CopyObject({ r2, source_key, dest_key }) {
   const copySource = `/${r2.bucket}/${source_key.split("/").map((part) => encodeRfc3986(part)).join("/")}`;
-  const response = await fetchR2WithRetry({
+  const { response, errorText } = await fetchR2WithRetry({
     method: "PUT",
     buildRequest: () => buildAwsSignedRequest({
       method: "PUT",
@@ -334,10 +499,13 @@ export async function r2CopyObject({ r2, source_key, dest_key }) {
         "x-amz-copy-source": copySource,
       },
     }),
+    consumeResponse: async (response) => ({
+      response,
+      errorText: response.ok ? "" : await readResponseText(response, 4000),
+    }),
   });
   if (!response.ok) {
-    const text = await readResponseText(response, 4000);
-    throw new Error(`R2 COPY failed (${response.status}) ${source_key} -> ${dest_key}: ${text}`);
+    throw new Error(`R2 COPY failed (${response.status}) ${source_key} -> ${dest_key}: ${errorText}`);
   }
 
   return {
@@ -349,9 +517,13 @@ export async function r2CopyObject({ r2, source_key, dest_key }) {
 
 export async function r2HeadObject({ r2, key }) {
   if (r2?.adapter?.headObject) {
-    return r2.adapter.headObject({ key });
+    const result = await r2.adapter.headObject({ key });
+    const sha256 = normalizeR2Sha256Checksum(
+      result?.sha256 ?? result?.checksums?.sha256,
+    );
+    return sha256 ? { ...result, sha256 } : result;
   }
-  const response = await fetchR2WithRetry({
+  const { response, errorText } = await fetchR2WithRetry({
     method: "HEAD",
     buildRequest: () => buildAwsSignedRequest({
       method: "HEAD",
@@ -361,6 +533,15 @@ export async function r2HeadObject({ r2, key }) {
       secretAccessKey: r2.secret_access_key,
       bucket: r2.bucket,
       objectKey: key,
+      headers: {
+        "x-amz-checksum-mode": "ENABLED",
+      },
+    }),
+    consumeResponse: async (response) => ({
+      response,
+      errorText: response.ok || response.status === 404
+        ? ""
+        : await readResponseText(response, 2000),
     }),
   });
 
@@ -372,8 +553,7 @@ export async function r2HeadObject({ r2, key }) {
   }
 
   if (!response.ok) {
-    const text = await readResponseText(response, 2000);
-    throw new Error(`R2 HEAD failed (${response.status}) key=${key}: ${text}`);
+    throw new Error(`R2 HEAD failed (${response.status}) key=${key}: ${errorText}`);
   }
 
   const bytesHeader = response.headers.get("content-length");
@@ -383,6 +563,9 @@ export async function r2HeadObject({ r2, key }) {
     etag: response.headers.get("etag") || null,
     last_modified: response.headers.get("last-modified") || null,
     bytes: bytesHeader ? Number(bytesHeader) : null,
+    sha256: normalizeR2Sha256Checksum(
+      response.headers.get("x-amz-checksum-sha256"),
+    ),
   };
 }
 
@@ -390,7 +573,7 @@ export async function r2GetObject({ r2, key }) {
   if (r2?.adapter?.getObject) {
     return r2.adapter.getObject({ key });
   }
-  const response = await fetchR2WithRetry({
+  const { response, arrayBuffer, errorText } = await fetchR2WithRetry({
     method: "GET",
     buildRequest: () => buildAwsSignedRequest({
       method: "GET",
@@ -401,14 +584,17 @@ export async function r2GetObject({ r2, key }) {
       bucket: r2.bucket,
       objectKey: key,
     }),
+    consumeResponse: async (response) => ({
+      response,
+      arrayBuffer: response.ok ? await response.arrayBuffer() : null,
+      errorText: response.ok ? "" : await readResponseText(response, 3000),
+    }),
   });
 
   if (!response.ok) {
-    const text = await readResponseText(response, 3000);
-    throw new Error(`R2 GET failed (${response.status}) key=${key}: ${text}`);
+    throw new Error(`R2 GET failed (${response.status}) key=${key}: ${errorText}`);
   }
 
-  const arrayBuffer = await response.arrayBuffer();
   return {
     key,
     bytes: arrayBuffer.byteLength,
@@ -471,6 +657,7 @@ export async function r2ListObjectsV2({
   continuation_token = null,
   max_keys = 1000,
   delimiter = null,
+  require_valid_listing = false,
 }) {
   const query = {
     "list-type": 2,
@@ -484,7 +671,7 @@ export async function r2ListObjectsV2({
     query.delimiter = delimiter;
   }
 
-  const response = await fetchR2WithRetry({
+  const { response, text: xml } = await fetchR2WithRetry({
     method: "GET",
     buildRequest: () => buildAwsSignedRequest({
       method: "GET",
@@ -496,15 +683,33 @@ export async function r2ListObjectsV2({
       objectKey: "",
       query,
     }),
+    consumeResponse: async (response) => ({
+      response,
+      text: await response.text(),
+    }),
   });
 
   if (!response.ok) {
-    const text = await readResponseText(response, 4000);
+    const text = xml.length <= 4000 ? xml : xml.slice(0, 4000);
     throw new Error(`R2 LIST failed (${response.status}) prefix=${prefix}: ${text}`);
   }
 
-  const xml = await response.text();
-  return parseListObjectsXml(xml);
+  const parsed = parseListObjectsXml(xml);
+  if (require_valid_listing) {
+    const truncated = xml.match(/<IsTruncated>(true|false)<\/IsTruncated>/);
+    const returnedPrefix = xml.match(/<Prefix>([^<]*)<\/Prefix>/);
+    const returnedBucket = xml.match(/<Name>([^<]+)<\/Name>/);
+    const keyCount = xml.match(/<KeyCount>([0-9]+)<\/KeyCount>/);
+    if (!/<ListBucketResult(?:\s[^>]*)?>/.test(xml) || !/<\/ListBucketResult>/.test(xml) || !truncated ||
+        !returnedPrefix || decodeXmlEntities(returnedPrefix[1]) !== prefix ||
+        !returnedBucket || decodeXmlEntities(returnedBucket[1]) !== r2.bucket ||
+        !keyCount || Number(keyCount[1]) !== parsed.entries.length || parsed.common_prefixes.length ||
+        (xml.match(/<IsTruncated>/g) || []).length !== 1 ||
+        (xml.match(/<Contents>/g) || []).length !== parsed.entries.length ||
+        (truncated[1] === 'true' && !parsed.next_token)) throw new Error(`Invalid R2 admission listing: ${prefix}`);
+    return { ...parsed, is_truncated: truncated[1] === 'true' };
+  }
+  return parsed;
 }
 
 export async function r2ListAllObjects({ r2, prefix, max_keys = 1000 }) {
@@ -581,7 +786,7 @@ export async function r2DeleteObjects({ r2, keys }) {
   const payloadHash = createHash("sha256").update(bodyBuffer).digest("hex");
   const contentMd5 = createHash("md5").update(bodyBuffer).digest("base64");
 
-  const response = await fetchR2WithRetry({
+  const { response, text: xml } = await fetchR2WithRetry({
     method: "POST",
     body: bodyBuffer,
     buildRequest: () => buildAwsSignedRequest({
@@ -600,14 +805,17 @@ export async function r2DeleteObjects({ r2, keys }) {
         "content-md5": contentMd5,
       },
     }),
+    consumeResponse: async (response) => ({
+      response,
+      text: await response.text(),
+    }),
   });
 
   if (!response.ok) {
-    const text = await readResponseText(response, 4000);
+    const text = xml.length <= 4000 ? xml : xml.slice(0, 4000);
     throw new Error(`R2 delete objects failed (${response.status}): ${text}`);
   }
 
-  const xml = await response.text();
   const deleted = [...xml.matchAll(/<Deleted>[\s\S]*?<Key>([^<]+)<\/Key>[\s\S]*?<\/Deleted>/g)]
     .map((match) => decodeXmlEntities(match[1]));
   const errors = [...xml.matchAll(/<Error>[\s\S]*?<Key>([^<]+)<\/Key>[\s\S]*?<Code>([^<]+)<\/Code>[\s\S]*?<Message>([^<]+)<\/Message>[\s\S]*?<\/Error>/g)]

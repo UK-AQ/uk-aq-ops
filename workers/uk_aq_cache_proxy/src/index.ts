@@ -1,3 +1,4 @@
+import { resolveObservationHistoryGeneration } from "../../shared/uk_aq_observation_history_generation.mjs";
 import {
   buildTimeseriesV2SupabaseFillPlan,
   classifyTimeseriesV2SourceRoute,
@@ -14,6 +15,7 @@ import * as stationHistoryObservations from "./station_history/observations.mjs"
 import * as stationHistoryStaleCache from "./station_history/stale_cache.mjs";
 
 export interface Env {
+  UK_AQ_R2_HISTORY_VERSION: unknown;
   STATION_HISTORY?: { fetch(input: Request | string, init?: RequestInit): Promise<Response> };
   SUPABASE_URL: unknown;
   SB_PUBLISHABLE_DEFAULT_KEY: unknown;
@@ -235,6 +237,7 @@ const ROUTE_TO_FUNCTION_MAP: Record<string, keyof typeof FUNCTION_PROFILE_MAP> =
 };
 
 const API_PREFIX = "/api/aq/";
+const PUBLIC_NETWORKS_PATH = "/api/aq/networks";
 const SESSION_START_PATH = "/api/aq/session/start";
 const SESSION_END_PATH = "/api/aq/session/end";
 const CHART_METRICS_PATH = "/api/aq/chart-metrics";
@@ -396,7 +399,7 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
-async function readSecret(value: unknown): Promise<string> {
+export async function readSecret(value: unknown): Promise<string> {
   if (typeof value === "string") {
     return value;
   }
@@ -444,7 +447,7 @@ function normalizeOrigin(value: string | null): string | null {
   }
 }
 
-function resolveRequestOrigin(request: Request, url: URL): string | null {
+export function resolveRequestOrigin(request: Request, url: URL): string | null {
   const originHeader = normalizeOrigin(request.headers.get("Origin"));
   if (originHeader) {
     return originHeader;
@@ -464,7 +467,7 @@ function resolveRequestOrigin(request: Request, url: URL): string | null {
   return null;
 }
 
-function parseAllowedOrigins(value: string): Set<string> {
+export function parseAllowedOrigins(value: string): Set<string> {
   const origins = new Set<string>();
   value
     .split(",")
@@ -483,7 +486,7 @@ function parseAllowedOrigins(value: string): Set<string> {
   return origins;
 }
 
-function isOriginAllowed(origin: string | null, allowedOrigins: Set<string>): boolean {
+export function isOriginAllowed(origin: string | null, allowedOrigins: Set<string>): boolean {
   if (!origin) {
     return false;
   }
@@ -519,7 +522,7 @@ function appendVary(headers: Headers, value: string): void {
   }
 }
 
-function addCorsHeaders(headers: Headers, requestOrigin: string | null, allowedOrigins: Set<string>): void {
+export function addCorsHeaders(headers: Headers, requestOrigin: string | null, allowedOrigins: Set<string>): void {
   const allowedOrigin = resolveAllowOrigin(requestOrigin, allowedOrigins);
   if (allowedOrigin) {
     headers.set("Access-Control-Allow-Origin", allowedOrigin);
@@ -2756,6 +2759,10 @@ function isSessionRoute(pathname: string): boolean {
   return pathname === SESSION_START_PATH || pathname === SESSION_END_PATH;
 }
 
+function isPublicMetadataRoute(pathname: string): boolean {
+  return pathname.replace(/\/+$/, "") === PUBLIC_NETWORKS_PATH;
+}
+
 function requiresApiCORS(pathname: string): boolean {
   return pathname.startsWith(API_PREFIX);
 }
@@ -2906,14 +2913,16 @@ export default {
       if (!isOriginAllowed(requestOrigin, allowedOrigins)) {
         return makeErrorResponse(403, "origin_not_allowed", requestOrigin, allowedOrigins);
       }
-      const sessionToken = getCookieValue(request.headers.get("Cookie"), SESSION_COOKIE_NAME);
-      if (!sessionToken) {
-        return makeErrorResponse(401, "missing_session_cookie", requestOrigin, allowedOrigins);
-      }
+      if (!isPublicMetadataRoute(url.pathname)) {
+        const sessionToken = getCookieValue(request.headers.get("Cookie"), SESSION_COOKIE_NAME);
+        if (!sessionToken) {
+          return makeErrorResponse(401, "missing_session_cookie", requestOrigin, allowedOrigins);
+        }
 
-      const authCheck = await verifyAccessToken(sessionToken, tokenSecret, requestOrigin);
-      if (!authCheck.ok) {
-        return makeErrorResponse(401, authCheck.error, requestOrigin, allowedOrigins);
+        const authCheck = await verifyAccessToken(sessionToken, tokenSecret, requestOrigin);
+        if (!authCheck.ok) {
+          return makeErrorResponse(401, authCheck.error, requestOrigin, allowedOrigins);
+        }
       }
     }
 
@@ -3068,11 +3077,22 @@ export default {
 
     const shouldUseCache = shouldCacheRequest(request, bypassRequested);
     const cache = (caches as unknown as { default: Cache }).default;
+    const historyCacheUrl = new URL(normalizedRequestUrl.toString());
+    if (stationHistoryInternalRoute || usingStationSeriesUpstream || useTimeseriesV2Skeleton || usingExternalAqiHistoryUpstream) {
+      try {
+        const generation = resolveObservationHistoryGeneration({
+          UK_AQ_R2_HISTORY_VERSION: await readSecret(env.UK_AQ_R2_HISTORY_VERSION),
+        });
+        historyCacheUrl.searchParams.set("__uk_aq_observation_generation", generation.version);
+      } catch (_error) {
+        return makeErrorResponse(500, "invalid_observation_history_generation", requestOrigin, allowedOrigins);
+      }
+    }
     const stationHistoryVersionedKeys = stationHistoryStaleRequestSupported
-      ? stationHistoryStaleCache.buildFreshAndStaleCacheKeys(normalizedRequestUrl)
+      ? stationHistoryStaleCache.buildFreshAndStaleCacheKeys(historyCacheUrl)
       : null;
     const cacheKey = stationHistoryVersionedKeys?.fresh
-      ?? new Request(normalizedRequestUrl.toString(), { method: "GET" });
+      ?? new Request(historyCacheUrl.toString(), { method: "GET" });
 
     if (shouldUseCache && request.method === "GET") {
       let cachedResponse = await cache.match(cacheKey);

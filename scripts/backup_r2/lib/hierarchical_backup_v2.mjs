@@ -1,3 +1,4 @@
+import { assertObservationHistoryGeneration, assertObservationHistoryGenerationKey } from "../../../workers/shared/uk_aq_observation_history_generation.mjs";
 import { createHash } from "node:crypto";
 
 export const HIERARCHICAL_INVENTORY_SCHEMA_VERSION = 1;
@@ -14,13 +15,31 @@ export const OBSERVATION_RUN_MANIFEST_INVENTORY_KIND =
   "uk_aq_r2_history_backup_inventory_observation_run_manifests";
 export const OBSERVATION_RUN_MANIFEST_STATE_KIND =
   "uk_aq_r2_history_backup_state_observation_run_manifests";
+export const TIMESERIES_BINDING_PACK_INVENTORY_KIND =
+  "uk_aq_r2_history_backup_inventory_timeseries_binding_packs";
+export const OBSERVATIONS_TIMESERIES_LATEST_PATHS = Object.freeze({
+  v2: "history/_index_v2/observations_timeseries_latest.json",
+  v3: "history/_index_v3/observations_timeseries_latest.json",
+});
 export const OBSERVATIONS_TIMESERIES_LATEST_PATH =
-  "history/_index_v2/observations_timeseries_latest.json";
+  OBSERVATIONS_TIMESERIES_LATEST_PATHS.v2;
+
+export function resolveObservationsTimeseriesLatestPath(indexVersion) {
+  const authority = String(indexVersion || "");
+  const path = OBSERVATIONS_TIMESERIES_LATEST_PATHS[authority];
+  if (!path) {
+    throw new Error(
+      `Observation-history backup index authority must be exactly v2 or v3: ${authority || "unset"}`,
+    );
+  }
+  return path;
+}
 
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 const ISO_DAY_PATTERN = /^(\d{4})-(\d{2})-(\d{2})$/;
 const YEAR_PATTERN = /^\d{4}$/;
 const MONTH_PATTERN = /^(0[1-9]|1[0-2])$/;
+const TIMESERIES_BINDING_PACK_RANGE_SIZE = 1_000;
 
 export function sha256Hex(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -305,9 +324,142 @@ export function validateLatestTimeseriesInventoryUnit(raw) {
   };
 }
 
+export function validateTimeseriesBindingPackInventoryReference(raw) {
+  if (raw === undefined || raw === null) return null;
+  const value = assertObject(raw, "timeseries binding pack inventory reference");
+  if (
+    Number(value.schema_version) !== HIERARCHICAL_INVENTORY_SCHEMA_VERSION
+    || value.kind !== TIMESERIES_BINDING_PACK_INVENTORY_KIND
+    || value.backup_pack_version !== "v1"
+    || Number(value.range_size) !== TIMESERIES_BINDING_PACK_RANGE_SIZE
+  ) {
+    throw new Error("Timeseries binding pack inventory reference identity mismatch");
+  }
+  const sourcePrefix = normalizeRelativePath(
+    value.source_prefix,
+    "timeseries binding pack inventory source prefix",
+  );
+  const sourceRootKey = normalizeRelativePath(
+    value.source_root_key,
+    "timeseries binding pack inventory source root key",
+  );
+  if (sourceRootKey !== `${sourcePrefix}/_manifests/root.json`) {
+    throw new Error("Timeseries binding pack inventory source root key mismatch");
+  }
+  const ranges = Array.isArray(value.ranges)
+    ? value.ranges.map((entry) => {
+      const rangeStart = Number(entry?.range_start);
+      const rangeEnd = Number(entry?.range_end);
+      if (
+        !Number.isSafeInteger(rangeStart)
+        || rangeStart < 0
+        || rangeStart % TIMESERIES_BINDING_PACK_RANGE_SIZE !== 0
+        || rangeEnd !== rangeStart + TIMESERIES_BINDING_PACK_RANGE_SIZE - 1
+      ) {
+        throw new Error(
+          `Invalid timeseries binding pack inventory range ${rangeStart}-${rangeEnd}`,
+        );
+      }
+      const packSize = Number(entry?.pack_size);
+      const memberCount = Number(entry?.member_count);
+      if (!Number.isSafeInteger(packSize) || packSize <= 0) {
+        throw new Error("Timeseries binding pack inventory pack_size is invalid");
+      }
+      if (!Number.isSafeInteger(memberCount) || memberCount <= 0) {
+        throw new Error("Timeseries binding pack inventory member_count is invalid");
+      }
+      return {
+        range_start: rangeStart,
+        range_end: rangeEnd,
+        source_range_hash: assertSha256(
+          entry.source_range_hash,
+          "timeseries binding pack inventory source_range_hash",
+        ),
+        pack_relative_path: normalizeRelativePath(entry.pack_relative_path),
+        pack_sha256: assertSha256(
+          entry.pack_sha256,
+          "timeseries binding pack inventory pack_sha256",
+        ),
+        pack_size: packSize,
+        member_count: memberCount,
+      };
+    }).sort((left, right) => left.range_start - right.range_start)
+    : null;
+  if (!ranges) {
+    throw new Error("Timeseries binding pack inventory ranges must be an array");
+  }
+  const seen = new Set();
+  for (const range of ranges) {
+    if (seen.has(range.range_start)) {
+      throw new Error(
+        `Duplicate timeseries binding pack inventory range ${range.range_start}`,
+      );
+    }
+    seen.add(range.range_start);
+  }
+  const rangeCount = Number(value.range_count);
+  const memberCount = Number(value.member_count);
+  const packRootSize = Number(value.pack_root_size);
+  if (!Number.isSafeInteger(rangeCount) || rangeCount !== ranges.length) {
+    throw new Error("Timeseries binding pack inventory range_count mismatch");
+  }
+  if (
+    !Number.isSafeInteger(memberCount)
+    || memberCount !== ranges.reduce((sum, range) => sum + range.member_count, 0)
+  ) {
+    throw new Error("Timeseries binding pack inventory member_count mismatch");
+  }
+  if (!Number.isSafeInteger(packRootSize) || packRootSize <= 0) {
+    throw new Error("Timeseries binding pack inventory pack_root_size is invalid");
+  }
+  const packRootRelativePath = normalizeRelativePath(
+    value.pack_root_relative_path,
+    "timeseries binding pack inventory root path",
+  );
+  if (!packRootRelativePath.endsWith("/root.json")) {
+    throw new Error("Timeseries binding pack inventory root path mismatch");
+  }
+  const packPrefix = packRootRelativePath.slice(0, -"/root.json".length);
+  for (const range of ranges) {
+    const expectedPackPath = `${packPrefix}/range=`
+      + `${String(range.range_start).padStart(6, "0")}-`
+      + `${String(range.range_end).padStart(6, "0")}/`
+      + `${range.source_range_hash}.pack.json`;
+    if (range.pack_relative_path !== expectedPackPath) {
+      throw new Error(
+        `Timeseries binding pack inventory path mismatch: ${range.pack_relative_path}`,
+      );
+    }
+  }
+  return {
+    schema_version: HIERARCHICAL_INVENTORY_SCHEMA_VERSION,
+    kind: TIMESERIES_BINDING_PACK_INVENTORY_KIND,
+    backup_pack_version: "v1",
+    range_size: TIMESERIES_BINDING_PACK_RANGE_SIZE,
+    source_prefix: sourcePrefix,
+    source_root_key: sourceRootKey,
+    source_root_hash: assertSha256(
+      value.source_root_hash,
+      "timeseries binding pack inventory source_root_hash",
+    ),
+    pack_root_relative_path: packRootRelativePath,
+    pack_root_sha256: assertSha256(
+      value.pack_root_sha256,
+      "timeseries binding pack inventory root SHA-256",
+    ),
+    pack_root_size: packRootSize,
+    range_count: rangeCount,
+    member_count: memberCount,
+    ranges,
+  };
+}
+
 export function validateHierarchicalInventoryRoot(
   root,
-  { requireLatestTimeseries = true } = {},
+  {
+    requireLatestTimeseries = true,
+    validateTimeseriesBindingPacks = true,
+  } = {},
 ) {
   const value = assertObject(root, "hierarchical inventory root");
   if (Number(value.schema_version) !== HIERARCHICAL_INVENTORY_SCHEMA_VERSION) {
@@ -380,6 +532,15 @@ export function validateHierarchicalInventoryRoot(
       years,
     },
     global_units: globalUnits,
+    ...(value.timeseries_binding_packs === undefined
+      || !validateTimeseriesBindingPacks
+      ? {}
+      : {
+        timeseries_binding_packs:
+          validateTimeseriesBindingPackInventoryReference(
+            value.timeseries_binding_packs,
+          ),
+      }),
   };
 }
 
@@ -647,14 +808,17 @@ export function markLatestTimeseriesProcessed(stateRoot, inventoryUnit, copiedAt
   return stateRoot;
 }
 
-export function emptyHierarchicalStateRoot(
-  stateRootPrefix = "_ops/checkpoints/r2_history_backup_state_v2",
-) {
+export function emptyHierarchicalStateRoot(stateRootPrefix, generation) {
+  assertObservationHistoryGeneration(generation);
   const prefix = normalizeRelativePath(stateRootPrefix, "state root prefix");
+  if (prefix !== generation.backup_state_prefix) {
+    throw new Error("Empty checkpoint prefix contradicts selected generation");
+  }
   return {
     schema_version: HIERARCHICAL_STATE_SCHEMA_VERSION,
     kind: HIERARCHICAL_STATE_KIND,
     backup_version: "v2",
+    observation_generation: generation.version,
     observations: {
       processed_source_root_hash: null,
       years: [],
@@ -666,21 +830,27 @@ export function emptyHierarchicalStateRoot(
         processed_source_hash: null,
         state_shard_hash: null,
       },
-      observations_timeseries_latest: emptyLatestTimeseriesState(),
+      observations_timeseries_latest: {
+        ...emptyLatestTimeseriesState(),
+        source_relative_path: generation.observations_timeseries_latest_key,
+      },
     },
   };
 }
 
 export function validateHierarchicalStateRoot(
   root,
-  stateRootPrefix = "_ops/checkpoints/r2_history_backup_state_v2",
+  stateRootPrefix = "_ops/checkpoints/r2_history_backup_state_v2/observation_generation=v2",
+  generation = null,
 ) {
-  if (!root) return emptyHierarchicalStateRoot(stateRootPrefix);
+  if (generation) assertObservationHistoryGeneration(generation);
+  if (!root) return emptyHierarchicalStateRoot(stateRootPrefix, generation);
   const value = assertObject(root, "hierarchical state root");
   if (Number(value.schema_version) !== HIERARCHICAL_STATE_SCHEMA_VERSION) {
     throw new Error("Hierarchical state root schema_version mismatch");
   }
-  if (value.kind !== HIERARCHICAL_STATE_KIND || value.backup_version !== "v2") {
+  if (value.kind !== HIERARCHICAL_STATE_KIND || value.backup_version !== "v2" ||
+      (generation && value.observation_generation !== generation.version)) {
     throw new Error("Hierarchical state root identity mismatch");
   }
   const observations = assertObject(value.observations, "state observations");
@@ -840,4 +1010,72 @@ export function stateMonthEntry(stateRoot, year, month) {
   const yearEntry = stateYearEntry(stateRoot, year);
   const normalizedMonth = normalizeMonth(month);
   return yearEntry?.months?.find((entry) => entry.month === normalizedMonth) || null;
+}
+
+// Runtime backup admission only; historical migration evidence keeps its own verifier.
+export function assertSelectedBackupInventory(generation, root) {
+  assertObservationHistoryGeneration(generation);
+  if (root.observation_generation !== generation.version ||
+      root.observations.source_root_manifest_key !== generation.observations_root_key ||
+      root.global_units.observations_timeseries_latest?.relative_path !== generation.observations_timeseries_latest_key ||
+      root.core?.source_prefix !== generation.core_prefix ||
+      root.timeseries_binding?.source_manifest_root_key !== `${generation.timeseries_binding_index_prefix}/_manifests/root.json`) {
+    throw new Error("Backup inventory does not describe the selected complete generation");
+  }
+  const inventoryKey = (key) => assertObservationHistoryGenerationKey(generation, key, "backup_inventory");
+  inventoryKey(root.core.inventory_shard_key);
+  inventoryKey(root.timeseries_binding.inventory_root_key);
+  for (const range of root.timeseries_binding.ranges) inventoryKey(range.inventory_shard_key);
+  inventoryKey(root.global_units.observation_run_manifests.inventory_shard_key);
+  for (const year of root.observations.years) {
+    assertObservationHistoryGenerationKey(generation, year.manifest_key);
+    for (const month of year.months) {
+      assertObservationHistoryGenerationKey(generation, month.manifest_key);
+      inventoryKey(month.inventory_shard_key);
+    }
+  }
+  if (root.timeseries_binding_packs) {
+    const pack = validateTimeseriesBindingPackInventoryReference(root.timeseries_binding_packs);
+    if (pack.source_prefix !== generation.timeseries_binding_index_prefix ||
+        pack.pack_root_relative_path !== `${generation.timeseries_binding_pack_prefix}/root.json`) {
+      throw new Error("Binding pack inventory contradicts selected generation");
+    }
+    for (const range of pack.ranges) assertObservationHistoryGenerationKey(generation, range.pack_relative_path, "packs");
+  }
+  return root;
+}
+
+export function assertSelectedBackupState(generation, root) {
+  assertObservationHistoryGeneration(generation);
+  if (root.observation_generation !== generation.version) {
+    throw new Error("Dropbox checkpoint contradicts selected generation");
+  }
+  const stateKey = (key) => assertObservationHistoryGenerationKey(generation, key, "backup_state");
+  for (const year of root.observations.years) {
+    for (const month of year.months) stateKey(month.state_shard_key);
+  }
+  stateKey(root.global_units.observation_run_manifests.state_shard_key);
+  if (root.core?.state_shard_key) stateKey(root.core.state_shard_key);
+  const latest = root.global_units.observations_timeseries_latest?.source_relative_path;
+  if (latest) assertObservationHistoryGenerationKey(generation, latest, "latest");
+  for (const range of root.timeseries_binding?.ranges || []) stateKey(range.state_shard_key);
+  for (const range of root.timeseries_binding_packs?.ranges || []) {
+    stateKey(range.state_shard_key);
+    assertObservationHistoryGenerationKey(generation, range.pack_relative_path, "packs");
+  }
+  if (root.timeseries_binding_packs?.pack_root_relative_path) {
+    assertObservationHistoryGenerationKey(generation, root.timeseries_binding_packs.pack_root_relative_path, "packs");
+  }
+  return root;
+}
+
+export function assertSelectedObservationInventoryShard(generation, shard) {
+  assertObservationHistoryGenerationKey(generation, shard.source_month_manifest_key);
+  for (const day of shard.days) {
+    const expected = `${generation.observations_prefix}/day_utc=${day.day_utc}`;
+    if (day.relative_path !== expected || day.manifest_key !== `${expected}/manifest.json`) {
+      throw new Error("Observation inventory day contradicts selected generation");
+    }
+  }
+  return shard;
 }

@@ -5,6 +5,7 @@ Cloudflare Worker for historical observations reads from R2 History.
 Routes:
 
 - `GET /v1/observations`
+- `GET /v1/daily-validation-provenance` (one connector-1 timeseries, bounded to 366 UTC days)
 - `GET /v1/timeseries-binding?timeseries_id=<id>` (stable v2 identity/routing)
 - `GET /v1/who-summary?as_of=YYYY-MM-DD` (WHO homepage summary)
 - alias: `GET /`
@@ -75,7 +76,7 @@ V2 serving rule:
 
 Response:
 
-- returns `{ observed_at, value }` rows sorted by `observed_at` ascending.
+- returns `{ observed_at, value, vstatus }` rows sorted by `observed_at` ascending; legacy rows without a status return `vstatus: null`.
 - includes `cache_scope` (`recent` or `immutable`) for cache policy visibility.
 - includes `read_version`, `index_version`, `pollutant`, `history_index_prefix`,
   and `timeseries_index_prefix` for read-path visibility.
@@ -104,7 +105,7 @@ Cache behavior:
 
 Optional env:
 
-- `UK_AQ_R2_HISTORY_VERSION` (required `v1|v2`, canonical active selector. Note: old `UK_AQ_R2_HISTORY_READ_VERSION` is deprecated and rejected by active runtime guards.)
+- `UK_AQ_R2_HISTORY_VERSION` (required `v2|v3`, canonical active selector. Note: old `UK_AQ_R2_HISTORY_READ_VERSION` is deprecated and rejected by active runtime guards.)
 - `UK_AQ_OBSERVS_HISTORY_R2_CACHE_MAX_AGE_SECONDS` (default `300`, clamp `30..604800`)
 - `UK_AQ_OBSERVS_HISTORY_R2_IMMUTABLE_CACHE_MAX_AGE_SECONDS` (default `86400`, clamp `30..604800`)
 - `UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX` (default `history/v1/observations`)
@@ -123,7 +124,16 @@ Optional env:
 
 ## Deploy (manual)
 
+From the repository root, install shared runtime dependencies and the pinned
+Worker-local deployment toolchain before invoking Wrangler:
+
 ```bash
+npm ci
+npm --prefix workers/uk_aq_observs_history_r2_api_worker ci
 cd workers/uk_aq_observs_history_r2_api_worker
-wrangler deploy
+./node_modules/.bin/wrangler deploy
 ```
+
+## Serving generation descriptor
+
+`GET /v1/history-generation` uses the existing `x-uk-aq-upstream-auth` authentication and returns the immutable shared generation selected by the stable service, with `Cache-Control: no-store`. It does not read or list R2. Dashboard clients use this endpoint rather than their own deployment-time history selector. See the active `system_docs/r2_history/generation_descriptor_contract.md` in the system-docs repository for the wire contract and failure semantics.

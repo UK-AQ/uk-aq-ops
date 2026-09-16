@@ -1,9 +1,31 @@
+import { readFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
 import {
   deprecatedR2HistoryVersionVarsPresent,
   parseR2HistoryVersion,
 } from "../workers/shared/uk_aq_r2_history_version.mjs";
+import {
+  getObservationHistoryGeneration,
+} from "../workers/shared/uk_aq_observation_history_generation.mjs";
 
 const RPC_SCHEMA = "uk_aq_public";
+const RESERVED_SUMMARY_FIELDS = new Set([
+  "github_repository",
+  "github_workflow",
+  "github_run_id",
+  "github_run_number",
+  "github_run_attempt",
+  "github_sha",
+  "github_ref_name",
+  "github_event_name",
+  "github_actor",
+  "job_status",
+  "trigger",
+  "__proto__",
+  "constructor",
+  "prototype",
+]);
 
 function parseBoolean(raw, fallback = false) {
   if (raw === undefined || raw === null || raw === "") {
@@ -106,34 +128,89 @@ function mapReportStage(rawStage) {
   throw new Error(`Invalid DAILY_TASK_HEALTH_REPORT_STAGE: ${rawStage}`);
 }
 
-function buildBackupVersionDetails() {
-  const deprecated = deprecatedR2HistoryVersionVarsPresent(process.env);
+export function buildBackupVersionDetails(env = process.env) {
+  const deprecated = deprecatedR2HistoryVersionVarsPresent(env);
   if (deprecated.length > 0) {
     throw new Error(
       `Daily task health no longer supports ${deprecated.join(", ")}. `
-      + "Use UK_AQ_R2_HISTORY_VERSION=v1|v2 and delete the old split read/write/backup vars.",
+      + "Use UK_AQ_R2_HISTORY_VERSION=v1|v2|v3 and delete the old split read/write/backup vars.",
     );
   }
 
-  const rawHistoryVersion = optionalEnv("UK_AQ_R2_HISTORY_VERSION");
+  const rawHistoryVersion = String(env.UK_AQ_R2_HISTORY_VERSION || "").trim();
   if (!rawHistoryVersion) {
     return null;
   }
 
-  const historyVersion = parseR2HistoryVersion(rawHistoryVersion);
-
-  const inventoryRelPaths = {
-    v1: "history/_index/backup_inventory_v1.json",
-    v2: "history/_index_v2/backup_inventory_v2/root.json",
-  };
+  const normalizedHistoryVersion = rawHistoryVersion.toLowerCase();
+  let historyVersion;
+  let inventoryRelPath;
+  if (normalizedHistoryVersion === "v1") {
+    historyVersion = parseR2HistoryVersion(rawHistoryVersion);
+    inventoryRelPath = "history/_index/backup_inventory_v1.json";
+  } else if (
+    normalizedHistoryVersion === "v2"
+    || normalizedHistoryVersion === "v3"
+  ) {
+    const generation = getObservationHistoryGeneration(normalizedHistoryVersion);
+    historyVersion = generation.version;
+    inventoryRelPath = `${generation.backup_inventory_prefix}/root.json`;
+  } else {
+    throw new Error(
+      `Invalid UK_AQ_R2_HISTORY_VERSION=${JSON.stringify(rawHistoryVersion)}; expected v1, v2, or v3.`,
+    );
+  }
 
   const details = {
     history_version: historyVersion,
     backup_version: historyVersion,
-    inventory_rel_path: inventoryRelPaths[historyVersion] || null,
+    inventory_rel_path: inventoryRelPath,
   };
 
   return details;
+}
+
+function readSupplementalSummary() {
+  const filename = optionalEnv("DAILY_TASK_HEALTH_SUPPLEMENTAL_SUMMARY_FILE");
+  if (!filename) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(readFileSync(filename, "utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("top-level JSON value must be an object");
+    }
+    return parsed;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(
+      `Daily task health supplemental summary ignored (${filename}): ${message}`,
+    );
+    return null;
+  }
+}
+
+function mergeSupplementalSummary(summary) {
+  const supplemental = readSupplementalSummary();
+  if (!supplemental) {
+    return summary;
+  }
+
+  const collisions = Object.keys(supplemental).filter(
+    (key) => RESERVED_SUMMARY_FIELDS.has(key)
+      || Object.prototype.hasOwnProperty.call(summary, key),
+  );
+  if (collisions.length > 0) {
+    console.warn(
+      "Daily task health supplemental summary ignored because it contains "
+      + `reserved or existing fields: ${collisions.sort().join(", ")}`,
+    );
+    return summary;
+  }
+
+  Object.assign(summary, supplemental);
+  return summary;
 }
 
 function buildSummary(jobStatus) {
@@ -156,7 +233,7 @@ function buildSummary(jobStatus) {
     Object.assign(summary, backupDetails);
   }
 
-  return summary;
+  return mergeSupplementalSummary(summary);
 }
 
 function stripUndefined(input) {
@@ -168,7 +245,7 @@ function stripUndefined(input) {
   return input;
 }
 
-async function main() {
+export async function main() {
   const disabled = parseBoolean(process.env.DAILY_TASK_HEALTH_DISABLED, false);
   const strict = parseBoolean(process.env.DAILY_TASK_HEALTH_STRICT, false);
   if (disabled) {
@@ -311,4 +388,7 @@ async function main() {
   }
 }
 
-await main();
+const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMain) {
+  await main();
+}

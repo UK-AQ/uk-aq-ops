@@ -87,6 +87,23 @@ load_dotenv_file() {
 
 load_dotenv_file "$ENV_FILE"
 
+# Never pass interactive/local MySQL administration helper secrets into either
+# dashboard process, even when this script is started from an operator shell.
+unset PRO_MYSQL_PSWD DASHBOARD_TEST_READER_MYSQLPSWD DASHBOARD_TEST_WRITER_MYSQLPSWD
+
+# Separate process credentials: the HTTP server never loads the writer file.
+if [[ "${1:-}" == "--cache-refresh" ]]; then
+  shift
+  cache_env_file="$ROOT_DIR/.env.dashboard-cache.writer"
+  [[ -f "$cache_env_file" ]] || { echo "Missing dashboard cache writer environment file" >&2; exit 1; }
+  load_dotenv_file "$cache_env_file"
+  exec "$PYTHON_BIN" local/dashboard/server/uk_aq_dashboard_cache_refresh.py "$@"
+fi
+if [[ -f "$ROOT_DIR/.env.dashboard-cache.reader" ]]; then
+  load_dotenv_file "$ROOT_DIR/.env.dashboard-cache.reader"
+fi
+
+
 generate_dashboard_config() {
   "$PYTHON_BIN" - <<'PY'
 import json
@@ -131,6 +148,7 @@ patch_paths = [
     Path("dashboard/assets/storage_coverage_missing_r2_hotfix.js"),
     Path("dashboard/assets/storage_coverage_backup_only_style_patch.js"),
     Path("dashboard/assets/freshness_table_layout_patch.js"),
+    Path("dashboard/assets/daily_task_refresh_patch.js"),
 ]
 for patch_path in patch_paths:
     if not patch_path.is_file():

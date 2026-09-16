@@ -21,6 +21,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
+      UKAQ_ENV_NAME: ${{ vars.UKAQ_ENV_NAME || 'TEST' }}
+      UK_AQ_SERVICE_EGRESS_METRICS_ENABLED: ${{ vars.UK_AQ_SERVICE_EGRESS_METRICS_ENABLED || 'false' }}
       SUPABASE_URL: ${{ vars.SUPABASE_URL }}
       OBS_AQIDB_SUPABASE_URL: ${{ vars.OBS_AQIDB_SUPABASE_URL }}
       SB_SECRET_KEY: ${{ secrets.SB_SECRET_KEY }}
@@ -53,14 +55,8 @@ jobs:
       UK_AQ_R2_HISTORY_STAGING_RETENTION_DAYS: ${{ vars.UK_AQ_R2_HISTORY_STAGING_RETENTION_DAYS || '7' }}
       UK_AQ_R2_HISTORY_STAGING_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_STAGING_PREFIX || 'history/v1/_ops/observations/staging' }}
       UK_AQ_R2_HISTORY_VERSION: ${{ vars.UK_AQ_R2_HISTORY_VERSION || '' }}
-      UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX || 'history/v1/observations' }}
-      UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX || 'history/v2/observations' }}
-      UK_AQ_R2_HISTORY_RUNS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_RUNS_PREFIX || 'history/v1/_ops/observations/runs' }}
       UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX || 'history/v2/aqilevels/hourly/data' }}
       UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DEBUG_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DEBUG_PREFIX || 'history/v2/aqilevels/hourly/debug' }}
-      UK_AQ_R2_HISTORY_V2_RUNS_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_RUNS_PREFIX || 'history/v2/_ops/observations/runs' }}
-      UK_AQ_R2_HISTORY_INDEX_V2_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_INDEX_V2_PREFIX || 'history/_index_v2' }}
-      UK_AQ_R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX || 'history/_index_v2/observations_timeseries' }}
       UK_AQ_R2_HISTORY_PRUNE_CHECK_DROPBOX_ENABLED: ${{ vars.UK_AQ_R2_HISTORY_PRUNE_CHECK_DROPBOX_ENABLED || 'false' }}
       UK_AQ_R2_HISTORY_PRUNE_CHECK_DROPBOX_REQUIRED: ${{ vars.UK_AQ_R2_HISTORY_PRUNE_CHECK_DROPBOX_REQUIRED || 'false' }}
       UK_AQ_R2_HISTORY_PRUNE_CHECK_DROPBOX_DIR: ${{ vars.UK_AQ_R2_HISTORY_PRUNE_CHECK_DROPBOX_DIR || 'prune_r2_check' }}
@@ -115,10 +111,14 @@ jobs:
               missing=1
             fi
           done
+          node --input-type=module -e '
+            import { resolvePruneHistoryGeneration } from "./workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
+            resolvePruneHistoryGeneration(process.env);
+          '
           exit "${missing}"
 
       - name: Run Prune Daily
-        run: timeout --kill-after=30s 30m node workers/uk_aq_prune_daily/job.mjs
+        run: timeout --kill-after=30s 180m node workers/uk_aq_prune_daily/job.mjs
 
       - name: Upload Prune Daily report
         if: always()

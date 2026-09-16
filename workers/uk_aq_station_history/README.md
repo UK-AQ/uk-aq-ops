@@ -15,6 +15,50 @@ A request uses ingest-only mode only when the direct response covers the complet
 
 Partial or gap-bearing responses use `Cache-Control: no-store`. Diagnostics report counts, boundaries, RPC window/HTTP attempt metadata, completeness, and overlap/mismatch totals but never observation values.
 
+## index_v3 observation-history paging
+
+When `UK_AQ_R2_HISTORY_INDEX_VERSION=v3`, station-history uses the selected
+shared exact-leaf reader through the authenticated observation-history client.
+The browser and cache proxy continue to use the existing station-history
+routes and response shape; neither receives nor returns a `physical_cursor`.
+
+The R2 observation adapter:
+
+- splits every required physical-timeseries interval at UTC-day boundaries,
+  so each low-level logical request is no more than 24 hours;
+- issues the first exact-leaf request, then follows
+  `physical_page.next_cursor` until that logical piece is complete;
+- appends pages and UTC pieces in strict chronological order;
+- shares one invocation-scoped read budget across all continuity members and
+  compatibility phases, capped at 16 physical pages and the existing 5,000
+  station-history observation rows; and
+- preserves the exact-leaf reader's one-segment/1,024-row invocation bound,
+  pinned object identities, exact stored byte ranges, and fail-closed cursor
+  validation.
+
+The existing maximum seven-day observation chunk plus 23 hours of PM context
+can intersect at most nine UTC days. Normal hourly and current five-minute
+sources therefore fit comfortably inside 16 pages. The budget also stays
+below the current external-subrequest limit and would produce at most 19
+Worker invocations in the full cache-proxy -> station-history ->
+observation-history chain if the leaf client later moves to a Service Binding.
+
+If page 16 still has work remaining, station-history stops with
+`observation_history_physical_page_budget_exceeded`. If appending a physical
+page would take the invocation above its row budget, that page is not appended
+and station-history stops with `observation_history_row_budget_exceeded`.
+Neither case exposes a browser continuation or claims completeness. Both flow
+through the existing incomplete-response `Cache-Control: no-store` policy.
+
+The historical response `limits.max_pages` field retains its established v2
+meaning. A v3 physical-page response instead reports
+`limits.max_physical_pages: 16`.
+
+The shelved encrypted, browser-visible station-history continuation candidate
+and its cap experiments are retained under
+`archive/2026-09-02/index_v3_station_history_continuation/`. That design is
+separate from the active private low-level `physical_cursor`.
+
 ## AQI v2 endpoint response contract
 
 The active R2 v2 AQI path uses `timestamp_hour_utc = n` as its canonical
@@ -48,3 +92,6 @@ Optional TEST tuning uses safe in-code defaults when absent:
 - `UK_AQ_STATION_HISTORY_OBSERVATION_CHUNK_MAX_HOURS` (`168`).
 - `UK_AQ_STATION_HISTORY_OBSERVATION_OVERLAP_HOURS` (`2`, validated to `1`–`3`).
 - `UK_AQ_STATION_HISTORY_OBSAQIDB_TIMEOUT_MS` (`10000`).
+
+The index_v3 physical-page budget is a fixed safety bound, not an environment
+variable or public pagination control.

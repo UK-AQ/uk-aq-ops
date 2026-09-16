@@ -4,10 +4,14 @@ import {
   r2GetObject,
   r2ListAllCommonPrefixes,
 } from "../shared/r2_sigv4.mjs";
+import {
+  getObservationHistoryGeneration,
+} from "../shared/uk_aq_observation_history_generation.mjs";
 
 const BACKUP_INVENTORY_KEYS = {
   v1: "history/_index/backup_inventory_v1.json",
-  v2: "history/_index_v2/backup_inventory_v2/root.json",
+  v2: `${getObservationHistoryGeneration("v2").backup_inventory_prefix}/root.json`,
+  v3: `${getObservationHistoryGeneration("v3").backup_inventory_prefix}/root.json`,
 };
 const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 const INVENTORY_CACHE_TTL_MS = 5 * 60 * 1000;
@@ -149,13 +153,14 @@ async function readBackupInventory(r2, version) {
   }
 
   let days;
-  if (version === "v2") {
+  if (version === "v2" || version === "v3") {
     if (
       payload.kind !== "uk_aq_r2_history_backup_inventory_v2_root"
       || payload.backup_version !== "v2"
       || !Array.isArray(payload.observations?.years)
+      || payload.observation_generation !== version
     ) {
-      throw new Error("Hierarchical v2 backup inventory root identity is invalid");
+      throw new Error(`Hierarchical ${version} observation backup inventory root identity is invalid`);
     }
     const monthReferences = payload.observations.years.flatMap((yearEntry) => {
       const year = String(yearEntry?.year || "").trim();
@@ -208,7 +213,7 @@ async function readBackupInventory(r2, version) {
   }
   const value = {
     key,
-    source: version === "v2"
+    source: version === "v2" || version === "v3"
       ? "r2_hierarchical_backup_inventory"
       : "r2_backup_inventory",
     error: null,
@@ -249,7 +254,7 @@ export async function enrichR2HistoryDaysResponse(response, env) {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return response;
 
   const version = String(payload.read_version || "").trim().toLowerCase();
-  if (version !== "v1" && version !== "v2") return response;
+  if (version !== "v1" && version !== "v2" && version !== "v3") return response;
   const bucket = String(payload.bucket || "").trim();
   const r2 = resolveR2Config(env, bucket);
   if (!hasRequiredR2Config(r2)) return response;

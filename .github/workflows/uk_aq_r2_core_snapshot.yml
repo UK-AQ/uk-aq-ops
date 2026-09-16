@@ -24,7 +24,7 @@ on:
         default: ""
         type: string
       history_version:
-        description: "Core snapshot history version (v1 or v2). Blank = repo variable UK_AQ_R2_HISTORY_VERSION."
+        description: "Optional confirmation of the repository history generation (v2 or v3); applies to Core and bindings together."
         required: false
         default: ""
         type: string
@@ -47,13 +47,10 @@ jobs:
       CFLARE_R2_REGION: ${{ vars.CFLARE_R2_REGION || 'auto' }}
       CFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CFLARE_R2_ACCESS_KEY_ID }}
       CFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CFLARE_R2_SECRET_ACCESS_KEY }}
-      UK_AQ_R2_HISTORY_VERSION: ${{ github.event.inputs.history_version || vars.UK_AQ_R2_HISTORY_VERSION || '' }}
-      UK_AQ_R2_HISTORY_CORE_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_CORE_PREFIX || 'history/v1/core' }}
-      UK_AQ_R2_HISTORY_V2_CORE_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_CORE_PREFIX || 'history/v2/core' }}
-      UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX || 'history/_index_v2/timeseries_binding' }}
-      UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX || 'history/_index_v2/backup_inventory_v2' }}
+      UK_AQ_R2_HISTORY_VERSION: ${{ vars.UK_AQ_R2_HISTORY_VERSION || '' }}
       UK_AQ_R2_CORE_SNAPSHOT_CURSOR_BATCH_ROWS: ${{ vars.UK_AQ_R2_CORE_SNAPSHOT_CURSOR_BATCH_ROWS || '5000' }}
 
+      INPUT_HISTORY_VERSION: ${{ github.event.inputs.history_version || '' }}
       INPUT_DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
       INPUT_DAY_UTC: ${{ github.event.inputs.day_utc || '' }}
       INPUT_TABLES: ${{ github.event.inputs.tables || '' }}
@@ -89,10 +86,6 @@ jobs:
             CFLARE_R2_ACCESS_KEY_ID
             CFLARE_R2_SECRET_ACCESS_KEY
             UK_AQ_R2_HISTORY_VERSION
-            UK_AQ_R2_HISTORY_CORE_PREFIX
-            UK_AQ_R2_HISTORY_V2_CORE_PREFIX
-            UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX
-            UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX
           )
 
           missing=0
@@ -108,12 +101,17 @@ jobs:
           fi
 
           case "${UK_AQ_R2_HISTORY_VERSION}" in
-            v1|v2) ;;
+            v2|v3) ;;
             *)
-              echo "UK_AQ_R2_HISTORY_VERSION must be v1 or v2." >&2
+              echo "UK_AQ_R2_HISTORY_VERSION must be v2 or v3." >&2
               exit 1
               ;;
           esac
+
+          if [ -n "${INPUT_HISTORY_VERSION}" ] && [ "${INPUT_HISTORY_VERSION}" != "${UK_AQ_R2_HISTORY_VERSION}" ]; then
+            echo "history_version must match the persistent repository selector." >&2
+            exit 1
+          fi
 
           day_utc="$(printf "%s" "${INPUT_DAY_UTC}" | tr -d '\r\n' | xargs)"
           case "${day_utc}" in
@@ -153,45 +151,18 @@ jobs:
           echo "Running: ${cmd[*]}"
           "${cmd[@]}"
 
-      - name: Refresh timeseries binding source hierarchy
+      - name: Save binding hierarchy result from protected publication
         run: |
-          set -euo pipefail
-          mkdir -p tmp
-
-          if [ "${UK_AQ_R2_HISTORY_VERSION}" != "v2" ]; then
-            echo "Skipping binding source hierarchy refresh for ${UK_AQ_R2_HISTORY_VERSION}."
-            exit 0
-          fi
-          if [ "${INPUT_DRY_RUN}" = "true" ]; then
-            echo "Skipping binding source hierarchy refresh during core snapshot dry run."
-            exit 0
-          fi
-
-          source_fingerprint="$(python3 - <<'PY'
+          python3 - <<'PYCODE'
           import json
-          with open('tmp/uk_aq_core_snapshot_to_r2_report.json', 'r', encoding='utf-8') as handle:
-              report = json.load(handle)
-          reconciliation = report.get('timeseries_binding_reconciliation') or {}
-          print(str(reconciliation.get('current_source_fingerprint') or '').strip())
-          PY
-          )"
-
-          cmd=(
-            node scripts/backup_r2/uk_aq_refresh_timeseries_binding_source_hierarchy.mjs
-            --binding-prefix "${UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX}"
-            --backup-inventory-prefix "${UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX}"
-            --report-out "tmp/uk_aq_timeseries_binding_source_hierarchy_report.json"
-          )
-          if [ -n "${source_fingerprint}" ]; then
-            if ! printf "%s" "${source_fingerprint}" | grep -Eq '^[a-f0-9]{64}$'; then
-              echo "Invalid binding reconciliation source fingerprint in core snapshot report." >&2
-              exit 1
-            fi
-            cmd+=(--source-fingerprint "${source_fingerprint}")
-          fi
-
-          echo "Running: ${cmd[*]}"
-          "${cmd[@]}"
+          from pathlib import Path
+          report = json.loads(Path("tmp/uk_aq_core_snapshot_to_r2_report.json").read_text())
+          result = report.get("timeseries_binding_source_hierarchy")
+          if not report.get("dry_run") and report.get("timeseries_binding_reconciliation", {}).get("status") in ("succeeded", "skipped"):
+              if not result or result.get("ok") is not True:
+                  raise SystemExit("Protected binding hierarchy publication is incomplete")
+          Path("tmp/uk_aq_timeseries_binding_source_hierarchy_report.json").write_text(json.dumps(result, indent=2))
+          PYCODE
 
       - name: Upload snapshot report artifact
         if: always()
