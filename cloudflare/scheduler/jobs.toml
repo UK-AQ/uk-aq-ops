@@ -105,3 +105,22 @@ github_workflow_file = "uk_aq_dropbox_prune_raw.yml"
 github_ref = "main"
 dry_run = false
 notes = "Dropbox raw-data pruning"
+
+[jobs.uk_aq_media_discovery]
+enabled = false
+cron_expr = "0 */2 * * *"
+target_type = "worker_http"
+worker_http_url = "https://uk-aq-media-discovery.uk-aq-media.workers.dev/scheduler/run"
+worker_http_secret_binding = "UK_AQ_MEDIA_WORKER_HTTP_SECRET"
+dry_run = false
+notes = "UK AQ Media discovery"
+
+[jobs.uk_aq_media_gdelt]
+enabled = false
+cron_expr = "10,40 * * * *"
+target_type = "github_workflow"
+github_repo = "UK-AQ/uk-aq-media"
+github_workflow_file = "uk_aq_media_gdelt.yml"
+github_ref = "main"
+dry_run = false
+notes = "GDELT Web NGrams Media discovery"
