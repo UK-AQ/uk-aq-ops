@@ -7,6 +7,7 @@ const ROUTES: Array<{ pattern: RegExp; methods: ReadonlySet<string> }> = [
   { pattern: /^\/api\/media\/articles$/, methods: new Set(['GET', 'POST']) },
   { pattern: /^\/api\/media\/articles\/selectors$/, methods: new Set(['GET']) },
   { pattern: /^\/api\/media\/articles\/lookup$/, methods: new Set(['POST']) },
+  { pattern: /^\/api\/media\/articles\/bulk-approve$/, methods: new Set(['POST']) },
   { pattern: /^\/api\/media\/articles\/[1-9]\d*$/, methods: new Set(['GET']) },
   { pattern: /^\/api\/media\/articles\/[1-9]\d*\/image$/, methods: new Set(['GET']) },
   { pattern: /^\/api\/media\/articles\/[1-9]\d*\/(approve|reject|hide|unhide)$/, methods: new Set(['POST']) },
@@ -55,7 +56,9 @@ export async function handleMediaRoute(request: Request, env: WorkerEnv): Promis
   if (!base || !token) {
     return errorEnvelope('MEDIA_ADMIN_NOT_CONFIGURED', 'Media admin is unavailable', 503);
   }
-  const upstreamPath = incoming.pathname.replace(/^\/api\/media/, '/admin');
+  const upstreamPath = incoming.pathname === '/api/media/articles/bulk-approve'
+    ? '/admin/articles/bulk/approve'
+    : incoming.pathname.replace(/^\/api\/media/, '/admin');
   const target = `${base}${upstreamPath}${incoming.search}`;
   const headers = new Headers({ Authorization: `Bearer ${token}`, Accept: request.headers.get('Accept') || '*/*' });
   const contentType = request.headers.get('Content-Type');

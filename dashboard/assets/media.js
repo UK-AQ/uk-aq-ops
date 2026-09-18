@@ -13,6 +13,11 @@
     ["updated_desc", "Recently Updated"],
   ];
   const STATUS_LABELS = { approved: "Approved", pending: "Pending", rejected: "Rejected", hidden: "Hidden" };
+  const BLUESKY_REASON_LABELS = {
+    pending_approved: "Approved from Pending",
+    rejected_repost: "Approved from Rejected",
+    unhidden_repost: "Approved from Hidden",
+  };
   const STATUS_ACTIONS = {
     pending: [["approved", "Approve", "approve"], ["rejected", "Reject", "reject"]],
     approved: [["hidden", "Hide", "hide"], ["rejected", "Reject", "reject"]],
@@ -61,20 +66,13 @@
     return includeUtcSuffix ? `${formatted} UTC` : formatted;
   }
 
-  function formatUtcDate(value) {
-    if (!value) return "";
-    const date = new Date(value);
-    if (Number.isNaN(date.getTime())) return "";
-    return new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "long", year: "numeric",
-      timeZone: "UTC" }).format(date);
-  }
-
-  function formatHomepageDate(value) {
-    if (!value) return "";
-    const date = new Date(value);
-    if (Number.isNaN(date.getTime())) return "";
-    return new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "long", year: "numeric",
-      timeZone: "Europe/London" }).format(date);
+  function formatPublicationDate(value) {
+    const match = String(value || "").match(/^(\d{4})-(\d{2})-(\d{2})(?:T|$)/);
+    if (!match || Number.isNaN(Date.parse(value))) return "";
+    const date = new Date(`${match[1]}-${match[2]}-${match[3]}T00:00:00Z`);
+    if (Number.isNaN(date.getTime()) || date.getUTCFullYear() !== Number(match[1])
+      || date.getUTCMonth() + 1 !== Number(match[2]) || date.getUTCDate() !== Number(match[3])) return "";
+    return `${match[3]}/${match[2]}/${match[1]}`;
   }
 
   function formatUtcDateTimeInput(value) {
@@ -141,7 +139,7 @@
     const messageText = String(template ?? "")
       .split("{publisher}").join("Example Publisher")
       .split("{publisher_mention}").join("@example.bsky.social");
-    return `Example display title for an air-quality article\n\n${messageText}`;
+    return `Example original publisher headline for an air-quality article\n${messageText}`;
   }
 
   function setView(html) {
@@ -286,7 +284,6 @@
   }
 
   function bulkStatusTargetEligible(article, target) {
-    if (target === "approved" && ["rejected", "hidden"].includes(article.status)) return false;
     return article.status === target || Boolean(statusActionForTarget(article.status, target));
   }
 
@@ -335,7 +332,7 @@
   function inlineAiReview(article) {
     const pendingActions = article.ai_title_suggestion_state === "pending"
       ? `<button class="media-button media-button--primary" data-ai-action="accept-ai">Accept AI title</button><button class="media-button" data-ai-action="reject-ai">Reject AI / use original</button>` : "";
-    const published = formatUtcDate(article.published_at);
+    const published = formatPublicationDate(article.published_at);
     const sourceRow = `${esc(article.publisher)}<span data-ai-preview-date>${published ? ` · ${esc(published)}` : ""}</span>`;
     const currentTitle = article.display_title || article.title;
     const provenance = article.ai_title_generated_at
@@ -345,7 +342,7 @@
     const image = article.admin_preview_image_path
       ? `<img class="media-site-preview__image" loading="lazy" src="${esc(apiUrl(`articles/${article.id}/image`))}" alt="" data-ai-preview-image>` : "";
     const savedMessage = state.titleMessages.get(String(article.id));
-    const homepagePublished = formatHomepageDate(article.published_at);
+    const homepagePublished = formatPublicationDate(article.published_at);
     const homepageSourceRow = `${esc(article.publisher)}<span data-homepage-preview-date>${homepagePublished ? ` · ${esc(homepagePublished)}` : ""}</span>`;
     const externalLinkIcon = `<svg class="media-homepage-mobile-preview__icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M14 5h5v5M19 5l-9 9M18 13v5a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
     return `<section class="media-review" data-ai-id="${article.id}" data-publisher-title="${esc(article.title)}" data-ai-published="${published ? "true" : "false"}"><div class="media-review__layout"><div class="media-preview-stack"><div class="media-site-preview-wrap"><div class="media-site-preview" aria-label="Website image article card preview"><span class="media-site-preview__fallback">No permitted preview</span>${image}<div class="media-site-preview__gradient" aria-hidden="true"></div><div class="media-site-preview__overlay"><div class="media-site-preview__source-row">${sourceRow}</div><div class="media-site-preview__title" data-ai-preview-title>${esc(currentTitle)}</div></div></div></div><div class="media-homepage-mobile-preview-wrap"><div class="media-homepage-mobile-preview__label">Homepage mobile · 360px</div><div class="media-homepage-mobile-preview" aria-label="Homepage non-image article card at a 360 pixel viewport"><div class="media-homepage-mobile-preview__container"><div class="media-homepage-mobile-preview__card">${externalLinkIcon}<p class="media-homepage-mobile-preview__source">${homepageSourceRow}</p><h5 class="media-homepage-mobile-preview__headline"><span data-ai-preview-title>${esc(currentTitle)}</span></h5></div></div></div></div></div><div class="media-review__controls"><span class="media-subtext">${provenance}</span><div class="media-review__titles"><div class="media-review__title"><span>Publisher original</span>${esc(article.title)}</div><div class="media-review__title"><span>Current display title</span>${esc(currentTitle)}</div><div class="media-review__title"><span>Title origin / status</span>${esc(article.display_title_origin || "original")} · ${esc(titleStatus(article)[1])}</div><div class="media-review__title"><span>${esc(aiSuggestionLabel(article))}</span>${esc(article.ai_title_suggestion || "—")}</div></div><div class="media-actions"><button class="media-button" data-ai-action="generate">${generateLabel}</button>${pendingActions}<label class="media-field media-field--grow"><span>Edit as human title</span><input data-ai-edit value="${esc(article.display_title || "")}" maxlength="500"></label><button class="media-button" data-ai-action="edit">Save human title</button>${article.display_title ? `<button class="media-button" data-ai-action="clear">Clear display title</button>` : ""}</div><div data-ai-message>${savedMessage ? message(savedMessage.text, savedMessage.kind) : ""}</div></div></div></section>`;
@@ -367,7 +364,7 @@
 
   function bulkToolbarHtml() {
     const count = state.selectedArticleIds.size;
-    return `<div class="media-bulk-toolbar"><strong>${count} selected</strong><label class="media-field"><span>Change Article Status to</span><select data-bulk-status ${count ? "" : "disabled"}>${bulkStatusOptions()}</select></label><button type="button" class="media-button media-button--primary" data-save-bulk ${count ? "" : "disabled"}>Save</button><span class="media-subtext">Current loaded rows only · maximum ${MAX_BATCH_SELECTION}</span><div data-bulk-message>${state.batchMessage ? message(state.batchMessage.text, state.batchMessage.kind) : ""}</div></div>`;
+    return `<div class="media-bulk-toolbar"><strong>${count} selected</strong><label class="media-field"><span>Change Article Status to</span><select data-bulk-status ${count ? "" : "disabled"}>${bulkStatusOptions()}</select></label><label class="media-toggle" data-bulk-bluesky hidden><input type="checkbox"> <span>Post to Bluesky @ukaq.co.uk</span></label><button type="button" class="media-button media-button--primary" data-save-bulk ${count ? "" : "disabled"}>Save</button><span class="media-subtext">Current loaded rows only · maximum ${MAX_BATCH_SELECTION}</span><div data-bulk-message>${state.batchMessage ? message(state.batchMessage.text, state.batchMessage.kind) : ""}</div></div>`;
   }
 
   function articleTableHtml(error = "") {
@@ -400,7 +397,7 @@
       state.articleCursor = data.page?.next_cursor || null;
       state.articleHasMore = Boolean(data.page?.has_more);
       setView(`<section class="media-card"><div class="media-toolbar"><div><h3>Articles</h3><p>Authoritative Media D1 editorial state.</p></div>
-        <div class="media-actions"><button class="media-button" data-open-bluesky>Bluesky</button><button class="media-button media-button--primary" data-focus-add>+ Add Article</button></div></div>
+        <div class="media-actions"><button class="media-button" data-open-bluesky>Bluesky</button></div></div>
         <form class="media-url-form" data-url-lookup><label class="media-field media-field--grow"><span>Search / Add article URL</span><input name="url" type="url" required placeholder="https://publisher.example/article"></label><button class="media-button media-button--primary">Search</button></form>
         <div data-url-result></div>${aiUsageHtml()}</section>
         <section class="media-card"><div class="media-toolbar"><form class="media-toolbar__group" data-table-search><label class="media-field"><span>Search existing rows</span><input name="q" type="search" value="${esc(state.filters.q)}" placeholder="Title, URL or author"></label><button class="media-button">Search</button><button type="button" class="media-button" data-clear-filters>Clear filters</button></form></div>
@@ -455,9 +452,6 @@
 
   function bindArticleEvents() {
     state.root.querySelector("[data-open-bluesky]")?.addEventListener("click", () => void openBlueskySettings());
-    state.root.querySelector("[data-focus-add]")?.addEventListener("click", () => {
-      const input = state.root.querySelector("[data-url-lookup] input"); input?.focus(); input?.scrollIntoView({ behavior: "smooth", block: "center" });
-    });
     state.root.querySelector("[data-url-lookup]")?.addEventListener("submit", event => { event.preventDefault(); void lookupUrl(new FormData(event.currentTarget).get("url")); });
     state.root.querySelector("[data-table-search]")?.addEventListener("submit", event => { event.preventDefault(); state.filters.q = String(new FormData(event.currentTarget).get("q") || "").trim(); clearArticleSelection(); void refreshArticleTable(); });
     state.root.querySelector("[data-clear-filters]")?.addEventListener("click", () => {
@@ -498,6 +492,12 @@
       refreshSelectionControls();
     }));
     state.root.querySelector("[data-bulk-status]")?.addEventListener("change", event => {
+      const bluesky = state.root.querySelector("[data-bulk-bluesky]");
+      if (bluesky) {
+        bluesky.hidden = event.currentTarget.value !== "approved";
+        const input = bluesky.querySelector("input");
+        if (input) input.checked = false;
+      }
       refreshSelectionControls();
     });
     state.root.querySelector("[data-save-bulk]")?.addEventListener("click", () => void saveBulkStatus());
@@ -547,6 +547,15 @@
       if ([...target.options].some(option => option.value === previous)) target.value = previous;
       target.disabled = count === 0;
     }
+    const bluesky = table.querySelector("[data-bulk-bluesky]");
+    if (bluesky) {
+      const visible = count > 0 && target?.value === "approved";
+      bluesky.hidden = !visible;
+      if (!visible) {
+        const input = bluesky.querySelector("input");
+        if (input) input.checked = false;
+      }
+    }
     if (save) save.disabled = count === 0 || count > MAX_BATCH_SELECTION || !target?.value;
     const output = table.querySelector("[data-bulk-message]"); if (output) output.innerHTML = state.batchMessage ? message(state.batchMessage.text, state.batchMessage.kind) : "";
   }
@@ -563,6 +572,21 @@
     }
     const changes = selected.map(article => ({ article, action: statusActionForTarget(article.status, target) })).filter(item => item.action);
     const save = table.querySelector("[data-save-bulk]"); save.disabled = true;
+    const postToBluesky = target === "approved" && table.querySelector("[data-bulk-bluesky] input")?.checked === true;
+    if (postToBluesky) {
+      try {
+        await request("articles/bulk-approve", { method: "POST", idempotent: "bulk-approve", body: {
+          article_ids: changes.map(({ article }) => article.id),
+          post_to_bluesky: true,
+        } });
+        state.batchMessage = { text: `${changes.length} changed${selected.length - changes.length ? `; ${selected.length - changes.length} already ${STATUS_LABELS[target]}` : ""}.`, kind: "success" };
+        await refreshArticleTable(false);
+      } catch (error) {
+        state.batchMessage = { text: error.message, kind: "error" };
+        refreshSelectionControls();
+      }
+      return;
+    }
     const results = await Promise.allSettled(changes.map(({ article, action }) => request(`articles/${article.id}/${action}`, { method: "POST", idempotent: "status" })));
     const succeeded = results.filter(result => result.status === "fulfilled").length;
     const failed = results.length - succeeded;
@@ -577,7 +601,7 @@
     const action = option.dataset.action;
     if (!action) return;
     const nextStatus = option.value;
-    if (nextStatus === "approved" && ["rejected", "hidden"].includes(control.dataset.current)) {
+    if (nextStatus === "approved" && control.dataset.current !== "approved") {
       select.value = control.dataset.current;
       control.querySelector(".media-save-state").outerHTML = `<span class="media-save-state" title="Saved/current" aria-label="Saved/current">💾</span>`;
       await openArticle(Number(control.dataset.id), "", "approved");
@@ -608,28 +632,40 @@
       result.innerHTML = `${data.metadata_error ? message(`Automatic metadata unavailable: ${data.metadata_error}. Supply the missing public fields manually.`) : message("New canonical article. Review metadata before adding.", "success")}
         <form class="media-inline-form" data-add-manual>
           <input type="hidden" name="url" value="${esc(data.canonical_url)}">
-          <label class="media-field media-field--grow"><span>Publisher title</span><input name="title" required maxlength="1000" value="${esc(metadata.title || "")}"></label>
-          <label class="media-field"><span>Publication</span><input name="publisher" required maxlength="200" value="${esc(metadata.publisher || data.source?.name || "")}"></label>
-          <label class="media-field"><span>Author</span><input name="author" maxlength="500" value="${esc(metadata.author || "")}"></label>
-          <label class="media-field"><span>Published UTC</span><input name="published_at" type="datetime-local" value="${esc(formatUtcDateTimeInput(metadata.published_at))}"></label>
+          <div class="media-manual-fields">
+            <label class="media-field media-field--grow"><span>Publisher title</span><input name="title" required maxlength="1000" value="${esc(metadata.title || "")}"></label>
+            <label class="media-field"><span>Publication</span><input name="publisher" required maxlength="200" value="${esc(metadata.publisher || data.source?.name || "")}"></label>
+            <label class="media-field"><span>Author</span><input name="author" maxlength="500" value="${esc(metadata.author || "")}"></label>
+            <label class="media-field"><span>Published UTC</span><input name="published_at" type="datetime-local" value="${esc(formatUtcDateTimeInput(metadata.published_at))}"></label>
+          </div>
           <input type="hidden" name="preview_image_url" value="${esc(metadata.image_url || "")}">
-          <button class="media-button media-button--primary">Add approved</button>
-        </form><p class="media-subtext">Creation records status Approved and approval method Manual. ${data.source?.will_create_disabled_definition ? "A conservative disabled publisher definition will also be created." : ""}</p>`;
-      result.querySelector("[data-add-manual]")?.addEventListener("submit", event => { event.preventDefault(); void addManualArticle(event.currentTarget, result); });
+          <div class="media-actions media-manual-actions">
+            <button class="media-button" data-initial-status="pending">Add Pending</button>
+            <button class="media-button media-button--primary" data-initial-status="approved">Add Approved</button>
+          </div>
+        </form><p class="media-subtext">Pending creates the article without approval; Approved creates it with Manual approval provenance. ${data.source?.will_create_disabled_definition ? "A conservative disabled publisher definition will also be created." : ""}</p>`;
+      result.querySelector("[data-add-manual]")?.addEventListener("submit", event => {
+        event.preventDefault();
+        void addManualArticle(event.currentTarget, result, event.submitter?.dataset.initialStatus);
+      });
     } catch (error) { result.innerHTML = message(error.message, "error"); }
   }
 
-  async function addManualArticle(form, result) {
+  async function addManualArticle(form, result, initialStatus) {
     const values = new FormData(form);
     const published = String(values.get("published_at") || "");
+    const status = initialStatus === "approved" ? "approved" : "pending";
     try {
       const data = await request("articles", { method: "POST", idempotent: "add", body: {
         url: values.get("url"), title: values.get("title"), publisher: values.get("publisher"),
         author: String(values.get("author") || "").trim() || null,
         published_at: published ? new Date(`${published}Z`).toISOString() : null,
         preview_image_url: String(values.get("preview_image_url") || "").trim() || null,
+        initial_status: status,
       } });
-      result.innerHTML = message("Article added and approved with manual provenance.", "success");
+      result.innerHTML = message(status === "approved"
+        ? "Article added and approved with manual provenance."
+        : "Article added as Pending.", "success");
       await renderArticles(false); await openArticle(data.article.id);
     } catch (error) { result.insertAdjacentHTML("afterbegin", message(error.message, "error")); }
   }
@@ -705,22 +741,27 @@
     return { ...(article || {}), ...(article?.bluesky || {}), ...(data?.bluesky || {}) };
   }
 
+  function blueskyReasonLabel(reason) {
+    return BLUESKY_REASON_LABELS[reason] || reason || "—";
+  }
+
   function blueskyHistoryHtml(data, article) {
     const bluesky = blueskyState(data, article); const publications = bluesky.publications || [];
     const rows = publications.map(item => {
       const href = item.post_url || (String(item.post_uri || "").startsWith("https://") ? item.post_uri : "");
       const post = href ? `<a href="${esc(href)}" target="_blank" rel="noopener noreferrer">Open post ↗</a>` : esc(item.post_uri || "—");
-      return `<tr><td>${esc(item.status || "—")}</td><td>${esc(item.publication_reason || "—")}</td><td>${esc(formatUtcDateTime(item.posted_at || item.updated_at || item.created_at))}</td><td>${esc(item.last_error_code || item.error_code || "—")}</td><td>${post}</td></tr>`;
+      const reason = blueskyReasonLabel(item.publication_reason);
+      return `<tr><td>${esc(item.status || "—")}</td><td>${esc(reason)}</td><td>${esc(formatUtcDateTime(item.posted_at || item.updated_at || item.created_at))}</td><td>${esc(item.last_error_code || item.error_code || "—")}</td><td>${post}</td></tr>`;
     }).join("");
     return `<section><h4>Bluesky publication</h4><div class="media-stats"><div class="media-stat"><strong>${esc(bluesky.post_count ?? 0)}</strong><span>Successful posts</span></div><div class="media-stat"><strong>${esc(bluesky.publication_count ?? publications.length)}</strong><span>Publication requests</span></div><div class="media-stat"><strong>${esc(bluesky.latest_status || "—")}</strong><span>Latest status</span></div></div>${rows ? `<div class="media-table-wrap"><table class="media-table media-table--bluesky"><thead><tr><th>Status</th><th>Reason</th><th>Relevant time</th><th>Error code</th><th>Post</th></tr></thead><tbody>${rows}</tbody></table></div>` : `<p class="media-subtext">No Bluesky publication history.</p>`}</section>`;
   }
 
   function manualBlueskyHtml(article, data) {
     const bluesky = blueskyState(data, article);
-    if (!["rejected", "hidden"].includes(article.status)) return "";
-    if (bluesky.manual_post_available === true) return `<label class="media-toggle" data-manual-bluesky><input type="checkbox"> <span>Post to Bluesky @ukaq.co.uk</span></label>${bluesky.manual_post_reason ? `<p class="media-subtext">${esc(bluesky.manual_post_reason)}</p>` : ""}`;
+    if (article.status === "approved") return "";
+    if (bluesky.manual_post_available === true) return `<label class="media-toggle" data-manual-bluesky><input type="checkbox"> <span>Post to Bluesky @ukaq.co.uk</span></label>${bluesky.manual_post_reason ? `<p class="media-subtext">Reason: ${esc(blueskyReasonLabel(bluesky.manual_post_reason))}</p>` : ""}`;
     const reason = bluesky.manual_post_unavailable_reason || bluesky.manual_post_reason;
-    return reason ? `<p class="media-message">Bluesky posting unavailable: ${esc(reason)}</p>` : "";
+    return reason ? `<p class="media-message">Bluesky posting unavailable: ${esc(blueskyReasonLabel(reason))}</p>` : "";
   }
 
   async function openArticle(id, notice = "", selectedStatus = "") {
@@ -780,7 +821,7 @@
     control.querySelector("button").disabled = true;
     try {
       const manual = dialog.querySelector("[data-manual-bluesky] input");
-      const body = manual?.checked ? { post_to_bluesky: true } : undefined;
+      const body = { post_to_bluesky: manual?.checked === true };
       await request(`articles/${id}/${action}`, { method: "POST", idempotent: "status", body });
       await renderArticles(false);
       await openArticle(id);
@@ -904,11 +945,11 @@
       articleDetailCache.set(id, detail);
     }
     const article = await detail;
-    const published = formatUtcDate(article?.published_at);
+    const published = formatPublicationDate(article?.published_at);
     if (!published || !row.isConnected) return;
     const date = row.querySelector("[data-ai-preview-date]");
     if (date) date.textContent = ` · ${published}`;
-    const homepageDate = formatHomepageDate(article?.published_at);
+    const homepageDate = formatPublicationDate(article?.published_at);
     const homepageDateNode = row.querySelector("[data-homepage-preview-date]");
     if (homepageDateNode && homepageDate) homepageDateNode.textContent = ` · ${homepageDate}`;
     row.dataset.aiPublished = "true";

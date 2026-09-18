@@ -92,6 +92,8 @@
 
 .media-toolbar { justify-content: space-between; }
 .media-toolbar__group { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; min-width: 0; }
+.media-manual-fields { display: flex; flex: 1 1 100%; flex-wrap: wrap; align-items: end; gap: 10px; min-width: 0; }
+.media-manual-actions { flex: 1 1 100%; justify-content: flex-end; }
 .media-field { display: grid; gap: 5px; min-width: 130px; }
 .media-field--grow { flex: 1 1 320px; }
 .media-field label,
@@ -112,6 +114,7 @@
 .media-field textarea { min-height: 74px; resize: vertical; }
 .media-toggle { display: flex; align-items: center; gap: 8px; margin: 14px 0; font-weight: 700; }
 .media-toggle input { width: 18px; height: 18px; accent-color: var(--accent-2); }
+.media-toggle[hidden] { display: none; }
 .media-counter { margin-top: 5px; color: var(--muted); font-size: 14px; font-variant-numeric: tabular-nums; text-align: right; }
 .media-bluesky textarea { min-height: 140px; }
 .media-bluesky__preview pre { min-height: 110px; margin: 8px 0 0; padding: 14px; border: 1px solid var(--border); border-radius: 10px; background: #fff; color: var(--ink); font: inherit; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -132,6 +135,7 @@
   background: rgba(255, 250, 241, 0.62);
 }
 .media-filter-group { min-width: 0; border: 0; padding: 0; margin: 0; }
+.media-filter-group:has([data-author-search]) > .media-field { display: none; }
 .media-filter-options { display: grid; gap: 5px; }
 .media-filter-options label { display: flex; align-items: center; gap: 6px; font-size: 15px; }
 .media-filter-scroll { position: relative; }
@@ -142,7 +146,8 @@
   padding-block: 18px;
   scrollbar-gutter: stable;
 }
-.media-filter-group--publication .media-filter-scroll__viewport { height: 190px; }
+.media-filter-group--publication .media-filter-scroll__viewport,
+.media-filter-group:has([data-author-search]) .media-filter-scroll__viewport { height: 190px; }
 .media-filter-scroll__fade {
   position: absolute;
   z-index: 1;
@@ -470,7 +475,9 @@ button.media-save-state { cursor: pointer; }
   .media-toolbar__group { width: 100%; }
   .media-toolbar__group,
   .media-url-form,
-  .media-inline-form { flex-direction: column; }
+  .media-inline-form,
+  .media-manual-fields { flex-direction: column; }
+  .media-manual-actions { align-items: stretch; justify-content: flex-end; }
   .media-field,
   .media-field--grow,
   .media-article-sort,
