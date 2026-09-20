@@ -19,8 +19,11 @@ _ROUTES = (
     (re.compile(r"^/api/media/articles$"), {"GET", "POST"}),
     (re.compile(r"^/api/media/articles/selectors$"), {"GET"}),
     (re.compile(r"^/api/media/articles/lookup$"), {"POST"}),
+    (re.compile(r"^/api/media/articles/bulk-approve$"), {"POST"}),
+    (re.compile(r"^/api/media/articles/bulk-publish$"), {"POST"}),
     (re.compile(r"^/api/media/articles/[1-9]\d*$"), {"GET"}),
     (re.compile(r"^/api/media/articles/[1-9]\d*/image$"), {"GET"}),
+    (re.compile(r"^/api/media/articles/[1-9]\d*/publish$"), {"POST"}),
     (re.compile(r"^/api/media/articles/[1-9]\d*/(?:approve|reject|hide|unhide)$"), {"POST"}),
     (re.compile(r"^/api/media/articles/[1-9]\d*/author$"), {"PUT"}),
     (re.compile(r"^/api/media/articles/[1-9]\d*/display-title$"), {"PUT"}),
@@ -36,6 +39,8 @@ _ROUTES = (
     (re.compile(r"^/api/media/author-rules$"), {"POST"}),
     (re.compile(r"^/api/media/author-rules/[a-z0-9]+:[a-z0-9]+(?:-[a-z0-9]+)*$"), {"PUT"}),
     (re.compile(r"^/api/media/bluesky/settings$"), {"GET", "PUT"}),
+    (re.compile(r"^/api/media/facebook/settings$"), {"GET", "PUT"}),
+    (re.compile(r"^/api/media/facebook/connection-check$"), {"POST"}),
 )
 
 
@@ -109,7 +114,11 @@ def proxy_media_request(handler: Any, method: str) -> None:
         _send_json(handler, HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "Media request body is too large")
         return
 
-    upstream_path = parsed.path.removeprefix("/api/media")
+    explicit_paths = {
+        "/api/media/articles/bulk-approve": "/articles/bulk/approve",
+        "/api/media/articles/bulk-publish": "/articles/bulk/publish",
+    }
+    upstream_path = explicit_paths.get(parsed.path, parsed.path.removeprefix("/api/media"))
     target = f"{base_url}/admin{upstream_path}"
     if parsed.query:
         target = f"{target}?{parsed.query}"
