@@ -132,8 +132,15 @@
     } catch (_error) {
       throw new Error("Media admin unavailable.");
     }
-    const contentType = String(response.headers.get("Content-Type") || "");
-    const payload = contentType.includes("json") ? await response.json().catch(() => null) : null;
+    // Some proxy paths can preserve a safe JSON error body while losing or changing the
+    // Content-Type header. Decode the body independently of that header so Media's existing
+    // safe error code (for example article_head_http_403) is not replaced by a generic 502.
+    const bodyText = await response.text().catch(() => "");
+    let payload = null;
+    if (bodyText) {
+      try { payload = JSON.parse(bodyText); }
+      catch (_error) { /* Never surface arbitrary non-JSON upstream response bodies. */ }
+    }
     if (!response.ok) {
       const error = new Error(String(payload?.error?.message || payload?.error || payload?.message || `Media request failed (${response.status})`));
       error.payload = payload;
