@@ -36,7 +36,7 @@ export default {
       }
 
       if (isMediaRoute(pathname)) {
-        return handleMediaRoute(request, env);
+        return handleMediaRoute(request, env, ctx);
       }
 
       if (pathname === "/api/health") {
