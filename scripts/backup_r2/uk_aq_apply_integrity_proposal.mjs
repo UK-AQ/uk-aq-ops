@@ -47,6 +47,19 @@ import {
 import {
   validateIntegrityCoreSnapshotIdentity,
 } from "./lib/uk_aq_integrity_core_snapshot_identity.mjs";
+import {
+  classifyObservationHistoryIntegrityKey,
+  isObservationHistoryIntegrityIndexKey,
+  isVersionedHistoryIntegrityNamespaceKey,
+  isVersionedHistoryIndexNamespaceKey,
+  requireObservationHistoryIntegrityKey,
+} from "./lib/observation_history_integrity_key_allowlist.mjs";
+import {
+  getIntegrityR2ObjectWithRetry,
+} from "./lib/integrity_r2_get_retry.mjs";
+import {
+  requireSosLightV2CoordinatorFreeze,
+} from "./lib/sos_light_v2_coordinator_validation.mjs";
 
 function parseArgs(argv) {
   const args = { runStateJson: "", writeR2: false };
@@ -115,30 +128,29 @@ function contentTypeForKey(key) {
 }
 
 function objectDomain(key) {
-  if (key.includes("/aqilevels_") || key.includes("/aqilevels/")) return "aqilevels";
-  return "observations";
+  return requireObservationHistoryIntegrityKey(key).domain;
 }
 
 export function publicationRank(key) {
   const value = String(key || "");
-  if (/^history\/v2\/observations\/.+\.parquet$/.test(value)) return 10;
-  if (/^history\/v2\/observations\/.+\/pollutant_code=[^/]+\/manifest\.json$/.test(value)) return 20;
-  if (/^history\/v2\/observations\/.+\/connector_id=\d+\/manifest\.json$/.test(value)) return 30;
-  if (/^history\/_index_v2\/observations_.+/.test(value)) return 40;
-  if (/^history\/v2\/aqilevels\/.+\.parquet$/.test(value)) return 50;
-  if (/^history\/v2\/aqilevels\/.+\/pollutant_code=[^/]+\/manifest\.json$/.test(value)) return 60;
-  if (/^history\/v2\/aqilevels\/.+\/connector_id=\d+\/manifest\.json$/.test(value)) return 70;
-  if (/^history\/_index_v2\/aqilevels_.+/.test(value)) return 80;
-  if (/^history\/v2\/observations\/day_utc=\d{4}-\d{2}-\d{2}\/manifest\.json$/.test(value)) return 90;
-  if (/^history\/v2\/aqilevels\/.+\/day_utc=\d{4}-\d{2}-\d{2}\/manifest\.json$/.test(value)) return 100;
-  if (value.includes("latest") || value.startsWith("history/_index_v2/")) return 120;
-  return 110;
+  const classification = classifyObservationHistoryIntegrityKey(value);
+  if (isVersionedHistoryIndexNamespaceKey(value) && !classification) {
+    requireObservationHistoryIntegrityKey(value);
+  }
+  if (/^history\/v[23]\/observations\/.+\.parquet$/.test(value)) return 10;
+  if (/^history\/v[23]\/observations\/.+\/pollutant_code=[^/]+\/manifest\.json$/.test(value)) return 20;
+  if (/^history\/v[23]\/observations\/.+\/connector_id=\d+\/manifest\.json$/.test(value)) return 30;
+  if (classification?.family === "observations_timeseries"
+      && classification.kind !== "observation_latest_index") return 40;
+  if (/^history\/v[23]\/observations\/day_utc=\d{4}-\d{2}-\d{2}\/manifest\.json$/.test(value)) return 50;
+  if (classification?.kind === "observation_latest_index" || value.includes("latest")) return 70;
+  return 60;
 }
 
 export const APPLY_PROGRESS_CHECKPOINT_OBJECT_INTERVAL = 50;
 export const APPLY_PROGRESS_CHECKPOINT_ELAPSED_MS = 30_000;
-export const APPLY_PROGRESS_LOG_OBJECT_INTERVAL = 50;
-export const APPLY_PROGRESS_LOG_ELAPSED_MS = 30_000;
+export const APPLY_PROGRESS_LOG_OBJECT_INTERVAL = 250;
+export const APPLY_PROGRESS_LOG_ELAPSED_MS = 15_000;
 export const MUTATION_EVENT_HASH_CONTRACT_VERSION = "integrity-apply-mutation-event-v1";
 export const PUBLICATION_SCHEDULE_CONTRACT_VERSION = "integrity-apply-publication-schedule-v1";
 
@@ -171,7 +183,7 @@ function publicationStageRank(stage) {
 function scheduleScope(object, selectedDays, publicationMode) {
   if (publicationMode === "generic") {
     if (objectPublicationStage(object) === "latest_snapshot") return [3, 0, 0];
-    if (object.key.startsWith("history/_index_v2/")) return [2, 0, 0];
+    if (isObservationHistoryIntegrityIndexKey(object.key)) return [2, 0, 0];
     const context = mutationContext(object.key);
     const dayIndex = context.day_utc ? selectedDays.indexOf(context.day_utc) : -1;
     if (dayIndex < 0) return [2, 0, 0];
@@ -179,7 +191,7 @@ function scheduleScope(object, selectedDays, publicationMode) {
     return [1, dayIndex, 0];
   }
   if (objectPublicationStage(object) === "latest_snapshot") return [selectedDays.length, 3, 0];
-  if (object.key.startsWith("history/_index_v2/")) return [selectedDays.length, 2, 0];
+  if (isObservationHistoryIntegrityIndexKey(object.key)) return [selectedDays.length, 2, 0];
   const context = mutationContext(object.key);
   const dayUtc = context.day_utc;
   const dayIndex = dayUtc ? selectedDays.indexOf(dayUtc) : -1;
@@ -235,6 +247,11 @@ export function buildFrozenPublicationSchedule({
     throw new Error(`Unsupported publication schedule mode: ${publicationMode}`);
   }
   const objects = proposal?.objects || [];
+  for (const object of objects) {
+    if (isVersionedHistoryIntegrityNamespaceKey(object?.key)) {
+      requireObservationHistoryIntegrityKey(object.key);
+    }
+  }
   const byKey = new Map(objects.map((object) => [object.key, object]));
   if (byKey.size !== objects.length) throw new Error("Publication schedule contains duplicate object keys");
   const dayOrder = [...new Set(selectedDays)].sort();
@@ -247,6 +264,9 @@ export function buildFrozenPublicationSchedule({
     const canonicalIdentities = canonicalDependencyIdentities(object.entry);
     const dependencies = canonicalIdentities.map((identity) => identity.key);
     for (const dependencyKey of dependencies) {
+      if (isVersionedHistoryIntegrityNamespaceKey(dependencyKey)) {
+        requireObservationHistoryIntegrityKey(dependencyKey);
+      }
       const dependency = byKey.get(dependencyKey);
       const identity = dependencyIdentity(object.entry, dependencyKey);
       if (!dependency) {
@@ -555,9 +575,7 @@ function objectPublicationStage(object) {
   if (rank <= 20) return "observation_pollutant_manifest";
   if (rank <= 30) return "observation_connector_manifest";
   if (rank <= 40) return "observation_index";
-  if (rank <= 50) return "aqi_parquet";
-  if (rank <= 70) return "aqi_manifest";
-  if (rank <= 100) return "day_parent";
+  if (rank <= 50) return "day_parent";
   return "global_index";
 }
 
@@ -787,7 +805,7 @@ export function createBoundedProgressReporter({
     if (!force
       && completedObjects - lastLoggedCompleted < objectInterval
       && currentTime - lastLoggedAt < elapsedMs) return false;
-    (log || ((line) => process.stderr.write(`[canonical-apply] ${line}\n`)))(message);
+    (log || ((line) => process.stderr.write(`UK_AQ_INTEGRITY_PROGRESS ${line}\n`)))(message);
     lastLoggedCompleted = completedObjects;
     lastLoggedAt = currentTime;
     return true;
@@ -997,18 +1015,13 @@ export function createVerifiedGetBodyCache({
 }
 
 const OBSERVATION_INTEGRITY_POLLUTANTS = new Set(["pm25", "pm10", "no2", "o3"]);
-const AQI_INTEGRITY_POLLUTANTS = new Set(["pm25", "pm10", "no2"]);
 const CANONICAL_CONNECTOR_DAY_PREFIX_PATTERNS = Object.freeze([
   /^history\/v2\/observations\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)$/,
-  /^history\/v2\/aqilevels\/hourly\/data\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)$/,
-  /^history\/v2\/aqilevels\/hourly\/debug\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)$/,
 ]);
 const CANONICAL_OBSERVATION_POLLUTANT_PREFIX_PATTERN =
   /^history\/v2\/observations\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)$/;
 const CANONICAL_OBSERVATION_DAY_PREFIX_PATTERN =
   /^history\/v2\/observations\/day_utc=(\d{4}-\d{2}-\d{2})$/;
-const CANONICAL_AQI_POLLUTANT_PREFIX_PATTERN =
-  /^history\/v2\/aqilevels\/hourly\/(data|debug)\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)$/;
 const CANONICAL_OBSERVATION_POLLUTANT_MANIFEST_PATTERN =
   /^history\/v(?:2|3)\/observations\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)\/manifest\.json$/;
 
@@ -1035,25 +1048,17 @@ function assertCanonicalDeletionPrefix(prefix, entry) {
     return;
   }
   const observationPollutantMatch = prefix.match(CANONICAL_OBSERVATION_POLLUTANT_PREFIX_PATTERN);
-  const aqiPollutantMatch = prefix.match(CANONICAL_AQI_POLLUTANT_PREFIX_PATTERN);
-  const pollutantMatch = observationPollutantMatch || aqiPollutantMatch;
-  if (pollutantMatch) {
-    const isObservation = Boolean(observationPollutantMatch);
-    const [, ...parts] = pollutantMatch;
-    const [dayUtc, connectorIdRaw, pollutant] = isObservation ? parts : parts.slice(1);
-    const supportedPollutants = isObservation
-      ? OBSERVATION_INTEGRITY_POLLUTANTS
-      : AQI_INTEGRITY_POLLUTANTS;
-    const domainName = isObservation ? "Observation" : "AQI";
+  if (observationPollutantMatch) {
+    const [, dayUtc, connectorIdRaw, pollutant] = observationPollutantMatch;
     validateDeletionDayConnector({ prefix, dayUtc, connectorIdRaw });
-    if (!supportedPollutants.has(pollutant)) {
-      throw new Error(`${domainName} deletion prefix has an unsupported pollutant: ${prefix}`);
+    if (!OBSERVATION_INTEGRITY_POLLUTANTS.has(pollutant)) {
+      throw new Error(`Observation deletion prefix has an unsupported pollutant: ${prefix}`);
     }
     const repairPollutants = Array.isArray(entry?.repair_pollutants)
       ? entry.repair_pollutants.map((value) => String(value || "").trim().toLowerCase()).filter(Boolean).sort()
       : [];
-    if (!repairPollutants.includes(pollutant) || repairPollutants.some((value) => !supportedPollutants.has(value))) {
-      throw new Error(`${domainName} pollutant deletion prefix is not backed by matching repair_pollutants evidence: ${prefix}`);
+    if (!repairPollutants.includes(pollutant) || repairPollutants.some((value) => !OBSERVATION_INTEGRITY_POLLUTANTS.has(value))) {
+      throw new Error(`Observation pollutant deletion prefix is not backed by matching repair_pollutants evidence: ${prefix}`);
     }
     return;
   }
@@ -1160,6 +1165,9 @@ export function validateExternalDependencyRoot({
   identity,
 }) {
   const key = safeKey(dependencyKey);
+  if (isVersionedHistoryIntegrityNamespaceKey(key)) {
+    requireObservationHistoryIntegrityKey(key);
+  }
   if (!identity || !["dropbox", "overlay"].includes(identity.source)) {
     throw new Error(`Changed publication dependency is missing from write set: ${objectKey} -> ${key}`);
   }
@@ -1202,8 +1210,13 @@ export function validateLocalProposal(runState) {
   const normalizedObjects = [];
   for (const [rawKey, entry] of objects) {
     const key = safeKey(rawKey);
-    if (!(key.startsWith("history/v2/") || key.startsWith("history/_index_v2/"))
-      || /\/(?:generation(?:=)|transactions\/)/.test(`/${key}`)) {
+    let classification;
+    try {
+      classification = requireObservationHistoryIntegrityKey(key, { generation: "v2" });
+    } catch {
+      throw new Error(`Non-observation history is outside the Integrity proposal contract: ${key}`);
+    }
+    if (/\/(?:generation(?:=)|transactions\/)/.test(`/${key}`)) {
       throw new Error(`Non-canonical Integrity proposal key: ${key}`);
     }
     if (!entry?.proposed || !entry?.built || !entry?.structurally_validated) {
@@ -1241,7 +1254,7 @@ export function validateLocalProposal(runState) {
         });
       }
     }
-    normalizedObjects.push({ key, entry, localPath, body, domain: objectDomain(key) });
+    normalizedObjects.push({ key, entry, localPath, body, domain: classification.domain });
   }
   const normalizedPrefixes = prefixes.map((entry) => {
     const prefix = safeKey(entry?.prefix).replace(/\/+$/, "");
@@ -1252,17 +1265,12 @@ export function validateLocalProposal(runState) {
   const scopedPollutantGroups = new Map();
   for (const item of normalizedPrefixes) {
     const observationMatch = item.prefix.match(CANONICAL_OBSERVATION_POLLUTANT_PREFIX_PATTERN);
-    const aqiMatch = item.prefix.match(CANONICAL_AQI_POLLUTANT_PREFIX_PATTERN);
-    const match = observationMatch || aqiMatch;
-    if (!match) continue;
-    const isObservation = Boolean(observationMatch);
-    const [, ...parts] = match;
-    const [dayUtc, connectorIdRaw, pollutant] = isObservation ? parts : parts.slice(1);
-    const scopeName = isObservation ? "observations" : `aqilevels/${parts[0]}`;
+    if (!observationMatch) continue;
+    const [, dayUtc, connectorIdRaw, pollutant] = observationMatch;
     const repairPollutants = Array.isArray(item.entry?.repair_pollutants)
       ? item.entry.repair_pollutants.map((value) => String(value || "").trim().toLowerCase()).filter(Boolean).sort()
       : [];
-    const groupKey = `${scopeName}|${dayUtc}|${connectorIdRaw}|${repairPollutants.join(",")}`;
+    const groupKey = `observations|${dayUtc}|${connectorIdRaw}|${repairPollutants.join(",")}`;
     const group = scopedPollutantGroups.get(groupKey) || { repairPollutants, prefixes: new Map() };
     group.prefixes.set(pollutant, (group.prefixes.get(pollutant) || 0) + 1);
     scopedPollutantGroups.set(groupKey, group);
@@ -1293,13 +1301,8 @@ export function validateDedicatedSosHistoricalProposal({ runState, proposal }) {
     || audit?.mode !== "sos-light"
     || audit?.validation_status !== "complete_local_days_validated"
     || audit?.old_live_r2_observation_bodies_used !== false
-    || audit?.no_old_live_r2_body_planning_or_preservation !== true
-    || runState.aqi_policy !== "bypassed_observation_history_only") {
+    || audit?.no_old_live_r2_body_planning_or_preservation !== true) {
     throw new Error("SOS-light proposal has invalid execution-scope or authority evidence");
-  }
-  const aqiScopeSets = ["AQILEVELS_CHANGED", "AQI_MANIFESTS_CHANGED", "AQI_INDEXES_CHANGED"];
-  if (aqiScopeSets.some((scope) => (runState.changed_scopes?.[scope] || []).length > 0)) {
-    throw new Error("SOS-light proposal must not contain AQI changed scopes");
   }
   const selectedDays = [...new Set((audit.days || []).map((entry) => String(entry?.day_utc || "")))].sort();
   const deletionDays = proposal.prefixes.map((item) => {
@@ -1320,8 +1323,8 @@ export function validateDedicatedSosHistoricalProposal({ runState, proposal }) {
       throw new Error(`SOS-light complete assembled day is missing required parents: ${day}`);
     }
   }
-  if (proposal.objects.some((object) => object.domain !== "observations" || object.key.includes("aqilevels"))) {
-    throw new Error("SOS-light proposal contains an AQI object");
+  if (proposal.objects.some((object) => object.domain !== "observations")) {
+    throw new Error("SOS-light proposal contains a non-observation object");
   }
   return {
     dedicated: true,
@@ -1505,7 +1508,11 @@ export async function putAndVerifyObject({
       post_put_verification_count: 0,
       post_put_verification_attempt_count: 1,
     });
-    const fresh = await adapters.getObject({ r2, key: object.key });
+    const fresh = await adapters.getObject({
+      r2,
+      key: object.key,
+      phase: `canonical_apply_post_put_readback_${objectPublicationStage(object)}`,
+    });
     if (Number(fresh.bytes) !== object.body.byteLength || sha256Hex(fresh.body) !== entry.sha256) {
       throw new Error(`R2 GET verification identity mismatch: ${object.key}`);
     }
@@ -1902,7 +1909,8 @@ function parseManifestObject(object, expectedKind) {
 function validateFinalParentReferences({ proposal, runState }) {
   const objects = new Map(proposal.objects.map((object) => [object.key, object]));
   for (const object of proposal.objects) {
-    if (!object.key.endsWith("/manifest.json") || object.key.startsWith("history/_index_v2/")) continue;
+    if (!object.key.endsWith("/manifest.json")
+        || isObservationHistoryIntegrityIndexKey(object.key)) continue;
     const expectedParentKind = /\/connector_id=\d+\/manifest\.json$/.test(object.key)
       ? "connector"
       : /\/day_utc=\d{4}-\d{2}-\d{2}\/manifest\.json$/.test(object.key)
@@ -1983,16 +1991,14 @@ function validateFinalParentReferences({ proposal, runState }) {
       }
     }
   }
-  for (const object of proposal.objects.filter((candidate) => candidate.key.startsWith("history/_index_v2/")
-    && candidate.key.includes("/day_utc=") && candidate.key.includes("/connector_id=")
-    && candidate.key.includes("/pollutant_code="))) {
+  for (const object of proposal.objects.filter((candidate) => {
+    const classification = classifyObservationHistoryIntegrityKey(candidate.key);
+    return classification?.generation === "v2"
+      && classification.kind === "observation_scoped_index";
+  })) {
     const observation = object.key.match(/^history\/_index_v2\/observations_timeseries\/day_utc=([^/]+)\/connector_id=([^/]+)\/pollutant_code=([^/]+)\/manifest\.json$/);
-    const aqi = object.key.match(/^history\/_index_v2\/aqilevels_hourly_data_timeseries\/day_utc=([^/]+)\/connector_id=([^/]+)\/pollutant_code=([^/]+)\/manifest\.json$/);
-    const match = observation || aqi;
-    if (!match) continue;
-    const manifestKey = observation
-      ? `history/v2/observations/day_utc=${match[1]}/connector_id=${match[2]}/pollutant_code=${match[3]}/manifest.json`
-      : `history/v2/aqilevels/hourly/data/day_utc=${match[1]}/connector_id=${match[2]}/pollutant_code=${match[3]}/manifest.json`;
+    if (!observation) continue;
+    const manifestKey = `history/v2/observations/day_utc=${observation[1]}/connector_id=${observation[2]}/pollutant_code=${observation[3]}/manifest.json`;
     if (!(object.entry.dependencies || []).includes(manifestKey)) {
       throw finalProposalError({ key: object.key, object, differingFields: [`missing_index_manifest_dependency:${manifestKey}`] });
     }
@@ -2331,7 +2337,11 @@ export async function verifyLiveObservationPartition({
           `Dedicated SOS semantic verification refuses a second GET for changed Parquet: ${key}`,
         );
       }
-      const live = await adapters.getObject({ r2, key });
+      const live = await adapters.getObject({
+        r2,
+        key,
+        phase: "canonical_apply_semantic_readback",
+      });
       body = live.body;
       sourceKind = "fresh_get";
       if (Number(live.bytes) !== Number(stagedEntry.bytes) || sha256Hex(body) !== expectedSha) {
@@ -2481,7 +2491,11 @@ export async function prepareMergedDayManifest({ r2, object, adapters, exactProp
     : mergeConnectorManifestReferences(currentReferences, references(proposed));
   const connectorManifests = [];
   for (const reference of mergedReferences) {
-    const child = JSON.parse((await adapters.getObject({ r2, key: reference.manifest_key })).body.toString("utf8"));
+    const child = JSON.parse((await adapters.getObject({
+      r2,
+      key: reference.manifest_key,
+      phase: "canonical_apply_parent_dependency_read",
+    })).body.toString("utf8"));
     validateCanonicalHistoryV2Manifest(child, {
       history_version: "v2",
       domain: proposed.domain,
@@ -2664,14 +2678,47 @@ export async function applyValidatedProposal({
   env = process.env,
 }) {
   assertIntegrityApplyGenerationEligible(env);
+  const baseGetObject = adapters.getObject || r2GetObject;
+  const retryLog = adapters.progressLog
+    ? (event) => adapters.progressLog(
+      `UK_AQ_INTEGRITY_PROGRESS ${JSON.stringify(event)}`,
+    )
+    : undefined;
   const resolvedAdapters = {
     deleteObjects: adapters.deleteObjects || r2DeleteObjects,
-    getObject: adapters.getObject || r2GetObject,
+    getObject: ({ phase, ...request }) => getIntegrityR2ObjectWithRetry({
+      getObject: baseGetObject,
+      ...request,
+      phase: phase || "canonical_apply_r2_get",
+      ...(retryLog ? { log: retryLog } : {}),
+    }),
     listAllObjects: adapters.listAllObjects || r2ListAllObjects,
     putObject: adapters.putObject || r2PutObject,
   };
   const indexConfig = resolveR2HistoryIndexConfig(env);
   const runState = JSON.parse(fs.readFileSync(runStatePath, "utf8"));
+  let sosLightV2CoordinatorFreeze;
+  try {
+    sosLightV2CoordinatorFreeze = requireSosLightV2CoordinatorFreeze(runState);
+    if (sosLightV2CoordinatorFreeze.dedicated) {
+      runState.sos_light_v2_node_transition_validation = {
+        ...sosLightV2CoordinatorFreeze,
+        accepted_at_utc: new Date().toISOString(),
+        r2_mutation_possible: false,
+      };
+      atomicWriteJson(runStatePath, runState);
+    }
+  } catch (error) {
+    runState.apply = {
+      status: "failed",
+      current_phase: "sos_light_v2_coordinator_freeze_validation",
+      r2_mutation_possible: false,
+      error: error instanceof Error ? error.message : String(error),
+      finished_at_utc: new Date().toISOString(),
+    };
+    atomicWriteJson(runStatePath, runState);
+    throw error;
+  }
   let coreSnapshotIdentityValidation;
   try {
     coreSnapshotIdentityValidation = validateIntegrityCoreSnapshotIdentity({
@@ -2892,9 +2939,22 @@ export async function applyValidatedProposal({
   const startedAtMs = Date.now();
   const report = createBoundedProgressReporter({ log: adapters.progressLog });
   const elapsedSeconds = () => Math.max(0, Math.round((Date.now() - startedAtMs) / 1000));
-  const progressMessage = (label) => `${label} completed_objects=${counts.completed_writes}/${counts.planned_writes} `
-    + `completed_verifications=${counts.completed_post_put_verifications}/${counts.planned_post_put_verifications} `
-    + `elapsed_seconds=${elapsedSeconds()}`;
+  const progressMessage = (label) => JSON.stringify({
+    phase: String(label || "canonical_apply_progress")
+      .trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, ""),
+    total_planned_operations: counts.planned_writes + counts.planned_deletions,
+    completed_operations: counts.completed_writes + counts.completed_deletions,
+    planned_writes: counts.planned_writes,
+    completed_writes: counts.completed_writes,
+    get_verified_writes: counts.get_verified_writes,
+    planned_post_put_verifications: counts.planned_post_put_verifications,
+    completed_post_put_verifications: counts.completed_post_put_verifications,
+    planned_deletions: counts.planned_deletions,
+    completed_deletions: counts.completed_deletions,
+    deleted_objects: counts.deleted_objects,
+    failed_operations: counts.failed_operations,
+    elapsed_seconds: elapsedSeconds(),
+  });
   let lastOptionalCheckpointAt = Date.now();
   let lastOptionalCheckpointWrites = 0;
   const maybeCheckpointAndLog = async () => {
@@ -2913,7 +2973,7 @@ export async function applyValidatedProposal({
       : "within-day object progress";
     report({
       message: progressMessage(progressLabel),
-      completedObjects: counts.completed_writes,
+      completedObjects: counts.completed_writes + counts.completed_deletions,
     });
   };
   try {
@@ -2948,7 +3008,7 @@ export async function applyValidatedProposal({
     const dayGroups = new Map();
     const globalOperations = [];
     for (const operation of operations) {
-      if (operation.key.startsWith("history/_index_v2/")) {
+      if (isObservationHistoryIntegrityIndexKey(operation.key)) {
         globalOperations.push(operation);
         continue;
       }
@@ -2985,6 +3045,7 @@ export async function applyValidatedProposal({
           verifiedBodyCache,
         });
         counts.completed_deletions += 1;
+        await maybeCheckpointAndLog();
         if (!dedicatedSosProposal.dedicated) await checkpoint("after_deletion_verification");
       } else {
         const { object } = operation;
@@ -3052,9 +3113,9 @@ export async function applyValidatedProposal({
                 ? "observation_connector_manifest"
                 : publicationRank(operation.key) <= 40
                 ? "observation_indexes"
-                : publicationRank(operation.key) <= 70
-                ? "aqi_manifests_and_data"
-                : "aqi_indexes";
+                : publicationRank(operation.key) <= 50
+                ? "observation_day_manifest"
+                : "observation_global_indexes";
             }
             runState.apply.connector_day_publication[groupKey].status = "succeeded";
             return { operation_count: group.operations.length };

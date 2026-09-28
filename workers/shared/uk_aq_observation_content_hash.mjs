@@ -55,13 +55,18 @@ export function requireCanonicalVerificationStatus(value) {
 export function resolveLegacyVerificationStatus(row, { isSos = false } = {}) {
   const source = row && typeof row === "object" ? row : {};
   const column = selectObservationVerificationStatusColumn(Object.keys(source));
+  // verification_status is already canonical persisted history. Decode it
+  // losslessly: historical null means unavailable/unknown, not provisional.
+  if (column === "verification_status") {
+    return requireCanonicalVerificationStatus(source.verification_status);
+  }
+  // status is a legacy source/physical field. Only this compatibility form is
+  // interpreted using connector-specific source semantics.
   if (column === "status") {
     return isSos ? normalizeUkAirVerificationStatus(source.status) : null;
   }
   if (column === null) return null;
-  return isSos
-    ? normalizeUkAirVerificationStatus(source[column])
-    : requireCanonicalVerificationStatus(source[column]);
+  throw new Error(`Unsupported observation status field: ${column}`);
 }
 
 export function float64BigEndianHex(value) {

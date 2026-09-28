@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// Ordered metadata executor for v2 observations and AQI data.
-// It never rewrites parquet data or invokes either data backfill wrapper.
+// Ordered metadata executor for v2 observations.
+// It never rewrites parquet data or invokes the data backfill wrapper.
 import fs from "node:fs";
 import { pathToFileURL } from "node:url";
 import {
@@ -19,6 +19,7 @@ import {
   buildHistoryV2PollutantManifest,
   buildHistoryV2ConnectorManifest,
   buildHistoryV2DayManifest,
+  validateCanonicalHistoryV2Manifest,
 } from "../../workers/shared/uk_aq_r2_history_canonical.mjs";
 import {
   combineObservationHistoryPhysicalSchemas,
@@ -32,7 +33,11 @@ import {
 import {
   assertV2ObservationsChildManifest,
   classifyRepairableV2ObservationsConnectorManifest,
+  isValidV2ObservationsBackedUpAtUtc,
 } from "./lib/uk_aq_v2_observations_manifest_validation.mjs";
+import {
+  getObservationHistoryGeneration,
+} from "../../workers/shared/uk_aq_observation_history_generation.mjs";
 
 const SUPPORTED_ACTIONS = new Set([
   "observation_pollutant_manifest_repair",
@@ -40,13 +45,8 @@ const SUPPORTED_ACTIONS = new Set([
   "observation_day_manifest_repair",
   "observation_index_repair",
   "rebuild_v2_observations_index_only",
-  "aqi_pollutant_manifest_repair",
-  "aqi_connector_manifest_repair",
-  "aqi_day_manifest_repair",
-  "aqi_index_repair",
-  "rebuild_v2_aqi_index_only",
 ]);
-const SOURCE_DERIVED_OWNER = "source_derived_observation_repair";
+export const SOURCE_DERIVED_OWNER = "source_derived_observation_repair";
 
 // Scope is part of the repair-action contract.  In particular, a day
 // manifest is above the connector hierarchy: giving it a connector ID would
@@ -59,11 +59,6 @@ const ACTION_SCOPE_RULES = {
   observation_day_manifest_repair: { connector: "absent", needsDay: true },
   observation_index_repair: { connector: "required", pollutant: "required" },
   rebuild_v2_observations_index_only: { connector: "required" },
-  aqi_pollutant_manifest_repair: { connector: "required", pollutant: "required", needsConnector: true, needsDay: true, pollutantRepair: true },
-  aqi_connector_manifest_repair: { connector: "required", needsConnector: true, needsDay: true },
-  aqi_day_manifest_repair: { connector: "absent", needsDay: true },
-  aqi_index_repair: { connector: "required", pollutant: "required" },
-  rebuild_v2_aqi_index_only: { connector: "required" },
 };
 
 function parseArgs(argv) {
@@ -131,11 +126,7 @@ export async function readChildren({
     // staged replacement is already the dependency body.
     if (identityOnlyKeys.has(key)) continue;
     const payload = jsonObject(object, key);
-    if (domain === "observations") {
-      assertV2ObservationsChildManifest(payload, { key, kind, dayUtc, connectorId });
-    } else if (payload?.domain !== "aqilevels" || payload?.manifest_kind !== kind) {
-      throw new Error(`Invalid AQI ${kind} manifest: ${key}`);
-    }
+    assertV2ObservationsChildManifest(payload, { key, kind, dayUtc, connectorId });
     children.push(payload);
   }
   return { children, identities };
@@ -305,6 +296,180 @@ function canonicalConnectorReferences(payload, { base, connectorId }) {
   return [...references.values()].sort((left, right) => left.manifest_key.localeCompare(right.manifest_key));
 }
 
+function canonicalDayConnectorReferences(payload, { base, dayUtc }) {
+  const dayManifestKey = `${base}/manifest.json`;
+  validateCanonicalHistoryV2Manifest(payload, {
+    history_version: "v2",
+    domain: "observations",
+    manifest_kind: "day",
+    day_utc: dayUtc,
+    manifest_key: dayManifestKey,
+  });
+  if (payload.manifest_key !== dayManifestKey || payload.connector_id !== null) {
+    throw new Error(`invalid_day_manifest_identity:${dayManifestKey}`);
+  }
+
+  const normalizeReferences = (field) => {
+    if (!Array.isArray(payload[field])) {
+      throw new Error(`invalid_day_connector_references:${field}`);
+    }
+    const references = new Map();
+    for (const reference of payload[field]) {
+      const connectorId = Number(reference?.connector_id);
+      const manifestKey = String(reference?.manifest_key || "").trim();
+      const manifestHash = String(reference?.manifest_hash || "").trim().toLowerCase();
+      const expectedKey = Number.isSafeInteger(connectorId) && connectorId > 0
+        ? `${base}/connector_id=${connectorId}/manifest.json`
+        : null;
+      if (!expectedKey || manifestKey !== expectedKey || !/^[a-f0-9]{64}$/.test(manifestHash)) {
+        throw new Error(`invalid_day_connector_reference:${manifestKey || "missing_key"}`);
+      }
+      if (references.has(connectorId)) {
+        throw new Error(`duplicate_day_connector_reference:${connectorId}`);
+      }
+      references.set(connectorId, {
+        connector_id: connectorId,
+        manifest_key: manifestKey,
+        manifest_hash: manifestHash,
+      });
+    }
+    return [...references.values()].sort((left, right) => left.connector_id - right.connector_id);
+  };
+
+  const connectorReferences = normalizeReferences("connector_manifests");
+  const childReferences = normalizeReferences("child_manifests");
+  if (JSON.stringify(connectorReferences) !== JSON.stringify(childReferences)) {
+    throw new Error(`contradictory_day_connector_references:${dayManifestKey}`);
+  }
+  const connectorIds = Array.isArray(payload.connector_ids)
+    ? payload.connector_ids.map(Number)
+    : null;
+  const expectedConnectorIds = connectorReferences.map((reference) => reference.connector_id);
+  if (!connectorIds
+    || connectorIds.some((value) => !Number.isSafeInteger(value) || value <= 0)
+    || JSON.stringify(connectorIds) !== JSON.stringify(expectedConnectorIds)) {
+    throw new Error(`day_connector_ids_disagree:${dayManifestKey}`);
+  }
+  return connectorReferences;
+}
+
+function manifestParquetKeys(payload) {
+  const keys = new Set(
+    Array.isArray(payload?.parquet_object_keys)
+      ? payload.parquet_object_keys.map(String)
+      : [],
+  );
+  for (const file of Array.isArray(payload?.files) ? payload.files : []) {
+    const key = String(file?.key || "");
+    if (key) keys.add(key);
+  }
+  return [...keys].sort();
+}
+
+async function assertConnectorClosure({
+  adapter,
+  base,
+  dayUtc,
+  reference,
+  source = null,
+  connectorObject: suppliedConnectorObject = null,
+}) {
+  const connectorId = reference.connector_id;
+  const getObject = async (key) => source
+    ? adapter.getObjectFromSourceIfExists(key, source)
+    : adapter.getObject({ key });
+  const connectorObject = suppliedConnectorObject || await getObject(reference.manifest_key);
+  if (!connectorObject) {
+    throw new Error(`required_connector_manifest_missing:${reference.manifest_key}`);
+  }
+  const connector = jsonObject(connectorObject, reference.manifest_key);
+  assertV2ObservationsChildManifest(connector, {
+    key: reference.manifest_key,
+    kind: "connector",
+    dayUtc,
+    connectorId,
+  });
+  validateCanonicalHistoryV2Manifest(connector, {
+    history_version: "v2",
+    domain: "observations",
+    manifest_kind: "connector",
+    day_utc: dayUtc,
+    connector_id: connectorId,
+    manifest_key: reference.manifest_key,
+  });
+  if (connector.manifest_hash !== reference.manifest_hash) {
+    throw new Error(`required_connector_manifest_hash_mismatch:${reference.manifest_key}`);
+  }
+
+  const pollutantReferences = canonicalConnectorReferences(connector, {
+    base,
+    connectorId,
+  });
+  const childParquetKeys = new Set();
+  const objectKeys = new Set([reference.manifest_key]);
+  const pollutantManifestKeys = [];
+  for (const pollutantReference of pollutantReferences) {
+    const pollutantKey = pollutantReference.manifest_key;
+    const pollutantObject = await getObject(pollutantKey);
+    if (!pollutantObject) {
+      throw new Error(`required_pollutant_manifest_missing:${pollutantKey}`);
+    }
+    const pollutant = jsonObject(pollutantObject, pollutantKey);
+    assertV2ObservationsChildManifest(pollutant, {
+      key: pollutantKey,
+      kind: "pollutant",
+      dayUtc,
+      connectorId,
+    });
+    validateCanonicalHistoryV2Manifest(pollutant, {
+      history_version: "v2",
+      domain: "observations",
+      manifest_kind: "pollutant",
+      day_utc: dayUtc,
+      connector_id: connectorId,
+      pollutant_code: pollutantReference.pollutant_code,
+      manifest_key: pollutantKey,
+    });
+    if (pollutant.manifest_hash !== pollutantReference.manifest_hash) {
+      throw new Error(`required_pollutant_manifest_hash_mismatch:${pollutantKey}`);
+    }
+    objectKeys.add(pollutantKey);
+    pollutantManifestKeys.push(pollutantKey);
+    const expectedPrefix = pollutantKey.slice(0, -"manifest.json".length);
+    const fileSizes = new Map((pollutant.files || []).map((file) => [
+      String(file?.key || ""),
+      Number(file?.bytes),
+    ]));
+    for (const parquetKey of manifestParquetKeys(pollutant)) {
+      if (!parquetKey.startsWith(expectedPrefix) || !parquetKey.endsWith(".parquet")) {
+        throw new Error(`required_pollutant_parquet_key_invalid:${parquetKey}`);
+      }
+      const parquetObject = await getObject(parquetKey);
+      if (!parquetObject) {
+        throw new Error(`required_pollutant_parquet_missing:${parquetKey}`);
+      }
+      const expectedBytes = fileSizes.get(parquetKey);
+      if (!Number.isSafeInteger(expectedBytes) || expectedBytes < 0
+        || parquetObject.bytes !== expectedBytes) {
+        throw new Error(`required_pollutant_parquet_size_mismatch:${parquetKey}`);
+      }
+      childParquetKeys.add(parquetKey);
+      objectKeys.add(parquetKey);
+    }
+  }
+  const connectorParquetKeys = manifestParquetKeys(connector);
+  if (JSON.stringify(connectorParquetKeys) !== JSON.stringify([...childParquetKeys].sort())) {
+    throw new Error(`required_connector_parquet_closure_mismatch:${reference.manifest_key}`);
+  }
+  return {
+    connector,
+    connectorObject,
+    objectKeys: [...objectKeys].sort(),
+    pollutantManifestKeys: pollutantManifestKeys.sort(),
+    parquetKeys: [...childParquetKeys].sort(),
+  };
+}
+
 function newSosLightAudit({ protectedConnectorIds, selectedMutationConnectorIds }) {
   return {
     mode: "sos-light",
@@ -340,73 +505,185 @@ export async function assembleSosLightDayParents({
     || JSON.stringify(selectedMutationConnectorIds) !== "[1]") {
     throw new Error("Blocked dependency: SOS-light currently supports selected/protected connector IDs [1] only");
   }
-  const entries = await staged.stagedR2.adapter.listAllObjects({
-    prefix: `${base}/connector_id=`,
-  });
-  const connectorKeys = [...new Set(entries
-    .map((entry) => entry.key)
-    .filter((key) => /\/connector_id=\d+\/manifest\.json$/.test(key)))].sort();
-  const children = [];
-  const identities = new Map();
-  const includedConnectorIds = [];
-  const omittedConnectorIds = [];
-  const omittedConnectorPrefixes = [];
-  let connector1ChildKeys = [];
-  for (const key of connectorKeys) {
-    const match = key.match(/\/connector_id=(\d+)\/manifest\.json$/);
-    const connectorId = Number(match?.[1]);
-    if (!Number.isInteger(connectorId) || connectorId <= 0) {
-      throw new Error(`Blocked dependency: invalid connector manifest key ${key}`);
-    }
+  const dayManifestKey = `${base}/manifest.json`;
+  const pinnedDayObject = staged.stagedR2.adapter.getObjectFromSourceIfExists(
+    dayManifestKey,
+    "dropbox",
+  );
+  let pinnedDayManifest = null;
+  let baselineReferences = [];
+  if (pinnedDayObject) {
+    pinnedDayManifest = jsonObject(pinnedDayObject, dayManifestKey);
     try {
-      const object = await staged.stagedR2.adapter.getObject({ key });
-      if (connectorId !== 1 && object.source !== "dropbox") {
-        throw new Error(`unprotected connector parent is not Dropbox-backed: ${object.source}`);
-      }
-      const payload = jsonObject(object, key);
-      assertV2ObservationsChildManifest(payload, {
-        key,
-        kind: "connector",
+      baselineReferences = canonicalDayConnectorReferences(pinnedDayManifest, {
+        base,
         dayUtc,
-        connectorId,
       });
-      children.push(payload);
-      identities.set(key, {
-        content_sha256: object.content_sha256 || sha256Hex(object.body),
-        bytes: object.bytes ?? Buffer.byteLength(object.body),
-        source: object.source || "combined_local",
-      });
-      includedConnectorIds.push(connectorId);
-      if (connectorId === 1) {
-        connector1ChildKeys = canonicalConnectorReferences(payload, { base, connectorId })
-          .map((reference) => reference.manifest_key);
-      }
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
-      if (connectorId === 1) {
-        throw new Error(`Blocked dependency: final SOS-light connector 1 parent is unusable ${key}: ${reason}`);
-      }
-      omittedConnectorIds.push(connectorId);
-      omittedConnectorPrefixes.push(`${base}/connector_id=${connectorId}`);
-      addSosLightDropboxWarning(audit, {
-        day_utc: dayUtc,
-        connector_id: connectorId,
-        object_key: key,
-        classification: "dropbox_unprotected_connector_parent_unusable",
-        reason,
-        omitted: true,
-      });
+      throw new Error(
+        `Blocked dependency: pinned Dropbox day manifest is unusable ${dayManifestKey}: ${reason}`,
+      );
     }
   }
-  if (!includedConnectorIds.includes(1)) {
-    throw new Error(`Blocked dependency: SOS-light assembled day has no final connector 1 parent: ${dayUtc}`);
+
+  const physicalEntries = await staged.stagedR2.adapter.listObjectsFromSource({
+    prefix: `${base}/connector_id=`,
+    source: "dropbox",
+  });
+  const physicalConnectorKeys = [...new Set(physicalEntries
+    .map((entry) => entry.key)
+    .filter((key) => /\/connector_id=\d+\/manifest\.json$/.test(key)))].sort();
+  const physicalConnectorIds = physicalConnectorKeys.map((key) =>
+    Number(key.match(/\/connector_id=(\d+)\/manifest\.json$/)?.[1]))
+    .filter((value) => Number.isSafeInteger(value) && value > 0)
+    .sort((left, right) => left - right);
+  const baselineConnectorIds = baselineReferences.map((reference) => reference.connector_id);
+  const expectedPreservedConnectorIds = baselineConnectorIds
+    .filter((connectorId) => connectorId !== 1);
+  const expectedFinalConnectorIds = [...new Set([1, ...expectedPreservedConnectorIds])]
+    .sort((left, right) => left - right);
+  const unreferencedPhysicalConnectorIds = physicalConnectorIds
+    .filter((connectorId) => connectorId !== 1 && !baselineConnectorIds.includes(connectorId));
+
+  const children = [];
+  const identities = new Map();
+  const connector1Key = `${base}/connector_id=1/manifest.json`;
+  let connector1Object;
+  let connector1;
+  let connector1Closure;
+  try {
+    connector1Object = await staged.stagedR2.adapter.getObject({ key: connector1Key });
+    connector1 = jsonObject(connector1Object, connector1Key);
+    assertV2ObservationsChildManifest(connector1, {
+      key: connector1Key,
+      kind: "connector",
+      dayUtc,
+      connectorId: 1,
+    });
+    connector1Closure = await assertConnectorClosure({
+      adapter: staged.stagedR2.adapter,
+      base,
+      dayUtc,
+      reference: {
+        connector_id: 1,
+        manifest_key: connector1Key,
+        manifest_hash: connector1.manifest_hash,
+      },
+      connectorObject: connector1Object,
+    });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `Blocked dependency: final SOS-light connector 1 parent is unusable ${connector1Key}: ${reason}`,
+    );
   }
+  children.push(connector1);
+  identities.set(connector1Key, {
+    content_sha256: connector1Object.content_sha256 || sha256Hex(connector1Object.body),
+    bytes: connector1Object.bytes ?? Buffer.byteLength(connector1Object.body),
+    source: connector1Object.source || "combined_local",
+  });
+  const connector1ChildKeys = connector1Closure.pollutantManifestKeys;
+  const authoritativeObservationObjectKeys = new Set([
+    dayManifestKey,
+    ...connector1Closure.objectKeys,
+  ]);
+
+  for (const reference of baselineReferences.filter((entry) => entry.connector_id !== 1)) {
+    try {
+      const preserved = await assertConnectorClosure({
+        adapter: staged.stagedR2.adapter,
+        base,
+        dayUtc,
+        reference,
+        source: "dropbox",
+      });
+      children.push(preserved.connector);
+      for (const key of preserved.objectKeys) authoritativeObservationObjectKeys.add(key);
+      identities.set(reference.manifest_key, {
+        content_sha256: preserved.connectorObject.content_sha256
+          || sha256Hex(preserved.connectorObject.body),
+        bytes: preserved.connectorObject.bytes
+          ?? Buffer.byteLength(preserved.connectorObject.body),
+        source: "dropbox",
+      });
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `Blocked dependency: pinned Dropbox day requires connector ${reference.connector_id} `
+        + `but it cannot be preserved ${reference.manifest_key}: ${reason}`,
+      );
+    }
+  }
+
+  const unreferencedPhysicalConnectorPrefixes = unreferencedPhysicalConnectorIds
+    .map((connectorId) => `${base}/connector_id=${connectorId}`);
+  for (const connectorId of unreferencedPhysicalConnectorIds) {
+    addSosLightDropboxWarning(audit, {
+      day_utc: dayUtc,
+      connector_id: connectorId,
+      object_key: `${base}/connector_id=${connectorId}/manifest.json`,
+      classification: "dropbox_unreferenced_physical_connector",
+      reason: "physical connector parent is not declared by the pinned authoritative day manifest",
+      omitted: true,
+    });
+  }
+  const unreferencedPhysicalObservationObjectKeys = physicalEntries
+    .map((entry) => entry.key)
+    .filter((key) => {
+      const connectorId = Number(key.match(/\/connector_id=([1-9]\d*)\//)?.[1]);
+      return expectedFinalConnectorIds.includes(connectorId)
+        && !authoritativeObservationObjectKeys.has(key)
+        && (/\/pollutant_code=[^/]+\/manifest\.json$/.test(key)
+          || /\/pollutant_code=[^/]+\/[^/]+\.parquet$/.test(key));
+    })
+    .sort();
+  for (const key of unreferencedPhysicalObservationObjectKeys) {
+    const connectorId = Number(key.match(/\/connector_id=([1-9]\d*)\//)?.[1]);
+    const pollutantCode = key.match(/\/pollutant_code=([^/]+)\//)?.[1] || null;
+    const classification = key.endsWith("/manifest.json")
+      ? "dropbox_unreferenced_physical_pollutant"
+      : "dropbox_unreferenced_physical_parquet";
+    addSosLightDropboxWarning(audit, {
+      day_utc: dayUtc,
+      connector_id: connectorId,
+      pollutant_code: pollutantCode,
+      object_key: key,
+      classification,
+      reason: "physical object is outside the manifest-reachable authoritative day closure",
+      omitted: true,
+    });
+  }
+  children.sort((left, right) => Number(left.connector_id) - Number(right.connector_id));
+  const finalAssembledConnectorIds = children.map((child) => Number(child.connector_id));
+  if (JSON.stringify(finalAssembledConnectorIds) !== JSON.stringify(expectedFinalConnectorIds)) {
+    throw new Error(
+      `Blocked dependency: SOS-light final connector membership differs from pinned authority `
+      + `day=${dayUtc} expected=${expectedFinalConnectorIds.join(",")} `
+      + `actual=${finalAssembledConnectorIds.join(",")}`,
+    );
+  }
+
   const dayAudit = {
     day_utc: dayUtc,
+    pinned_day_manifest_present: pinnedDayObject !== null,
+    pinned_day_manifest_key: pinnedDayObject ? dayManifestKey : null,
+    pinned_day_manifest_hash: pinnedDayManifest?.manifest_hash || null,
+    pinned_baseline_connector_ids: baselineConnectorIds,
+    expected_preserved_connector_ids: expectedPreservedConnectorIds,
+    expected_final_connector_ids: expectedFinalConnectorIds,
+    physical_dropbox_connector_ids: physicalConnectorIds,
+    unreferenced_physical_connector_ids: unreferencedPhysicalConnectorIds,
+    unreferenced_physical_connector_prefixes: unreferencedPhysicalConnectorPrefixes,
+    authoritative_observation_object_keys:
+      [...authoritativeObservationObjectKeys].sort(),
+    unreferenced_physical_observation_object_keys:
+      unreferencedPhysicalObservationObjectKeys,
     final_connector_1_child_set: connector1ChildKeys,
-    final_assembled_connector_ids: includedConnectorIds.sort((left, right) => left - right),
-    omitted_dropbox_connector_ids: omittedConnectorIds.sort((left, right) => left - right),
-    omitted_dropbox_connector_prefixes: omittedConnectorPrefixes.sort(),
+    final_assembled_connector_ids: finalAssembledConnectorIds,
+    omitted_dropbox_connector_ids: unreferencedPhysicalConnectorIds,
+    omitted_dropbox_connector_prefixes: unreferencedPhysicalConnectorPrefixes,
   };
   audit.days.push(dayAudit);
   return { children, identities, dayAudit };
@@ -437,6 +714,23 @@ function walkLocalObjects(root, prefixes = []) {
   return found;
 }
 
+export function isChangedCurrentRunObject(entry) {
+  return entry?.structurally_validated === true
+    && entry?.proposed === true
+    && entry?.changed !== false
+    && entry?.included_in_write_set !== false
+    && entry?.status !== "skipped_unchanged";
+}
+
+export function resolveCurrentRunProposalOwner(entry) {
+  if (typeof entry?.proposal_owner === "string" && entry.proposal_owner) {
+    return entry.proposal_owner;
+  }
+  return isChangedCurrentRunObject(entry) && entry?.stage === "observations_data"
+    ? SOURCE_DERIVED_OWNER
+    : null;
+}
+
 export function createCombinedLocalStore({ overlayRoot, dropboxRoot, runStateJson, prefixes, exactKeys = [], dynamicExactKeyPrefixes = [] }) {
   const state = JSON.parse(fs.readFileSync(runStateJson, "utf8"));
   const proposedTombstones = new Set(Object.entries(state?.tombstones || {})
@@ -453,6 +747,7 @@ export function createCombinedLocalStore({ overlayRoot, dropboxRoot, runStateJso
     const candidate = `${dropboxRoot}/${key}`;
     if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) dropboxPaths.set(key, candidate);
   }
+  const pinnedDropboxPaths = new Map(dropboxPaths);
   for (const key of [...dropboxPaths.keys()]) {
     if (isProposedAbsent(key)) dropboxPaths.delete(key);
   }
@@ -463,11 +758,7 @@ export function createCombinedLocalStore({ overlayRoot, dropboxRoot, runStateJso
     const locallyValidatedObject = entry?.structurally_validated === true
       && typeof entry.local_path === "string"
       && fs.existsSync(entry.local_path);
-    const changedCurrentRunObject = entry?.structurally_validated === true
-      && entry?.proposed === true
-      && entry?.changed !== false
-      && entry?.included_in_write_set !== false
-      && entry?.status !== "skipped_unchanged";
+    const changedCurrentRunObject = isChangedCurrentRunObject(entry);
     if (locallyValidatedObject) {
       const normalizedKey = safeLocalKey(key);
       overlayPaths.set(normalizedKey, entry.local_path);
@@ -477,11 +768,8 @@ export function createCombinedLocalStore({ overlayRoot, dropboxRoot, runStateJso
       if (changedCurrentRunObject) {
         overlayProvenance.set(normalizedKey, "planned_overlay");
       }
-      if (typeof entry.proposal_owner === "string" && entry.proposal_owner) {
-        overlayOwners.set(normalizedKey, entry.proposal_owner);
-      } else if (changedCurrentRunObject && entry.stage === "observations_data") {
-        overlayOwners.set(normalizedKey, "source_derived_observation_repair");
-      }
+      const proposalOwner = resolveCurrentRunProposalOwner(entry);
+      if (proposalOwner) overlayOwners.set(normalizedKey, proposalOwner);
     }
   }
   function localObject(key, storageSource) {
@@ -532,10 +820,38 @@ export function createCombinedLocalStore({ overlayRoot, dropboxRoot, runStateJso
         throw error;
       }
     },
-    listAllObjects({ prefix }) {
+    listObjectsFromSource({ prefix, source, keyFilter = null }) {
+      const paths = source === "overlay" ? overlayPaths
+        : source === "dropbox" ? pinnedDropboxPaths : null;
+      if (!paths) throw new Error(`Unsupported local object source: ${source}`);
+      return [...paths.keys()]
+        .filter((key) => key.startsWith(prefix) &&
+          (typeof keyFilter !== "function" || keyFilter(key)))
+        .map((key) => {
+          const localPath = paths.get(key);
+          const body = fs.readFileSync(localPath);
+          const object = objectFromBody({
+            key,
+            body,
+            source,
+            content_sha256: sha256Hex(body),
+          });
+          return {
+            key,
+            size: object?.bytes ?? null,
+            source: object?.source ?? null,
+            content_sha256: object?.content_sha256 ?? null,
+            r2_etag: object?.r2_etag ?? null,
+          };
+        })
+        .sort((left, right) => left.key.localeCompare(right.key));
+    },
+    listAllObjects({ prefix, keyFilter = null }) {
       const keys = new Set([...dropboxPaths.keys(), ...overlayPaths.keys()]);
       return [...keys]
-        .filter((key) => key.startsWith(prefix) && (!isProposedAbsent(key) || overlayPaths.has(key)))
+        .filter((key) => key.startsWith(prefix) &&
+          (!isProposedAbsent(key) || overlayPaths.has(key)) &&
+          (typeof keyFilter !== "function" || keyFilter(key)))
         .map((key) => {
           const object = objectFor(key);
           return { key, size: object?.bytes ?? null, source: object?.source ?? null, content_sha256: object?.content_sha256 ?? null, r2_etag: object?.r2_etag ?? null };
@@ -642,7 +958,12 @@ export function localDependencySnapshot({ child, proposals, prefix, dayUtc, conn
   };
 }
 
-export function createStagedObjectMap({ r2, store, dropboxSourceKeys = [] }) {
+export function createStagedObjectMap({
+  r2,
+  store,
+  dropboxSourceKeys = [],
+  observationGeneration = getObservationHistoryGeneration("v2"),
+}) {
   const proposals = new Map();
   // `dropboxSourceKeys` identifies exact source leaves for targeted index
   // repairs. It must not make a valid combined-local leaf invisible to
@@ -653,18 +974,15 @@ export function createStagedObjectMap({ r2, store, dropboxSourceKeys = [] }) {
       ? "latest_timeseries_index"
       : "pollutant_timeseries_index";
   const indexDependencies = (key) => {
-    const observation = String(key).match(
-      /^history\/_index_v2\/observations_timeseries\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)\/manifest\.json$/,
-    );
+    const escapedIndexPrefix = observationGeneration.observations_timeseries_index_prefix
+      .replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const observation = String(key).match(new RegExp(
+      `^${escapedIndexPrefix}/day_utc=(\\d{4}-\\d{2}-\\d{2})/connector_id=([1-9]\\d*)/pollutant_code=([a-z0-9_]+)/manifest\\.json$`,
+    ));
     if (observation) {
-      return [`history/v2/observations/day_utc=${observation[1]}/connector_id=${observation[2]}/pollutant_code=${observation[3]}/manifest.json`];
+      return [`${observationGeneration.observations_prefix}/day_utc=${observation[1]}/connector_id=${observation[2]}/pollutant_code=${observation[3]}/manifest.json`];
     }
-    const aqi = String(key).match(
-      /^history\/_index_v2\/aqilevels_hourly_data_timeseries\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)\/manifest\.json$/,
-    );
-    return aqi
-      ? [`history/v2/aqilevels/hourly/data/day_utc=${aqi[1]}/connector_id=${aqi[2]}/pollutant_code=${aqi[3]}/manifest.json`]
-      : [];
+    return [];
   };
 
   function resolveDependencyIdentities(dependencies) {
@@ -748,6 +1066,10 @@ export function createStagedObjectMap({ r2, store, dropboxSourceKeys = [] }) {
       });
     },
     adapter: {
+      getObjectFromSourceIfExists: (key, source) =>
+        store.getObjectFromSourceIfExists(key, source),
+      listObjectsFromSource: ({ prefix, source, keyFilter = null }) =>
+        store.listObjectsFromSource({ prefix, source, keyFilter }),
       getObject: async ({ key }) => {
         const staged = stagedObject(key);
         if (staged) return staged;
@@ -804,7 +1126,7 @@ function stableGeneratedAt({ dayUtc, dayManifest }) {
   return /^\d{4}-\d{2}-\d{2}T/.test(backedUpAt) ? backedUpAt : `${dayUtc}T00:00:00.000Z`;
 }
 
-async function stageSosLightLatestIndex({ staged, config, latestIndexKey, audit }) {
+async function stageSosLightLatestIndex({ staged, config, generation, latestIndexKey, audit }) {
   const existingObject = await staged.stagedR2.adapter.getObject({ key: latestIndexKey });
   const existing = jsonObject(existingObject, latestIndexKey);
   const summaries = new Map((existing.day_summaries || [])
@@ -815,7 +1137,7 @@ async function stageSosLightLatestIndex({ staged, config, latestIndexKey, audit 
     const dayUtc = String(dayAudit.day_utc);
     const included = new Set(dayAudit.final_assembled_connector_ids || []);
     const entries = await staged.stagedR2.adapter.listAllObjects({
-      prefix: `${config.observations_timeseries_index_prefix_v2}/day_utc=${dayUtc}/connector_id=`,
+      prefix: `${generation.observations_timeseries_index_prefix}/day_utc=${dayUtc}/connector_id=`,
     });
     const connectorMap = new Map([...included].map((connectorId) => [connectorId, {
       connector_id: connectorId,
@@ -883,9 +1205,9 @@ async function stageSosLightLatestIndex({ staged, config, latestIndexKey, audit 
     bucket: config.r2.bucket,
     generatedAt: existing.generated_at,
     existingGeneratedAt: existing.generated_at,
-    indexPrefix: config.index_prefix_v2,
-    dataPrefix: config.observations_prefix_v2,
-    timeseriesIndexPrefix: config.observations_timeseries_index_prefix_v2,
+    indexPrefix: generation.index_root_prefix,
+    dataPrefix: generation.observations_prefix,
+    timeseriesIndexPrefix: generation.observations_timeseries_index_prefix,
     daySummaries: [...summaries.values()],
   });
   await staged.stage({
@@ -1111,8 +1433,8 @@ function existingManifestMetadata(store, {
   pollutantCode,
   domain,
 }) {
-  const grain = domain === "aqilevels" ? "hourly" : null;
-  const profile = domain === "aqilevels" ? "data" : null;
+  const grain = null;
+  const profile = null;
   const leafExpectation = { domain, grain, profile, dayUtc, connectorId, pollutantCode, manifestKind: "pollutant" };
   for (const [source, label] of [["overlay", "overlay_manifest"], ["dropbox", "dropbox_manifest"]]) {
     const found = sourceManifestMetadata(store, source, label, manifestKey, leafExpectation);
@@ -1268,7 +1590,7 @@ function assertCanonicalObjectKey(value, label) {
   return value;
 }
 
-function assertCanonicalManifestProposal(proposal) {
+export function assertCanonicalManifestProposal(proposal) {
   const expectedKind = {
     pollutant_manifest: "pollutant",
     connector_manifest: "connector",
@@ -1284,18 +1606,15 @@ function assertCanonicalManifestProposal(proposal) {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     throw new Error(`Invalid ${proposal.kind} payload: ${proposal.key}`);
   }
-  const isAqi = payload.domain === "aqilevels";
-  const expectedGrain = isAqi ? "hourly" : null;
-  const expectedProfile = isAqi ? "data" : null;
-  if (!['observations', 'aqilevels'].includes(payload.domain)
+  if (payload.domain !== "observations"
     || payload.history_version !== "v2"
     || payload.manifest_kind !== expectedKind
     || payload.manifest_key !== proposal.key
-    || payload.grain !== expectedGrain
-    || payload.profile !== expectedProfile) {
+    || payload.grain !== null
+    || payload.profile !== null) {
     throw new Error(`Invalid canonical ${proposal.kind} contract: ${proposal.key}`);
   }
-  if (typeof payload.backed_up_at_utc !== "string" || Number.isNaN(Date.parse(payload.backed_up_at_utc))) {
+  if (!isValidV2ObservationsBackedUpAtUtc(payload)) {
     throw new Error(`Invalid canonical ${proposal.kind} backed_up_at_utc: ${proposal.key}`);
   }
   if (!Array.isArray(payload.files) || !Array.isArray(payload.parquet_object_keys)) {
@@ -1398,7 +1717,7 @@ function assertCanonicalProposalRelationships(proposal, proposals) {
 }
 
 function extractRepairPlan(input) {
-  if (input?.history_version === "v2" && ["observations", "aqilevels"].includes(input?.domain) && Array.isArray(input.repair_plan)) {
+  if (input?.history_version === "v2" && input?.domain === "observations" && Array.isArray(input.repair_plan)) {
     return { inputKind: `${input.domain}_repair_plan`, domain: input.domain, actions: input.repair_plan };
   }
   const v2 = input?.history_version_results?.v2;
@@ -1428,7 +1747,7 @@ function validateAction(action) {
   if (action.history_version !== undefined && action.history_version !== "v2") {
     throw new Error(`Unsupported history version for Phase 4 repair action: ${action.history_version}`);
   }
-  if (action.domain !== undefined && !["observations", "aqilevels"].includes(action.domain)) {
+  if (action.domain !== undefined && action.domain !== "observations") {
     throw new Error(`Unsupported domain for Phase 4 repair action: ${action.domain}`);
   }
   if (typeof action.requires_index_rebuild !== "boolean" || !Array.isArray(action.gap_types)
@@ -1542,11 +1861,42 @@ function authoritativeTimeseriesById(input) {
   return bindings;
 }
 
+export function createMetadataPlanningProgressTracker({
+  totalObjects,
+  reportProgress,
+  now = () => Date.now(),
+}) {
+  let lastReportedCompleted = 0;
+  let lastReportedAtMs = now();
+  const emit = (completedObjects, details) => {
+    reportProgress({
+      phase: "metadata_planning_progress",
+      completed_objects: completedObjects,
+      total_objects: totalObjects,
+      ...details,
+    });
+    lastReportedCompleted = completedObjects;
+    lastReportedAtMs = now();
+  };
+  return {
+    update(completedObjects, details = {}) {
+      if (completedObjects - lastReportedCompleted < 25
+          && now() - lastReportedAtMs < 15_000) return;
+      emit(completedObjects, details);
+    },
+    finish(completedObjects, details = {}) {
+      emit(completedObjects, details);
+    },
+  };
+}
+
 export async function runV2ObservationsRepair({
   argv = process.argv.slice(2),
   env = process.env,
   repairPlan = null,
   updateIndexes = updateR2HistoryIndexesTargeted,
+  storageGeneration = "v2",
+  planIndexes = true,
 } = {}) {
   const startedAtMs = Date.now();
   const reportProgress = ({ phase, completed_objects = 0, total_objects = 0, successful_put_count = 0, successful_readback_verification_count = 0, failures = 0, blocked_count = 0 }) => {
@@ -1603,7 +1953,13 @@ export async function runV2ObservationsRepair({
     throw new Error("Blocked dependency: SOS-light currently requires selected/protected connector IDs [1]");
   }
   reportProgress({ phase: "metadata_planning_start", total_objects: scopes.length });
+  const metadataPlanningProgress = createMetadataPlanningProgressTracker({
+    totalObjects: scopes.length,
+    reportProgress,
+  });
+  let completedMetadataPlanningScopes = 0;
   const config = resolveR2HistoryIndexConfig(env);
+  const observationGeneration = getObservationHistoryGeneration(storageGeneration);
   if (args.writeR2) {
     throw new Error("metadata executor is proposal-only; use the validated canonical apply executor");
   }
@@ -1616,32 +1972,26 @@ export async function runV2ObservationsRepair({
   if (!args.overlayRoot || !args.dropboxRoot || !args.runStateJson) {
     throw new Error("Combined local resolver paths are required for metadata repair");
   }
-  const dataPrefix = domain === "observations"
-    ? config.observations_prefix_v2
-    : config.aqilevels_hourly_data_prefix_v2;
-  const indexPrefix = domain === "observations"
-    ? config.observations_timeseries_index_prefix_v2
-    : config.aqilevels_hourly_data_timeseries_index_prefix_v2;
+  const dataPrefix = observationGeneration.observations_prefix;
+  const indexPrefix = observationGeneration.observations_timeseries_index_prefix;
   // Targeted index rebuilds merge the changed days into this global latest
   // summary.  Read exactly that key from the Dropbox baseline; scanning the
   // whole index tree would make the sparse overlay resolver non-deterministic.
-  const latestIndexKey = domain === "observations"
-    ? `${config.index_prefix_v2}/observations_timeseries_latest.json`
-    : `${config.index_prefix_v2}/aqilevels_hourly_data_timeseries_latest.json`;
+  const latestIndexKey = observationGeneration.observations_timeseries_latest_key;
   // An explicit index-only action can legitimately target a historical leaf
   // which is absent from the live connector/day hierarchy. Keep that leaf
   // out of parent discovery, but allow its Dropbox manifest as a narrowly
   // scoped index source. The target index itself is still live-only.
-  const additionalIndexPollutantTargets = domain === "observations"
-    ? scopes.flatMap((scope) => (scope.needsIndex && Number.isInteger(scope.connectorId) && scope.connectorId > 0
+  const additionalIndexPollutantTargets = scopes.flatMap((scope) => (
+    scope.needsIndex && Number.isInteger(scope.connectorId) && scope.connectorId > 0
       ? (scope.index_pollutant_codes || []).map((pollutantCode) => ({
-        day_utc: scope.dayUtc,
-        connector_id: scope.connectorId,
-        pollutant_code: pollutantCode,
-        manifest_key: `${dataPrefix}/day_utc=${scope.dayUtc}/connector_id=${scope.connectorId}/pollutant_code=${pollutantCode}/manifest.json`,
-      }))
-      : []))
-    : [];
+          day_utc: scope.dayUtc,
+          connector_id: scope.connectorId,
+          pollutant_code: pollutantCode,
+          manifest_key: `${dataPrefix}/day_utc=${scope.dayUtc}/connector_id=${scope.connectorId}/pollutant_code=${pollutantCode}/manifest.json`,
+        }))
+      : []
+  ));
   const localStore = createCombinedLocalStore({
     ...args,
     prefixes: [...new Set(scopes.flatMap((scope) => [
@@ -1655,6 +2005,7 @@ export async function runV2ObservationsRepair({
     r2: config.r2,
     store: localStore,
     dropboxSourceKeys: additionalIndexPollutantTargets.map((target) => target.manifest_key),
+    observationGeneration,
   });
   const dayPlans = [];
   const blockedScopes = [];
@@ -1668,6 +2019,12 @@ export async function runV2ObservationsRepair({
   ) ? plannedStageStatus : "not_run";
 
   for (const [dayUtc, dayScopes] of [...byDay.entries()].sort(([left], [right]) => left.localeCompare(right))) {
+    const reportCompletedDayScopes = () => {
+      completedMetadataPlanningScopes += dayScopes.length;
+      metadataPlanningProgress.update(completedMetadataPlanningScopes, {
+        blocked_count: blockedScopes.length,
+      });
+    };
     const base = `${dataPrefix}/day_utc=${dayUtc}`;
     const proposalKeys = [];
     // Pollutant manifests are the leaf metadata layer.  Rebuild them before
@@ -1715,8 +2072,8 @@ export async function runV2ObservationsRepair({
         } = source;
         const rebuilt = buildHistoryV2PollutantManifest({
           domain,
-          grain: domain === "aqilevels" ? "hourly" : null,
-          profile: domain === "aqilevels" ? "data" : null,
+          grain: null,
+          profile: null,
           dayUtc,
           connectorId: scope.connectorId,
           pollutantCode,
@@ -1771,18 +2128,14 @@ export async function runV2ObservationsRepair({
           continue;
         }
         const existingPayload = jsonObject(existing, key);
-        if (domain === "observations") {
-          assertV2ObservationsChildManifest(existingPayload, { key, kind: "connector", dayUtc, connectorId: scope.connectorId });
-        } else if (existingPayload?.domain !== "aqilevels" || existingPayload?.manifest_kind !== "connector") {
-          throw new Error(`Invalid empty AQI connector manifest: ${key}`);
-        }
+        assertV2ObservationsChildManifest(existingPayload, { key, kind: "connector", dayUtc, connectorId: scope.connectorId });
         if ((existingPayload.child_manifests || []).length || (existingPayload.files || []).length) {
           throw new Error(`Connector manifest has children hidden by the proposed final state: ${key}`);
         }
         proposalKeys.push(key);
         continue;
       }
-      const payload = buildHistoryV2ConnectorManifest({ domain, grain: domain === "aqilevels" ? "hourly" : null, profile: domain === "aqilevels" ? "data" : null, dayUtc, connectorId: scope.connectorId, runId: child.children[0].run_id, manifestKey: key, pollutantManifests: child.children, writerGitSha: child.children[0].writer_git_sha, backedUpAtUtc: child.children.map((value) => value.backed_up_at_utc).sort().at(-1) || null });
+      const payload = buildHistoryV2ConnectorManifest({ domain, grain: null, profile: null, dayUtc, connectorId: scope.connectorId, runId: child.children[0].run_id, manifestKey: key, pollutantManifests: child.children, writerGitSha: child.children[0].writer_git_sha, backedUpAtUtc: child.children.map((value) => value.backed_up_at_utc).sort().at(-1) || null });
       await staged.stage({
         key,
         body: JSON.stringify(payload, null, 2),
@@ -1809,18 +2162,17 @@ export async function runV2ObservationsRepair({
     if (dayBlocked) {
       blockedScopes.push({ day_utc: dayUtc, status: "blocked_dependency", reason: "connector_manifest_dependency_blocked" });
       dayPlans.push({ day_utc: dayUtc, status: "blocked_dependency", manifest_status: "blocked_dependency", index_status: "blocked_dependency", scopes: dayScopes, blocked_scopes: blockedScopes.filter((scope) => scope.dayUtc === dayUtc || scope.day_utc === dayUtc), proposal_keys: [], index: null });
+      reportCompletedDayScopes();
       continue;
     }
     if (needsDay) {
-      if (domain === "observations") {
-        if (!sosLightReplacement) {
-          await stageRepairableObservationConnectorDependencies({
-            staged,
-            base,
-            dayUtc,
-            proposalKeys,
-          });
-        }
+      if (!sosLightReplacement) {
+        await stageRepairableObservationConnectorDependencies({
+          staged,
+          base,
+          dayUtc,
+          proposalKeys,
+        });
       }
       const child = sosLightReplacement
         ? await assembleSosLightDayParents({
@@ -1832,7 +2184,7 @@ export async function runV2ObservationsRepair({
           audit: sosLightAudit,
         })
         : await readChildren({ store: staged.stagedR2.adapter, prefix: `${base}/connector_id=`, dayUtc, kind: "connector", domain });
-      dayManifest = buildHistoryV2DayManifest({ domain, grain: domain === "aqilevels" ? "hourly" : null, profile: domain === "aqilevels" ? "data" : null, dayUtc, runId: child.children[0].run_id, manifestKey: dayManifestKey, connectorManifests: child.children, writerGitSha: child.children[0].writer_git_sha, backedUpAtUtc: child.children.map((value) => value.backed_up_at_utc).sort().at(-1) || null });
+      dayManifest = buildHistoryV2DayManifest({ domain, grain: null, profile: null, dayUtc, runId: child.children[0].run_id, manifestKey: dayManifestKey, connectorManifests: child.children, writerGitSha: child.children[0].writer_git_sha, backedUpAtUtc: child.children.map((value) => value.backed_up_at_utc).sort().at(-1) || null });
       await staged.stage({
         key: dayManifestKey,
         body: JSON.stringify(dayManifest, null, 2),
@@ -1867,7 +2219,7 @@ export async function runV2ObservationsRepair({
       .map((scope) => Number(scope.connectorId))
       .filter((connectorId) => Number.isInteger(connectorId) && connectorId > 0))]
       .sort((left, right) => left - right);
-    if (indexRequested && !indexConnectorIds.length) {
+    if (planIndexes && indexRequested && !indexConnectorIds.length) {
       blockedScopes.push({
         status: "blocked_dependency",
         day_utc: dayUtc,
@@ -1883,9 +2235,10 @@ export async function runV2ObservationsRepair({
         proposal_keys: [],
         index: null,
       });
+      reportCompletedDayScopes();
       continue;
     }
-    if (indexRequested) {
+    if (planIndexes && indexRequested) {
       const proposalSnapshot = new Map(staged.proposals);
       try {
         const results = [];
@@ -1893,7 +2246,7 @@ export async function runV2ObservationsRepair({
           results.push(await updateIndexes({
             env,
             r2: staged.stagedR2,
-            historyVersion: "v2",
+            historyVersion: storageGeneration,
             domains: [domain],
             fromDayUtc: dayUtc,
             toDayUtc: dayUtc,
@@ -1908,6 +2261,9 @@ export async function runV2ObservationsRepair({
             additionalPollutantManifestTargets: additionalIndexPollutantTargets.filter((target) =>
               target.day_utc === dayUtc && target.connector_id === connectorId
             ),
+            observationGeneration: domain === "observations"
+              ? observationGeneration
+              : null,
           }));
         }
         index = {
@@ -1928,6 +2284,7 @@ export async function runV2ObservationsRepair({
           detail: message,
         });
         dayPlans.push({ day_utc: dayUtc, status: "blocked_dependency", manifest_status: manifestStageStatus(proposalKeys), index_status: "blocked_dependency", scopes: dayScopes, blocked_scopes: blockedScopes.filter((scope) => scope.dayUtc === dayUtc || scope.day_utc === dayUtc), proposal_keys: [], index: null });
+        reportCompletedDayScopes();
         continue;
       }
       for (const key of staged.proposals.keys()) {
@@ -1938,18 +2295,23 @@ export async function runV2ObservationsRepair({
       day_utc: dayUtc,
       status: "planned",
       manifest_status: manifestStageStatus(proposalKeys),
-      index_status: indexRequested ? plannedStageStatus : "not_run",
+      index_status: planIndexes && indexRequested ? plannedStageStatus : "not_run",
       scopes: dayScopes,
       blocked_scopes: [],
       proposal_keys: [...new Set(proposalKeys)].sort(),
       index,
     });
+    reportCompletedDayScopes();
   }
+  metadataPlanningProgress.finish(completedMetadataPlanningScopes, {
+    blocked_count: blockedScopes.length,
+  });
 
-  if (sosLightAudit && !blockedScopes.length) {
+  if (planIndexes && sosLightAudit && !blockedScopes.length) {
     await stageSosLightLatestIndex({
       staged,
       config,
+      generation: observationGeneration,
       latestIndexKey,
       audit: sosLightAudit,
     });
@@ -1959,9 +2321,7 @@ export async function runV2ObservationsRepair({
   // targeted merge. Apply it last, after all lower-level index
   // proposals have completed their PUT-and-GET verification.
   const latestKeys = new Set(dayPlans.map((plan) => {
-    const domainResult = domain === "observations"
-      ? plan.index?.observations_timeseries
-      : plan.index?.aqilevels_timeseries;
+    const domainResult = plan.index?.observations_timeseries;
     return domainResult?.latest_index_key;
   }).filter(Boolean));
   for (const key of latestKeys) {

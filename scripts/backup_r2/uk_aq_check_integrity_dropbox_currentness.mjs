@@ -59,6 +59,7 @@ function parseArgs(argv) {
     statePrefix: null,
     observationsPrefix: null,
     timeseriesBindingBackupMode: "individual",
+    checkpointOnly: false,
   };
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
@@ -74,6 +75,7 @@ function parseArgs(argv) {
     else if (flag === "--timeseries-binding-backup-mode") {
       args.timeseriesBindingBackupMode = value();
     }
+    else if (flag === "--checkpoint-only") args.checkpointOnly = true;
     else throw new Error(`Unknown argument: ${flag}`);
   }
   if (!args.dropboxRoot) throw new Error("--dropbox-root is required");
@@ -162,6 +164,7 @@ export async function checkIntegrityDropboxCurrentness({
   env = process.env,
   getLiveRoot,
   lockContext,
+  checkpointOnly = false,
 } = {}) {
   const lock = lockContext || requireObservationsGlobalOperationLockContext({
     env,
@@ -191,6 +194,28 @@ export async function checkIntegrityDropboxCurrentness({
   }
   const checkpoint = validateHierarchicalStateRoot(checkpointRaw, normalizedStatePrefix, generation);
   requireCompleteCheckpoint(checkpoint, normalizedBindingBackupMode);
+  const latest = checkpoint.global_units.observations_timeseries_latest;
+
+  const checkpointResult = {
+    allowed: true,
+    status: checkpointOnly ? "checkpoint_complete" : "checkpoint_complete_pending_root_match",
+    lock_owner: lock.owner,
+    lock_run_id: lock.run_id,
+    checkpoint: {
+      path: checkpointPath,
+      relative_key: `${normalizedStatePrefix}/root.json`,
+      byte_size: checkpointBody.length,
+      sha256: sha256Hex(checkpointBody),
+      observations_processed_source_root_hash:
+        checkpoint.observations.processed_source_root_hash,
+      observations_timeseries_latest: {
+        key: latest.source_relative_path,
+        byte_size: latest.byte_size,
+        sha256: latest.processed_source_sha256,
+      },
+    },
+  };
+  if (checkpointOnly) return checkpointResult;
 
   const liveRootKey = `${normalizedObservationsPrefix}/_manifests/manifest.json`;
   let liveObject;
@@ -218,17 +243,11 @@ export async function checkIntegrityDropboxCurrentness({
   const checkpointHash = checkpoint.observations.processed_source_root_hash;
   const match = checkpointHash === liveRoot.content_hash;
   const result = {
+    ...checkpointResult,
     allowed: match,
     status: match ? "current" : "blocked_stale_dropbox_checkpoint",
     lock_owner: lock.owner,
     lock_run_id: lock.run_id,
-    checkpoint: {
-      path: checkpointPath,
-      relative_key: `${normalizedStatePrefix}/root.json`,
-      byte_size: checkpointBody.length,
-      sha256: sha256Hex(checkpointBody),
-      observations_processed_source_root_hash: checkpointHash,
-    },
     live_observations_root: {
       key: liveRootKey,
       content_hash: liveRoot.content_hash,
