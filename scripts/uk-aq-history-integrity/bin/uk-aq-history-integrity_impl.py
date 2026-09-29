@@ -21621,6 +21621,15 @@ def run_canonical_apply_executor(
             "node_apply_launch_permitted": True,
         })
     write_run_state(run_state)
+    if dedicated_sos_light_v2:
+        recovery_state_path = str(
+            run_state.get("fixed_v2_lock_recovery_state_path") or ""
+        ).strip()
+        if not recovery_state_path:
+            raise RuntimeError(
+                "fixed-v2 SOS-light Node APPLY requires durable lock-recovery authority"
+            )
+        _permit_fixed_v2_node_apply_launch(recovery_state_path)
     repo_root = _repo_root_for_integrity_script(env)
     node_bin = str(env.get("UK_AQ_BACKFILL_NODE_BIN") or shutil.which("node") or "node")
     command = [
@@ -21850,6 +21859,459 @@ def observations_global_operation_lock_context(
 
 INTEGRITY_LOGICAL_RUN_CONTEXT_ENV = "UK_AQ_INTEGRITY_LOGICAL_RUN_CONTEXT"
 INTEGRITY_LOGICAL_RUN_CONTEXT_VERSION = 1
+FIXED_V2_SOS_LIGHT_RECOVERY_PROFILE = "fixed-v2-sos-light-pre-mutation"
+FIXED_V2_SOS_LIGHT_RECOVERY_CONTRACT = (
+    "uk_aq_sos_light_v2_pre_mutation_lock_recovery_v1"
+)
+FIXED_V2_SOS_LIGHT_RECOVERY_STATE_ENV = (
+    "UK_AQ_FIXED_V2_SOS_LIGHT_LOCK_RECOVERY_STATE_PATH"
+)
+FIXED_V2_SOS_LIGHT_RECOVERY_REENTRY_ENV = (
+    "UK_AQ_FIXED_V2_SOS_LIGHT_LOCK_RECOVERY_REENTRY"
+)
+FIXED_V2_SOS_LIGHT_RECOVERY_GENERATION_ENV = (
+    "UK_AQ_FIXED_V2_SOS_LIGHT_LOCK_RECOVERY_GENERATION"
+)
+
+
+def _atomic_write_fixed_v2_recovery_state(
+    state_path: str | Path,
+    state: Mapping[str, Any],
+) -> None:
+    path = Path(state_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(state, handle, indent=2, sort_keys=True, default=str)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    temporary.replace(path)
+    descriptor = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _read_fixed_v2_recovery_state(state_path: str | Path) -> dict[str, Any]:
+    try:
+        state = json.loads(Path(state_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            "fixed-v2 SOS-light recovery authority is unavailable or invalid"
+        ) from exc
+    if (
+        not isinstance(state, dict)
+        or state.get("contract_version")
+        != FIXED_V2_SOS_LIGHT_RECOVERY_CONTRACT
+        or state.get("profile") != FIXED_V2_SOS_LIGHT_RECOVERY_PROFILE
+        or state.get("generation") != "v2"
+        or state.get("authority_status") != "complete"
+        or not isinstance(state.get("logical_run"), dict)
+        or not isinstance(state.get("r2_mutation_started"), bool)
+    ):
+        raise RuntimeError(
+            "fixed-v2 SOS-light recovery authority is incomplete or contradictory"
+        )
+    return state
+
+
+def _writer_run_matches_logical_identity(
+    run: Mapping[str, Any],
+    *,
+    daily_task_health_run_id: str | None,
+    platform_run_id: str,
+    integrity_run_id: int | None = None,
+    environment: str | None = None,
+) -> bool:
+    summary = run.get("summary")
+    summary = summary if isinstance(summary, Mapping) else {}
+    actual_health_run_id = str(
+        run.get("run_id") or run.get("id") or ""
+    ).strip()
+    expected_health_run_id = str(daily_task_health_run_id or "").strip()
+    if expected_health_run_id:
+        return actual_health_run_id == expected_health_run_id
+
+    actual_platform_run_id = str(
+        run.get("platform_run_id")
+        or run.get("external_run_id")
+        or summary.get("platform_run_id")
+        or ""
+    ).strip()
+    expected_platform_run_id = str(platform_run_id or "").strip()
+    if expected_platform_run_id and actual_platform_run_id:
+        return actual_platform_run_id == expected_platform_run_id
+
+    actual_integrity_run_id = summary.get("integrity_run_id")
+    actual_environment = str(summary.get("env") or "").strip()
+    return bool(
+        integrity_run_id is not None
+        and actual_integrity_run_id is not None
+        and str(actual_integrity_run_id) == str(integrity_run_id)
+        and str(environment or "").strip()
+        and actual_environment == str(environment).strip()
+    )
+
+
+def _fixed_v2_recovery_self_writer_context(
+    recovery_state: Mapping[str, Any],
+) -> dict[str, Any]:
+    logical_run = recovery_state.get("logical_run")
+    writer_watermarks = recovery_state.get("writer_watermarks")
+    if not isinstance(logical_run, Mapping) or not isinstance(
+        writer_watermarks, Mapping
+    ):
+        raise RuntimeError(
+            "fixed-v2 recovery self-writer authority is unavailable"
+        )
+    original_integrity_watermark = writer_watermarks.get(
+        "ops.history_integrity"
+    )
+    if not isinstance(original_integrity_watermark, Mapping):
+        raise RuntimeError(
+            "fixed-v2 recovery self-writer watermark is unavailable"
+        )
+    return {
+        "daily_task_health_run_id": logical_run.get(
+            "daily_task_health_run_id"
+        ),
+        "platform_run_id": logical_run.get("platform_run_id"),
+        "integrity_run_id": logical_run.get("integrity_run_id"),
+        "environment": logical_run.get("environment"),
+        "original_history_integrity_watermark": json.loads(json.dumps(
+            original_integrity_watermark,
+            sort_keys=True,
+            default=str,
+        )),
+    }
+
+
+def _normalise_recovery_self_writer_runs(
+    writer_runs: Iterable[Mapping[str, Any]],
+    recovery_self_writer: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    normalised = json.loads(json.dumps(
+        list(writer_runs), sort_keys=True, default=str,
+    ))
+    audit: dict[str, Any] = {
+        "running_run": None,
+        "latest_finished_run": None,
+    }
+    for writer in normalised:
+        if writer.get("task_key") != "ops.history_integrity":
+            continue
+        for field in ("running_run", "latest_finished_run"):
+            candidate = writer.get(field)
+            if not isinstance(candidate, Mapping):
+                continue
+            if not _writer_run_matches_logical_identity(
+                candidate,
+                daily_task_health_run_id=recovery_self_writer.get(
+                    "daily_task_health_run_id"
+                ),
+                platform_run_id=str(
+                    recovery_self_writer.get("platform_run_id") or ""
+                ),
+                integrity_run_id=recovery_self_writer.get("integrity_run_id"),
+                environment=str(
+                    recovery_self_writer.get("environment") or ""
+                ),
+            ):
+                continue
+            audit[field] = json.loads(json.dumps(
+                candidate, sort_keys=True, default=str,
+            ))
+            if field == "running_run":
+                writer["running_run"] = None
+                writer["is_running"] = False
+            else:
+                original = recovery_self_writer.get(
+                    "original_history_integrity_watermark"
+                )
+                if not isinstance(original, Mapping):
+                    raise RuntimeError(
+                        "fixed-v2 recovery original Integrity watermark is invalid"
+                    )
+                writer["latest_finished_run"] = json.loads(json.dumps(
+                    original.get("latest_finished_run"),
+                    sort_keys=True,
+                    default=str,
+                ))
+    return normalised, audit
+
+
+def _fixed_v2_writer_watermarks(
+    backup_readiness: Mapping[str, Any],
+    *,
+    daily_task_health_run_id: str | None,
+    platform_run_id: str,
+) -> dict[str, Any]:
+    expected = {
+        "ops.prune_daily",
+        "ops.r2_core_snapshot",
+        "ops.history_integrity",
+    }
+    entries = list(backup_readiness.get("writer_runs") or [])
+    if (
+        len(entries) != len(expected)
+        or {
+            str(entry.get("task_key") or "")
+            for entry in entries if isinstance(entry, Mapping)
+        } != expected
+    ):
+        raise RuntimeError("fixed-v2 SOS-light writer watermarks are incomplete")
+    result: dict[str, Any] = {}
+    for entry in entries:
+        task_key = str(entry["task_key"])
+        latest = entry.get("latest_finished_run")
+        running = entry.get("running_run")
+        if latest is not None and not isinstance(latest, Mapping):
+            raise RuntimeError("fixed-v2 SOS-light writer watermark is invalid")
+        if running is not None and not isinstance(running, Mapping):
+            raise RuntimeError("fixed-v2 SOS-light running-writer evidence is invalid")
+        own_running = bool(
+            task_key == "ops.history_integrity"
+            and isinstance(running, Mapping)
+            and _writer_run_matches_logical_identity(
+                running,
+                daily_task_health_run_id=daily_task_health_run_id,
+                platform_run_id=platform_run_id,
+            )
+        )
+        result[task_key] = {
+            "latest_finished_run": (
+                json.loads(json.dumps(latest, sort_keys=True, default=str))
+                if isinstance(latest, Mapping) else None
+            ),
+            "running_run": (
+                None if own_running else
+                json.loads(json.dumps(running, sort_keys=True, default=str))
+                if isinstance(running, Mapping) else None
+            ),
+        }
+    return result
+
+
+def _fixed_v2_recovery_authority_projection(
+    *,
+    args: argparse.Namespace,
+    started_iso: str,
+    run_compact: str,
+    integrity_run_id: int,
+    daily_task_health_run_id: str | None,
+    platform_run_id: str,
+    requested_from_day: str,
+    requested_to_day: str,
+    global_operation_lock: Mapping[str, Any],
+    backup_readiness: Mapping[str, Any],
+    dropbox_currentness: Mapping[str, Any],
+    core_snapshot_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    checkpoint = dropbox_currentness.get("checkpoint")
+    live_root = dropbox_currentness.get("live_observations_root")
+    if (
+        not backup_readiness.get("backup_ready")
+        or not isinstance(checkpoint, Mapping)
+        or not isinstance(live_root, Mapping)
+        or dropbox_currentness.get("checkpoint_live_root_match") is not True
+    ):
+        raise RuntimeError(
+            "fixed-v2 SOS-light recovery authority cannot be pinned from incomplete Step 0"
+        )
+    dropbox_hash = str(
+        checkpoint.get("observations_processed_source_root_hash") or ""
+    )
+    live_hash = str(live_root.get("content_hash") or "")
+    if not dropbox_hash or dropbox_hash != live_hash:
+        raise RuntimeError("fixed-v2 SOS-light recovery root authority is invalid")
+    return {
+        "logical_run": {
+            "environment": args.env,
+            "started_at_utc": started_iso,
+            "run_compact": run_compact,
+            "lock_run_id": f"integrity:{args.env}:{run_compact}",
+            "integrity_run_id": int(integrity_run_id),
+            "daily_task_health_run_id": daily_task_health_run_id,
+            "platform_run_id": platform_run_id,
+        },
+        "request": {
+            "source": args.source,
+            "from_day": requested_from_day,
+            "to_day": requested_to_day,
+            "repair_pollutants": sorted(args.repair_pollutants),
+            "run_backfill": bool(args.run_backfill),
+            "dry_run": bool(args.dry_run),
+            "check_only": bool(args.check_only),
+        },
+        "generation": "v2",
+        "backup": {
+            key: backup_readiness.get(key)
+            for key in (
+                "backup_run_id",
+                "backup_started_at",
+                "backup_finished_at",
+            )
+        },
+        "checkpoint": json.loads(json.dumps(
+            checkpoint, sort_keys=True, default=str,
+        )),
+        "observations_roots": {
+            "dropbox_content_hash": dropbox_hash,
+            "live_r2_content_hash": live_hash,
+            "equal": True,
+        },
+        "writer_watermarks": _fixed_v2_writer_watermarks(
+            backup_readiness,
+            daily_task_health_run_id=daily_task_health_run_id,
+            platform_run_id=platform_run_id,
+        ),
+        "core_snapshot_identity": _normalise_core_snapshot_identity(
+            core_snapshot_identity,
+            stage="fixed_v2_lock_recovery_authority",
+        ),
+        "lock_session": {
+            key: global_operation_lock.get(key)
+            for key in (
+                "logical_identity", "run_id", "nonce", "wait_ms", "outcome"
+            )
+        },
+    }
+
+
+def _initialise_fixed_v2_recovery_state(
+    state_path: str | Path,
+    authority: Mapping[str, Any],
+) -> dict[str, Any]:
+    state = {
+        "contract_version": FIXED_V2_SOS_LIGHT_RECOVERY_CONTRACT,
+        "profile": FIXED_V2_SOS_LIGHT_RECOVERY_PROFILE,
+        "authority_status": "complete",
+        **json.loads(json.dumps(authority, sort_keys=True, default=str)),
+        "r2_mutation_started": False,
+        "r2_mutation_started_at_utc": None,
+        "automatic_lock_recovery_permitted": True,
+        "resume": "permitted",
+        "node_apply_launch_permitted": False,
+        "r2_mutation_possible": False,
+        "recovery": {
+            "recovery_generation": 0,
+            "lock_loss_count": 0,
+            "reacquire_attempt_count": 0,
+            "outcome": "not_required",
+            "gate_results": [],
+        },
+    }
+    _atomic_write_fixed_v2_recovery_state(state_path, state)
+    return state
+
+
+def _revalidate_fixed_v2_recovery_state(
+    state_path: str | Path,
+    current_authority: Mapping[str, Any],
+) -> dict[str, Any]:
+    state = _read_fixed_v2_recovery_state(state_path)
+    original = {
+        key: state.get(key)
+        for key in (
+            "logical_run", "request", "generation", "backup", "checkpoint",
+            "observations_roots", "writer_watermarks", "core_snapshot_identity",
+        )
+    }
+    current = json.loads(json.dumps(
+        current_authority, sort_keys=True, default=str,
+    ))
+    gate_results: list[dict[str, Any]] = []
+    for key in (
+        "logical_run", "request", "generation", "backup", "checkpoint",
+        "observations_roots", "writer_watermarks", "core_snapshot_identity",
+    ):
+        gate_results.append({
+            "gate": key,
+            "status": "succeeded" if original[key] == current[key] else "changed",
+        })
+    active_different_writers = [
+        task_key
+        for task_key, watermark in dict(current["writer_watermarks"]).items()
+        if isinstance(watermark, Mapping)
+        and watermark.get("running_run") is not None
+    ]
+    gate_results.append({
+        "gate": "no_incompatible_active_writer",
+        "status": "succeeded" if not active_different_writers else "changed",
+        "task_keys": active_different_writers,
+    })
+    mutation_unchanged = state.get("r2_mutation_started") is False
+    gate_results.append({
+        "gate": "r2_mutation_started",
+        "status": "succeeded" if mutation_unchanged else "uncertain",
+    })
+    changed = any(item["status"] == "changed" for item in gate_results)
+    uncertain = any(item["status"] == "uncertain" for item in gate_results)
+    recovery = state.setdefault("recovery", {})
+    recovery["gate_results"] = gate_results
+    recovery["rechecked_authority"] = current
+    recovery["finished_at_utc"] = fmt_iso(utc_now())
+    if changed or uncertain:
+        recovery["outcome"] = (
+            "blocked_authority_changed" if changed
+            else "blocked_authority_uncertain"
+        )
+        state["resume"] = "forbidden"
+        state["node_apply_launch_permitted"] = False
+        state["r2_mutation_possible"] = False
+        _atomic_write_fixed_v2_recovery_state(state_path, state)
+        raise RuntimeError(
+            "fixed-v2 SOS-light lock recovery authority changed or is uncertain"
+        )
+    recovery["outcome"] = "resumed"
+    state["resume"] = "permitted"
+    state["node_apply_launch_permitted"] = False
+    state["r2_mutation_possible"] = False
+    _atomic_write_fixed_v2_recovery_state(state_path, state)
+    return state
+
+
+def _block_fixed_v2_recovery_state(
+    state_path: str | Path,
+    *,
+    outcome: str,
+    reason: str,
+) -> None:
+    state = _read_fixed_v2_recovery_state(state_path)
+    recovery = state.setdefault("recovery", {})
+    recovery.update({
+        "outcome": outcome,
+        "finished_at_utc": fmt_iso(utc_now()),
+        "error": reason,
+    })
+    state["resume"] = "forbidden"
+    state["node_apply_launch_permitted"] = False
+    state["r2_mutation_possible"] = False
+    _atomic_write_fixed_v2_recovery_state(state_path, state)
+
+
+def _permit_fixed_v2_node_apply_launch(
+    state_path: str | Path,
+) -> dict[str, Any]:
+    state = _read_fixed_v2_recovery_state(state_path)
+    if (
+        state.get("resume") != "permitted"
+        or state.get("r2_mutation_started") is not False
+        or state.get("recovery", {}).get("outcome")
+        not in {"not_required", "resumed"}
+    ):
+        raise RuntimeError(
+            "fixed-v2 SOS-light recovery state does not permit Node APPLY launch"
+        )
+    state["node_apply_launch_permitted"] = True
+    state["r2_mutation_possible"] = True
+    state.setdefault("recovery", {})[
+        "node_apply_launch_permitted_at_utc"
+    ] = fmt_iso(utc_now())
+    _atomic_write_fixed_v2_recovery_state(state_path, state)
+    return state
 
 
 def build_integrity_logical_run_context(
@@ -21936,6 +22398,7 @@ def run_integrity_under_global_operation_lock(
     run_compact: str,
     started_at_utc: str,
     log_path: str | Path,
+    fixed_v2_recovery_enabled: bool = False,
 ) -> int:
     repo_root = _repo_root_for_integrity_script(env)
     node_bin = str(env.get("UK_AQ_BACKFILL_NODE_BIN") or shutil.which("node") or "node")
@@ -21945,6 +22408,19 @@ def run_integrity_under_global_operation_lock(
             "SUPABASE_DB_URL (or DATABASE_URL) is required for the Integrity observations global operation lock"
         )
     lock_run_id = f"integrity:{args.env}:{run_compact}"
+    recovery_state_path = (
+        Path(env["UK_AQ_HISTORY_INTEGRITY_TMP_DIR"])
+        / "fixed-v2-sos-light-lock-recovery"
+        / f"{run_compact}.json"
+        if fixed_v2_recovery_enabled else None
+    )
+    recovery_options = (
+        [
+            "--recovery-profile", FIXED_V2_SOS_LIGHT_RECOVERY_PROFILE,
+            "--recovery-state-json", str(recovery_state_path),
+        ]
+        if fixed_v2_recovery_enabled else []
+    )
     command = [
         node_bin,
         str(
@@ -21953,6 +22429,7 @@ def run_integrity_under_global_operation_lock(
         ),
         "--owner", "integrity",
         "--run-id", lock_run_id,
+        *recovery_options,
         "--",
         sys.executable,
         str(Path(__file__).resolve()),
@@ -21976,6 +22453,10 @@ def run_integrity_under_global_operation_lock(
                 logical_run_context,
                 sort_keys=True,
                 separators=(",", ":"),
+            ),
+            **(
+                {FIXED_V2_SOS_LIGHT_RECOVERY_STATE_ENV: str(recovery_state_path)}
+                if fixed_v2_recovery_enabled else {}
             ),
         },
         check=False,
@@ -24838,6 +25319,7 @@ def check_dropbox_backup_ready(
     integrity_started_at_utc: str,
     allow_stale_dropbox: bool = False,
     rpc_name: str = "uk_aq_rpc_history_integrity_readiness",
+    recovery_self_writer: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     summary: dict[str, Any] = {
         "backup_gate_checked": True,
@@ -24934,6 +25416,44 @@ def check_dropbox_backup_ready(
         "latest_writer_finished_at",
     ):
         summary[key] = data.get(key)
+    recovery_self_evidence: dict[str, Any] | None = None
+    if recovery_self_writer is not None:
+        try:
+            writer_runs, recovery_self_evidence = (
+                _normalise_recovery_self_writer_runs(
+                    writer_runs,
+                    recovery_self_writer,
+                )
+            )
+        except (TypeError, ValueError, RuntimeError) as exc:
+            summary["blocked_reason"] = (
+                f"invalid_recovery_self_writer_context:{exc}"
+            )
+            return summary
+        summary["recovery_self_writer_evidence"] = recovery_self_evidence
+        if recovery_self_evidence.get("latest_finished_run") is not None:
+            completed_values = []
+            for writer_run in writer_runs:
+                latest = writer_run.get("latest_finished_run")
+                if not isinstance(latest, Mapping):
+                    continue
+                completed_raw = str(
+                    latest.get("completed_at")
+                    or latest.get("finished_at")
+                    or latest.get("failed_at")
+                    or ""
+                ).strip()
+                completed_at = _parse_iso_utc(completed_raw)
+                if completed_at is None:
+                    summary["blocked_reason"] = (
+                        "daily_task_health_query_returned_unexpected_shape"
+                    )
+                    return summary
+                completed_values.append((completed_at, completed_raw))
+            summary["latest_writer_finished_at"] = (
+                max(completed_values, key=lambda item: item[0])[1]
+                if completed_values else None
+            )
     summary["writer_runs"] = writer_runs
 
     if summary["running_backup_run"] is not None and not isinstance(summary["running_backup_run"], dict):
@@ -24956,7 +25476,22 @@ def check_dropbox_backup_ready(
             and bool(running_writer_keys)
             and running_writer_keys <= {"ops.prune_daily"}
         )
-        if not may_overlap_prune:
+        may_ignore_recovery_self_running = bool(
+            recovery_self_evidence
+            and recovery_self_evidence.get("running_run") is not None
+            and blocked_reason == "relevant_writer_running"
+            and running_writer_keys <= {"ops.prune_daily"}
+        )
+        may_ignore_recovery_self_finished = bool(
+            recovery_self_evidence
+            and recovery_self_evidence.get("latest_finished_run") is not None
+            and blocked_reason == "backup_started_before_latest_writer_finished"
+        )
+        if not (
+            may_overlap_prune
+            or may_ignore_recovery_self_running
+            or may_ignore_recovery_self_finished
+        ):
             summary["blocked_reason"] = blocked_reason
             return summary
 
@@ -24973,7 +25508,9 @@ def check_dropbox_backup_ready(
     if backup_finished_at >= integrity_started_at:
         summary["blocked_reason"] = "backup_finished_at_or_after_integrity_start"
         return summary
-    latest_writer_raw = str(data.get("latest_writer_finished_at") or "").strip()
+    latest_writer_raw = str(
+        summary.get("latest_writer_finished_at") or ""
+    ).strip()
     if latest_writer_raw:
         latest_writer_finished_at = _parse_iso_utc(latest_writer_raw)
         if latest_writer_finished_at is None:
@@ -25017,7 +25554,12 @@ def resolve_backup_gate_credentials(values: Mapping[str, Any] | None = None) -> 
     )
 
 
-def run_scheduled_backup_gate(args: argparse.Namespace, started_iso: str) -> dict[str, Any]:
+def run_scheduled_backup_gate(
+    args: argparse.Namespace,
+    started_iso: str,
+    *,
+    recovery_self_writer: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     supabase_url, service_role_key = resolve_backup_gate_credentials()
     fixed_v2_sos_light_write_enabled = bool(
         select_sos_historical_replacement_route(args).get("arguments_qualify")
@@ -25035,6 +25577,10 @@ def run_scheduled_backup_gate(args: argparse.Namespace, started_iso: str) -> dic
                 "UK_AQ_HISTORY_INTEGRITY_BACKUP_READINESS_RPC",
                 "uk_aq_rpc_history_integrity_readiness",
             )
+        ),
+        recovery_self_writer=(
+            recovery_self_writer
+            if fixed_v2_sos_light_write_enabled else None
         ),
     )
 
@@ -27751,6 +28297,22 @@ def main(argv: list[str]) -> int:
     fixed_v2_sos_light_write_enabled = bool(
         sos_historical_route.get("arguments_qualify")
     )
+    recovery_state_path_raw = str(
+        os.environ.get(FIXED_V2_SOS_LIGHT_RECOVERY_STATE_ENV) or ""
+    ).strip()
+    fixed_v2_recovery_reentry = (
+        str(os.environ.get(FIXED_V2_SOS_LIGHT_RECOVERY_REENTRY_ENV) or "")
+        .strip().lower() == "true"
+    )
+    fixed_v2_recovery_state: dict[str, Any] | None = None
+    if fixed_v2_recovery_reentry:
+        if not fixed_v2_sos_light_write_enabled or not recovery_state_path_raw:
+            raise RuntimeError(
+                "fixed-v2 SOS-light recovery re-entry is not valid for this request"
+            )
+        fixed_v2_recovery_state = _read_fixed_v2_recovery_state(
+            recovery_state_path_raw
+        )
     dedicated_sos_historical_replacement = False
     env = load_env_or_die()
     protected_connector_ids = (
@@ -27984,6 +28546,12 @@ def main(argv: list[str]) -> int:
         }
     log.info("IngestDB boundary check: %s", json.dumps(ingest_boundary, sort_keys=True, default=str))
     if not ingest_boundary.get("allowed"):
+        if fixed_v2_recovery_reentry and recovery_state_path_raw:
+            _block_fixed_v2_recovery_state(
+                recovery_state_path_raw,
+                outcome="blocked_authority_changed",
+                reason="request-level IngestDB boundary changed during recovery",
+            )
         summary = {
             "env": args.env,
             "profile": args.profile,
@@ -28025,6 +28593,7 @@ def main(argv: list[str]) -> int:
             run_compact=run_compact,
             started_at_utc=started_iso,
             log_path=log_path,
+            fixed_v2_recovery_enabled=fixed_v2_sos_light_write_enabled,
         )
 
     # The child process is now inside the retained PostgreSQL session lock.
@@ -28062,6 +28631,12 @@ def main(argv: list[str]) -> int:
         json.dumps(dropbox_currentness, sort_keys=True, default=str),
     )
     if not dropbox_currentness.get("allowed"):
+        if fixed_v2_recovery_reentry and recovery_state_path_raw:
+            _block_fixed_v2_recovery_state(
+                recovery_state_path_raw,
+                outcome="blocked_authority_uncertain",
+                reason="Dropbox checkpoint could not be revalidated during recovery",
+            )
         summary = {
             "env": args.env,
             "profile": args.profile,
@@ -28098,9 +28673,26 @@ def main(argv: list[str]) -> int:
         write_reports(env["UK_AQ_HISTORY_INTEGRITY_REPORT_DIR"], run_compact, summary)
         return 2
 
-    backup_gate_summary = run_scheduled_backup_gate(args, started_iso)
+    backup_gate_summary = run_scheduled_backup_gate(
+        args,
+        started_iso,
+        recovery_self_writer=(
+            _fixed_v2_recovery_self_writer_context(
+                fixed_v2_recovery_state
+            )
+            if fixed_v2_recovery_reentry
+            and fixed_v2_recovery_state is not None
+            else None
+        ),
+    )
     log.info("dropbox backup gate: %s", json.dumps(backup_gate_summary, sort_keys=True, default=str))
     if not backup_gate_summary.get("backup_ready"):
+        if fixed_v2_recovery_reentry and recovery_state_path_raw:
+            _block_fixed_v2_recovery_state(
+                recovery_state_path_raw,
+                outcome="blocked_authority_changed",
+                reason="writer ordering or backup identity changed during recovery",
+            )
         log.error("backup gate blocked after the IngestDB boundary: %s", backup_gate_summary.get("blocked_reason"))
         summary = {
             "env": args.env,
@@ -28149,6 +28741,12 @@ def main(argv: list[str]) -> int:
             json.dumps(dropbox_currentness, sort_keys=True, default=str),
         )
         if not dropbox_currentness.get("allowed"):
+            if fixed_v2_recovery_reentry and recovery_state_path_raw:
+                _block_fixed_v2_recovery_state(
+                    recovery_state_path_raw,
+                    outcome="blocked_authority_changed",
+                    reason="Dropbox/live observations-root identity changed during recovery",
+                )
             summary = {
                 "env": args.env,
                 "profile": args.profile,
@@ -28202,27 +28800,48 @@ def main(argv: list[str]) -> int:
             **(selection_summary or {}),
             "state_row_status": "planned",
         }
-    run_id: int | None = None
+    run_id: int | None = (
+        int(fixed_v2_recovery_state["logical_run"]["integrity_run_id"])
+        if fixed_v2_recovery_state is not None else None
+    )
     try:
-        cur = conn.execute(
-            """
-            INSERT INTO integrity_runs (
-              started_at_utc, env_name, profile, source_filter,
-              from_day, to_day, effective_mode, dropbox_baseline,
-              allow_stale_dropbox, status, notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
+        if fixed_v2_recovery_state is not None:
+            existing_run = conn.execute(
+                """
+                SELECT started_at_utc, env_name, profile, source_filter,
+                       from_day, to_day, effective_mode
+                FROM integrity_runs WHERE id = ?
+                """,
+                (int(run_id),),
+            ).fetchone()
+            if existing_run is None or tuple(existing_run) != (
                 started_iso, args.env, args.profile, args.source,
                 from_day, to_day, effective_mode,
-                resolve_r2_history_root(os.environ),
-                1 if args.allow_stale_dropbox else 0, "running",
-                "history integrity run in progress.",
-            ),
-        )
-        run_id = cur.lastrowid
-        conn.commit()
-        log.info("integrity_runs.id=%s", run_id)
+            ):
+                raise RuntimeError(
+                    "fixed-v2 SOS-light recovery SQLite logical run identity disagrees"
+                )
+            log.info("reusing integrity_runs.id=%s after lock recovery", run_id)
+        else:
+            cur = conn.execute(
+                """
+                INSERT INTO integrity_runs (
+                  started_at_utc, env_name, profile, source_filter,
+                  from_day, to_day, effective_mode, dropbox_baseline,
+                  allow_stale_dropbox, status, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    started_iso, args.env, args.profile, args.source,
+                    from_day, to_day, effective_mode,
+                    resolve_r2_history_root(os.environ),
+                    1 if args.allow_stale_dropbox else 0, "running",
+                    "history integrity run in progress.",
+                ),
+            )
+            run_id = cur.lastrowid
+            conn.commit()
+            log.info("integrity_runs.id=%s", run_id)
         if daily_selection is not None:
             _upsert_daily_profile_state(
                 conn,
@@ -28232,9 +28851,14 @@ def main(argv: list[str]) -> int:
                 status="running",
                 started_at_utc=started_iso,
             )
-        if daily_task_health_enabled:
+        if daily_task_health_enabled and fixed_v2_recovery_state is not None:
+            daily_task_health_run_id = fixed_v2_recovery_state[
+                "logical_run"
+            ].get("daily_task_health_run_id")
+        elif daily_task_health_enabled:
             start_summary = {
                 "env": args.env, "profile": args.profile, "source": args.source,
+                "platform_run_id": daily_task_platform_run_id,
                 "from_day": from_day, "to_day": to_day,
                 "date_selection": selection_summary,
                 "logical_run_date": logical_run_date.isoformat(),
@@ -28313,6 +28937,52 @@ def main(argv: list[str]) -> int:
             json.dumps(core_snapshot_identity, sort_keys=True),
             core_snapshot_identity_path,
         )
+        if fixed_v2_sos_light_write_enabled:
+            if not recovery_state_path_raw:
+                raise RuntimeError(
+                    "write-enabled fixed-v2 SOS-light requires its durable lock-recovery state path"
+                )
+            recovery_authority = _fixed_v2_recovery_authority_projection(
+                args=args,
+                started_iso=started_iso,
+                run_compact=run_compact,
+                integrity_run_id=int(run_id),
+                daily_task_health_run_id=daily_task_health_run_id,
+                platform_run_id=daily_task_platform_run_id,
+                requested_from_day=from_day,
+                requested_to_day=to_day,
+                global_operation_lock=global_operation_lock,
+                backup_readiness=backup_gate_summary,
+                dropbox_currentness=dropbox_currentness or {},
+                core_snapshot_identity=core_snapshot_identity,
+            )
+            if fixed_v2_recovery_reentry:
+                fixed_v2_recovery_state = (
+                    _revalidate_fixed_v2_recovery_state(
+                        recovery_state_path_raw,
+                        recovery_authority,
+                    )
+                )
+                stale_run_root = (
+                    Path(env["UK_AQ_HISTORY_INTEGRITY_TMP_DIR"])
+                    / f"run-{run_compact}"
+                )
+                if stale_run_root.exists():
+                    shutil.rmtree(stale_run_root)
+                log.info(
+                    "fixed-v2 SOS-light lock recovery authority unchanged; "
+                    "same logical run resumed generation=%s",
+                    os.environ.get(
+                        FIXED_V2_SOS_LIGHT_RECOVERY_GENERATION_ENV, ""
+                    ),
+                )
+            else:
+                fixed_v2_recovery_state = (
+                    _initialise_fixed_v2_recovery_state(
+                        recovery_state_path_raw,
+                        recovery_authority,
+                    )
+                )
         if args.skip_snapshot_import:
             log.warning("--skip-snapshot-import: skipping core snapshot import")
             snapshot_result = {
@@ -28738,6 +29408,13 @@ def main(argv: list[str]) -> int:
             repair_overlay["observations_global_operation_lock"] = dict(
                 global_operation_lock
             )
+            if fixed_v2_sos_light_write_enabled:
+                repair_overlay["fixed_v2_lock_recovery_state_path"] = (
+                    recovery_state_path_raw
+                )
+                repair_overlay["fixed_v2_lock_recovery"] = (
+                    _read_fixed_v2_recovery_state(recovery_state_path_raw)
+                )
             repair_overlay["dropbox_currentness"] = dict(
                 dropbox_currentness or {}
             )
@@ -29365,6 +30042,11 @@ def main(argv: list[str]) -> int:
             "backup_readiness": backup_gate_summary,
             "observations_global_operation_lock": global_operation_lock,
             "dropbox_currentness": dropbox_currentness,
+            "fixed_v2_lock_recovery": (
+                _read_fixed_v2_recovery_state(recovery_state_path_raw)
+                if fixed_v2_sos_light_write_enabled
+                and recovery_state_path_raw else None
+            ),
             "repair_flow": repair_flow,
             "current_state_reconciliation": current_state_summary,
             "r2_history_status": current_state_summary.get("r2_history_status"),
@@ -29446,6 +30128,7 @@ def main(argv: list[str]) -> int:
                 "env": args.env,
                 "profile": args.profile,
                 "source": args.source,
+                "platform_run_id": daily_task_platform_run_id,
                 "from_day": from_day,
                 "to_day": to_day,
                 "date_selection": selection_summary,
@@ -29556,6 +30239,36 @@ def main(argv: list[str]) -> int:
                     raise
         return 1 if status in {"fail", "stopped_limit"} else 0
     except Exception as exc:
+        if fixed_v2_recovery_reentry and recovery_state_path_raw:
+            try:
+                recovery_failure_state = _read_fixed_v2_recovery_state(
+                    recovery_state_path_raw
+                )
+                recovery_evidence = recovery_failure_state.setdefault(
+                    "recovery", {}
+                )
+                if recovery_evidence.get("outcome") not in {
+                    "blocked_authority_changed",
+                    "blocked_authority_uncertain",
+                    "post_mutation_lock_loss",
+                    "reacquire_timeout",
+                }:
+                    recovery_evidence.update({
+                        "outcome": "blocked_authority_uncertain",
+                        "finished_at_utc": fmt_iso(utc_now()),
+                        "error": str(exc),
+                    })
+                    recovery_failure_state["resume"] = "forbidden"
+                    recovery_failure_state[
+                        "node_apply_launch_permitted"
+                    ] = False
+                    recovery_failure_state["r2_mutation_possible"] = False
+                    _atomic_write_fixed_v2_recovery_state(
+                        recovery_state_path_raw,
+                        recovery_failure_state,
+                    )
+            except Exception:
+                pass
         log.exception("run failed: %s", exc)
         if run_id is not None:
             try:
@@ -29592,6 +30305,7 @@ def main(argv: list[str]) -> int:
                 "env": args.env,
                 "profile": args.profile,
                 "source": args.source,
+                "platform_run_id": daily_task_platform_run_id,
                 "from_day": from_day if "from_day" in locals() else args.from_day,
                 "to_day": to_day if "to_day" in locals() else args.to_day,
                 "date_selection": selection_summary if "selection_summary" in locals() else None,

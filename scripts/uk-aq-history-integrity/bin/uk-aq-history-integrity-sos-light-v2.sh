@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Repository-owned UK-AQ History Integrity runner.
-# The local deployed dispatcher selects this repository; this runner loads only
+# The deployed local wrapper selects this repository; this runner loads only
 # the repository root .env, derives runtime paths, takes the per-env lock and
 # invokes the repository Python coordinator.
 
@@ -13,8 +13,8 @@ Usage:
 
 This repository runner loads the selected repository root .env and derives
 non-Dropbox state under /Users/mikehinford/uk-aq-history-integrity/state/<ENV>.
-The local dispatcher is a separate deployed file at:
-  /Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity-sos-light-v2.sh
+The local wrapper is a separate deployed file at:
+  /Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity-sos-light-local-wrapper-v2.sh
 
 All options after --env are forwarded unchanged to the Python coordinator.
 USAGE
@@ -99,7 +99,7 @@ ROOT_ENV_FILE="${REPO_ROOT}/.env"
 [[ -f "${ROOT_ENV_FILE}" && -r "${ROOT_ENV_FILE}" ]] || error "repository root .env is unavailable: ${ROOT_ENV_FILE}"
 
 # The repository .env is the established shared environment source. Preserve
-# the dispatcher-provided local root across loading, then reassert all runner
+# the local-wrapper-provided local root across loading, then reassert all runner
 # ownership values below.
 LOCAL_ROOT="${UK_AQ_HISTORY_INTEGRITY_LOCAL_ROOT:-/Users/mikehinford/uk-aq-history-integrity}"
 [[ "${LOCAL_ROOT}" = /* ]] || error "UK_AQ_HISTORY_INTEGRITY_LOCAL_ROOT must be absolute"
@@ -229,8 +229,6 @@ export UK_AQ_HISTORY_INTEGRITY_TMP_DIR="${STATE_DIR}/tmp"
 export UK_AQ_HISTORY_INTEGRITY_LOCK_DIR="${STATE_DIR}/locks"
 export UK_AQ_HISTORY_INTEGRITY_LOG_DIR="${DROPBOX_ROOT}/uk-aq-history-integrity/logs"
 export UK_AQ_HISTORY_INTEGRITY_REPORT_DIR="${DROPBOX_ROOT}/uk-aq-history-integrity/reports"
-export UK_AQ_AQI_GAP_LOG_DIR="${DROPBOX_ROOT}/uk-aq-history-integrity/aqi_gap_check/logs"
-export UK_AQ_AQI_GAP_REPORT_DIR="${DROPBOX_ROOT}/uk-aq-history-integrity/aqi_gap_check/reports"
 export UK_AQ_HISTORY_INTEGRITY_DROPBOX_DB_COPY_PATH="${DROPBOX_ROOT}/uk-aq-history-integrity/uk_aq_history_integrity.sqlite"
 
 R2_ROOT_RAW="${UK_AQ_R2_HISTORY_DROPBOX_ROOT:-}"
@@ -259,9 +257,7 @@ for dir in \
   "${UK_AQ_HISTORY_INTEGRITY_TMP_DIR}" \
   "${UK_AQ_HISTORY_INTEGRITY_LOCK_DIR}" \
   "${UK_AQ_HISTORY_INTEGRITY_LOG_DIR}" \
-  "${UK_AQ_HISTORY_INTEGRITY_REPORT_DIR}" \
-  "${UK_AQ_AQI_GAP_LOG_DIR}" \
-  "${UK_AQ_AQI_GAP_REPORT_DIR}"; do
+  "${UK_AQ_HISTORY_INTEGRITY_REPORT_DIR}"; do
   mkdir -p -- "${dir}"
   [[ -d "${dir}" && -w "${dir}" ]] || error "required runtime directory is unavailable or not writable: ${dir}"
 done

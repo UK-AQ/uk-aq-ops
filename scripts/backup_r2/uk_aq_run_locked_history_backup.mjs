@@ -17,6 +17,10 @@ import {
 import {
   DEFAULT_TIMESERIES_BINDING_BACKUP_PACK_PREFIX,
 } from "./lib/timeseries_binding_backup_pack_v1.mjs";
+import {
+  DEFAULT_OBSERVATION_PARQUET_COPY_MODE,
+  normalizeObservationParquetCopyMode,
+} from "./lib/observation_parquet_reuse.mjs";
 
 function requireValue(argv, index, flag) {
   const value = argv[index + 1];
@@ -33,6 +37,8 @@ export function parseLockedHistoryBackupArgs(argv) {
     corePrefix: null,
     timeseriesBindingPrefix: null,
     timeseriesBindingBackupMode: "individual",
+    observationParquetCopyMode: DEFAULT_OBSERVATION_PARQUET_COPY_MODE,
+    observationParquetCopyModeExplicit: false,
     timeseriesBindingPackPrefix: null,
     historyIndexVersion: null,
     inventoryRootPrefix: null,
@@ -68,6 +74,9 @@ export function parseLockedHistoryBackupArgs(argv) {
       else if (flag === "--timeseries-binding-prefix") args.timeseriesBindingPrefix = value;
       else if (flag === "--timeseries-binding-backup-mode") {
         args.timeseriesBindingBackupMode = normalizeTimeseriesBindingBackupMode(value);
+      } else if (flag === "--observation-parquet-copy-mode") {
+        args.observationParquetCopyMode = normalizeObservationParquetCopyMode(value);
+        args.observationParquetCopyModeExplicit = true;
       } else if (flag === "--timeseries-binding-pack-prefix") {
         args.timeseriesBindingPackPrefix = value;
       }
@@ -230,6 +239,9 @@ export function runLockedHistoryBackup({
     "--inventory-root-prefix", args.inventoryRootPrefix,
     "--state-root-prefix", args.stateRootPrefix,
     "--timeseries-binding-backup-mode", args.timeseriesBindingBackupMode,
+    ...(args.observationParquetCopyModeExplicit
+      ? ["--observation-parquet-copy-mode", args.observationParquetCopyMode]
+      : []),
     "--max-days-per-run", args.maxDaysPerRun,
     "--checkpoint-batch-units", args.checkpointBatchUnits,
     "--checkpoint-flush-seconds", args.checkpointFlushSeconds,
