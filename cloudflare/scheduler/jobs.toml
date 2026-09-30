@@ -48,7 +48,7 @@ notes = "Supabase logical database dumps to Dropbox"
 trigger_mode = "scheduler"
 
 [jobs.uk_aq_r2_core_snapshot]
-enabled = true
+enabled = false
 cron_expr = "15 4 * * *"
 target_type = "github_workflow"
 github_repo = "UK-AQ/uk-aq-ops"
