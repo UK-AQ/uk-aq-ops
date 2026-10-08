@@ -13,6 +13,9 @@
     ["updated_desc", "Recently Updated"],
   ];
   const STATUS_LABELS = { approved: "Approved", pending: "Pending", rejected: "Rejected", hidden: "Hidden" };
+  const POSSIBLE_DUPLICATE_REASON_LABELS = {
+    same_source_exact_title_same_published_at: "Same source, exact publisher title and publication time",
+  };
   const BLUESKY_REASON_LABELS = {
     auto_approved: "Automatically approved",
     pending_approved: "Approved from Pending",
@@ -34,6 +37,7 @@
   const FACEBOOK_PLACEHOLDERS = ["{publisher}"];
   const articleDetailCache = new Map();
   let articleRefreshSequence = 0;
+  let sourceRefreshSequence = 0;
 
   const state = {
     root: null,
@@ -51,10 +55,23 @@
     aiUsage: null,
     aiUsageUnavailable: false,
     batchMessage: "",
+    sourcesVisibility: "non_blocked",
+    sourcesFeedback: "",
+    sourcesRows: [],
+    sourceDomainRows: [],
+    sourceAuthorRules: [],
+    sourcesOffset: 0,
+    sourceDomainsOffset: 0,
     runsKind: "publisher",
     publisherRuns: { rows: null, error: "", loading: false },
     gdeltRuns: { rows: null, error: "", loading: false },
   };
+
+  // Presentation-only: keep a hyphenated term together unless CSS must wrap it.
+  // Do not change stored titles, edit fields, search, or accessible article labels.
+  function displayTitleWrapping(value) {
+    return String(value).replace(/([\p{L}\p{N}])([-\u2010])(?=[\p{L}\p{N}])/gu, "$1$2\u2060");
+  }
 
   function esc(value) {
     return String(value ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;")
@@ -185,6 +202,10 @@
     return `<div class="media-message${kind ? ` media-message--${kind}` : ""}" role="status">${esc(text)}</div>`;
   }
 
+  function possibleDuplicateReasonLabel(reason) {
+    return POSSIBLE_DUPLICATE_REASON_LABELS[reason] || "Strong same-article evidence";
+  }
+
   function graphemeCount(value) {
     const text = String(value ?? "");
     return [...new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(text)].length;
@@ -225,7 +246,11 @@
     });
     if (tab === "articles") void renderArticles(false);
     if (tab === "runs") void renderRuns(true);
-    if (tab === "sources") void renderSources(false);
+    if (tab === "sources") {
+      state.sourcesVisibility = "non_blocked";
+      state.sourcesFeedback = "";
+      void renderSources();
+    }
   }
 
   function checkedFilter(group, value) {
@@ -414,7 +439,7 @@
     const homepagePublished = formatPublicationDate(article.published_at);
     const homepageSourceRow = `${esc(article.publisher)}<span data-homepage-preview-date>${homepagePublished ? ` · ${esc(homepagePublished)}` : ""}</span>`;
     const externalLinkIcon = `<svg class="media-homepage-mobile-preview__icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M14 5h5v5M19 5l-9 9M18 13v5a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
-    return `<section class="media-review" data-ai-id="${article.id}" data-publisher-title="${esc(article.title)}" data-ai-published="${published ? "true" : "false"}"><div class="media-review__layout"><div class="media-preview-stack"><div class="media-site-preview-wrap"><div class="media-site-preview" aria-label="Website image article card preview"><span class="media-site-preview__fallback">No permitted preview</span>${image}<div class="media-site-preview__gradient" aria-hidden="true"></div><div class="media-site-preview__overlay"><div class="media-site-preview__source-row">${sourceRow}</div><div class="media-site-preview__title" data-ai-preview-title>${esc(currentTitle)}</div></div></div></div><div class="media-homepage-mobile-preview-wrap"><div class="media-homepage-mobile-preview__label">Homepage mobile · 360px</div><div class="media-homepage-mobile-preview" aria-label="Homepage non-image article card at a 360 pixel viewport"><div class="media-homepage-mobile-preview__container"><div class="media-homepage-mobile-preview__card">${externalLinkIcon}<p class="media-homepage-mobile-preview__source">${homepageSourceRow}</p><h5 class="media-homepage-mobile-preview__headline"><span data-ai-preview-title>${esc(currentTitle)}</span></h5></div></div></div></div></div><div class="media-review__controls"><span class="media-subtext">${provenance}</span><div class="media-review__titles"><div class="media-review__title"><span>Publisher original</span>${esc(article.title)}</div><div class="media-review__title"><span>Current display title</span>${esc(currentTitle)}</div><div class="media-review__title"><span>Title origin / status</span>${esc(article.display_title_origin || "original")} · ${esc(titleStatus(article)[1])}</div><div class="media-review__title"><span>${esc(aiSuggestionLabel(article))}</span>${esc(article.ai_title_suggestion || "—")}</div></div><div class="media-actions"><button class="media-button" data-ai-action="generate">${generateLabel}</button>${pendingActions}<label class="media-field media-field--grow"><span>Edit as human title</span><input data-ai-edit value="${esc(article.display_title || "")}" maxlength="500"></label><button class="media-button" data-ai-action="edit">Save human title</button>${article.display_title ? `<button class="media-button" data-ai-action="clear">Clear display title</button>` : ""}</div><div data-ai-message>${savedMessage ? message(savedMessage.text, savedMessage.kind) : ""}</div></div></div></section>`;
+    return `<section class="media-review" data-ai-id="${article.id}" data-publisher-title="${esc(article.title)}" data-ai-published="${published ? "true" : "false"}"><div class="media-review__layout"><div class="media-preview-stack"><div class="media-site-preview-wrap"><div class="media-site-preview" aria-label="Website image article card preview"><span class="media-site-preview__fallback">No permitted preview</span>${image}<div class="media-site-preview__gradient" aria-hidden="true"></div><div class="media-site-preview__overlay"><div class="media-site-preview__source-row">${sourceRow}</div><div class="media-site-preview__title" data-ai-preview-title>${esc(displayTitleWrapping(currentTitle))}</div></div></div></div><div class="media-homepage-mobile-preview-wrap"><div class="media-homepage-mobile-preview__label">Homepage mobile · 360px</div><div class="media-homepage-mobile-preview" aria-label="Homepage non-image article card at a 360 pixel viewport"><div class="media-homepage-mobile-preview__container"><div class="media-homepage-mobile-preview__card">${externalLinkIcon}<p class="media-homepage-mobile-preview__source">${homepageSourceRow}</p><h5 class="media-homepage-mobile-preview__headline"><span data-ai-preview-title>${esc(displayTitleWrapping(currentTitle))}</span></h5></div></div></div></div></div><div class="media-review__controls"><span class="media-subtext">${provenance}</span><div class="media-review__titles"><div class="media-review__title"><span>Publisher original</span>${esc(article.title)}</div><div class="media-review__title"><span>Current display title</span>${esc(currentTitle)}</div><div class="media-review__title"><span>Title origin / status</span>${esc(article.display_title_origin || "original")} · ${esc(titleStatus(article)[1])}</div><div class="media-review__title"><span>${esc(aiSuggestionLabel(article))}</span>${esc(article.ai_title_suggestion || "—")}</div></div><div class="media-actions"><button class="media-button" data-ai-action="generate">${generateLabel}</button>${pendingActions}<label class="media-field media-field--grow"><span>Edit as human title</span><input data-ai-edit value="${esc(article.display_title || "")}" maxlength="500"></label><button class="media-button" data-ai-action="edit">Save human title</button>${article.display_title ? `<button class="media-button" data-ai-action="clear">Clear display title</button>` : ""}</div><div data-ai-message>${savedMessage ? message(savedMessage.text, savedMessage.kind) : ""}</div></div></div></section>`;
   }
 
   function articleRow(article) {
@@ -426,8 +451,11 @@
       ? `<img class="media-thumb" loading="lazy" src="${esc(imageUrl)}" alt="" data-media-thumb>`
       : `<span class="media-thumb-fallback">No image</span>`;
     const imageState = articleImageState(article);
+    const possibleDuplicate = Number(article.possible_duplicate_active) === 1
+      ? `<span class="media-possible-duplicate">Possible duplicate</span><span class="media-subtext">${esc(possibleDuplicateReasonLabel(article.possible_duplicate_reason_code))}</span>`
+      : "";
     return `<tr data-article-id="${article.id}"><td class="media-select-cell"><input type="checkbox" data-select-article aria-label="Select ${esc(title)}"${state.selectedArticleIds.has(String(article.id)) ? " checked" : ""}></td><td>${thumb}<span class="media-image-state media-image-state--${esc(imageState[0])}">${esc(imageState[1])}</span></td>
-      <td class="media-title-cell"><button type="button" class="media-title-button" data-open-article>${esc(title)}</button>${article.display_title ? `<span class="media-subtext">Original: ${esc(article.title)}</span>` : ""}</td>
+      <td class="media-title-cell"><button type="button" class="media-title-button" data-open-article>${esc(displayTitleWrapping(title))}</button>${article.display_title ? `<span class="media-subtext">Original: ${esc(article.title)}</span>` : ""}${possibleDuplicate}</td>
       <td>${esc(article.publisher)}</td><td>${esc(article.author || "—")}</td>
       <td>${esc(formatPublishedDateTime(article.published_at, false))}</td><td>${esc(formatUtcDateTime(article.approved_at, false))}</td>
       <td><span class="media-title-status media-title-status--${esc(titleState)}">${esc(titleLabel)}</span><button type="button" class="media-ai-disclosure" data-toggle-ai aria-expanded="${isExpanded}">${isExpanded ? "▴ Title" : "▾ Title"}</button></td><td>${statusControl(article)}</td></tr>${isExpanded ? `<tr class="media-ai-expanded"><td colspan="9">${inlineAiReview(article)}</td></tr>` : ""}`;
@@ -930,11 +958,27 @@
   }
 
   function blueskyState(data, article) {
-    return { ...(article || {}), ...(article?.bluesky || {}), ...(data?.bluesky || {}) };
+    const social = { ...(article || {}), ...(article?.bluesky || {}), ...(data?.bluesky || {}) };
+    if ((social.publications || []).some(item => item.publication_reason === "auto_approved"
+      && item.status === "blocked" && item.last_error_code === "thumbnail_pending")) {
+      social.direct_publish_available = false;
+      social.direct_publish_unavailable_reason = "publication_in_progress";
+      social.manual_post_available = false;
+      social.manual_post_unavailable_reason = "publication_in_progress";
+    }
+    return social;
   }
 
   function blueskyReasonLabel(reason) {
     return BLUESKY_REASON_LABELS[reason] || reason || "—";
+  }
+
+  function blueskyStatusLabel(item) {
+    const error = item.last_error_code || item.error_code;
+    if (item.status === "blocked" && error === "thumbnail_pending") return "Waiting for thumbnail";
+    if (item.status === "blocked" && error === "operator_cancelled") return "Cancelled";
+    return item.status_label || ({ queued: "Queued", posting: "Posting", posted: "Posted",
+      failed: "Failed", blocked: "Blocked" })[item.status] || item.status || "—";
   }
 
   function blueskyHistoryHtml(data, article) {
@@ -943,9 +987,14 @@
       const href = item.post_url || (String(item.post_uri || "").startsWith("https://") ? item.post_uri : "");
       const post = href ? `<a href="${esc(href)}" target="_blank" rel="noopener noreferrer">Open post ↗</a>` : esc(item.post_uri || "—");
       const reason = blueskyReasonLabel(item.publication_reason);
-      return `<tr><td>${esc(item.status || "—")}</td><td>${esc(reason)}</td><td>${esc(formatUtcDateTime(item.posted_at || item.updated_at || item.created_at))}</td><td>${esc(item.last_error_code || item.error_code || "—")}</td><td>${post}</td></tr>`;
+      const error = item.last_error_code || item.error_code;
+      const detail = error === "thumbnail_pending" ? "Awaiting an eligible thumbnail"
+        : error === "operator_cancelled" ? "Cancelled by operator" : error || "—";
+      return `<tr><td>${esc(blueskyStatusLabel(item))}</td><td>${esc(reason)}</td><td>${esc(formatUtcDateTime(item.posted_at || item.updated_at || item.created_at))}</td><td>${esc(detail)}</td><td>${post}</td></tr>`;
     }).join("");
-    return `<section><h4>Bluesky publication</h4><div class="media-stats"><div class="media-stat"><strong>${esc(bluesky.post_count ?? 0)}</strong><span>Successful posts</span></div><div class="media-stat"><strong>${esc(bluesky.publication_count ?? publications.length)}</strong><span>Publication requests</span></div><div class="media-stat"><strong>${esc(bluesky.latest_status || "—")}</strong><span>Latest status</span></div></div>${rows ? `<div class="media-table-wrap"><table class="media-table media-table--bluesky"><thead><tr><th>Status</th><th>Reason</th><th>Relevant time</th><th>Error code</th><th>Post</th></tr></thead><tbody>${rows}</tbody></table></div>` : `<p class="media-subtext">No Bluesky publication history.</p>`}</section>`;
+    const latestStatus = bluesky.latest_status_label || blueskyStatusLabel(publications[0] || {
+      status: bluesky.latest_status, last_error_code: bluesky.latest_error_code });
+    return `<section><h4>Bluesky publication</h4><div class="media-stats"><div class="media-stat"><strong>${esc(bluesky.post_count ?? 0)}</strong><span>Successful posts</span></div><div class="media-stat"><strong>${esc(bluesky.publication_count ?? publications.length)}</strong><span>Publication requests</span></div><div class="media-stat"><strong>${esc(latestStatus)}</strong><span>Latest status</span></div></div>${rows ? `<div class="media-table-wrap"><table class="media-table media-table--bluesky"><thead><tr><th>Status</th><th>Reason</th><th>Relevant time</th><th>Details</th><th>Post</th></tr></thead><tbody>${rows}</tbody></table></div>` : `<p class="media-subtext">No Bluesky publication history.</p>`}</section>`;
   }
 
   function facebookState(data, article) {
@@ -957,7 +1006,9 @@
   function directPublishUnavailableMessage(platform, reason) {
     const messages = {
       thumbnail_missing: "Bluesky posting unavailable because no eligible thumbnail is available.",
-      publication_in_progress: "A publication is already queued or in progress.",
+      publication_in_progress: platform === "Bluesky"
+        ? "A Bluesky publication is already waiting for a thumbnail, queued or in progress."
+        : "A publication is already queued or in progress.",
       unknown_remote_state: "Facebook publication state is unknown and is being held to prevent a possible duplicate post.",
       facebook_publishing_disabled: "Facebook publishing is disabled.",
       article_not_approved: "Direct publishing is only available for Approved articles.",
@@ -1008,7 +1059,7 @@
     if (article.status === "approved") return "";
     if (bluesky.manual_post_available === true) return `<label class="media-toggle" data-manual-bluesky><input type="checkbox"> <span>Post to Bluesky @ukaq.co.uk</span></label>${bluesky.manual_post_reason ? `<p class="media-subtext">Reason: ${esc(blueskyReasonLabel(bluesky.manual_post_reason))}</p>` : ""}`;
     const reason = bluesky.manual_post_unavailable_reason || bluesky.manual_post_reason;
-    return reason ? `<p class="media-message">Bluesky posting unavailable: ${esc(blueskyReasonLabel(reason))}</p>` : "";
+    return reason ? `<p class="media-message">${esc(directPublishUnavailableMessage("Bluesky", reason))}</p>` : "";
   }
 
   function manualFacebookHtml(article) {
@@ -1027,6 +1078,17 @@
     const retainedWarning = article.image_policy === "local_copy_permitted"
       ? `<div class="media-message">Changing away from local_copy_permitted makes any retained image immediately ineligible for delivery and Bluesky. The R2 object is not automatically deleted.</div>` : "";
     return `<section><h4>Image policy</h4><p>Article: <strong>${esc(article.image_policy)}</strong> · Source: <strong>${esc(article.source_image_policy)}</strong></p>${retainedWarning}<form class="media-inline-form" data-article-image-policy><label class="media-field"><span>Article image policy</span><select name="image_policy"><option value="blocked"${article.image_policy === "blocked" ? " selected" : ""}>blocked</option><option value="remote_preview"${article.image_policy === "remote_preview" ? " selected" : ""}>remote_preview</option><option value="local_copy_permitted"${article.image_policy === "local_copy_permitted" ? " selected" : ""}${sourceAllowsLocalCopy ? "" : " disabled"}>local_copy_permitted</option></select></label><label class="media-toggle"><input name="confirm_local_copy_permitted" type="checkbox"> <span>I explicitly confirm that the recorded permission, licence or other right permits this article’s image to be retained locally.</span></label><button type="submit" class="media-button media-button--primary">Save image policy</button></form><p class="media-subtext">A retained image can be uploaded only after both source and article policies are local_copy_permitted.</p><div data-article-image-policy-message></div></section>`;
+  }
+
+  function possibleDuplicateDetailHtml(possibleDuplicate) {
+    if (!possibleDuplicate?.candidate) return "";
+    const candidate = possibleDuplicate.candidate;
+    const stateLabel = possibleDuplicate.active
+      ? `<span class="media-possible-duplicate">Active hold</span>`
+      : `<span class="media-possible-duplicate media-possible-duplicate--resolved">Resolved ${esc(possibleDuplicate.resolution || "")}</span>`;
+    const resolution = possibleDuplicate.active ? ""
+      : `<p class="media-subtext">Resolved ${esc(formatUtcDateTime(possibleDuplicate.resolved_at))}. Evidence is retained for audit.</p>`;
+    return `<section class="media-possible-duplicate-detail"><h4>Possible duplicate ${stateLabel}</h4><p>${esc(possibleDuplicateReasonLabel(possibleDuplicate.reason_code))}</p><dl><dt>Candidate title</dt><dd>${esc(candidate.title || "—")}</dd><dt>Candidate URL</dt><dd>${candidate.canonical_url ? `<a href="${esc(candidate.canonical_url)}" target="_blank" rel="noopener noreferrer">${esc(candidate.canonical_url)} ↗</a>` : "—"}</dd><dt>Candidate status</dt><dd>${esc(STATUS_LABELS[candidate.status] || candidate.status || "—")}</dd><dt>Candidate published</dt><dd>${esc(formatPublishedDateTime(candidate.published_at))}</dd><dt>Candidate author</dt><dd>${esc(candidate.author || "—")}</dd></dl>${possibleDuplicate.active ? `<p class="media-subtext">Automatic approval is held. Approve or reject only through the normal Article Status control after review; social posting remains an explicit manual choice.</p>` : resolution}</section>`;
   }
 
   async function openArticle(id, notice = "", selectedStatus = "") {
@@ -1050,6 +1112,7 @@
         <div class="media-detail__grid"><div>${article.admin_preview_image_path && imageUrl ? `<img class="media-detail__preview" src="${esc(imageUrl)}" alt="">` : `<div class="media-thumb-fallback media-detail__preview">No permitted preview</div>`}<span class="media-image-state media-image-state--${esc(imageState[0])}">${esc(imageState[1])}</span></div>
         <dl><dt>Original title</dt><dd>${esc(article.title)}</dd><dt>Display title</dt><dd>${esc(article.display_title || "Publisher original")}</dd><dt>Title Status</dt><dd>${esc(titleStatus(article)[1])}</dd><dt>Title origin</dt><dd>${esc(article.display_title_origin || "original")}</dd><dt>${esc(aiSuggestionLabel(article))}</dt><dd>${esc(article.ai_title_suggestion || "—")}</dd><dt>Canonical URL</dt><dd><a href="${esc(article.canonical_url)}" target="_blank" rel="noopener noreferrer">Open publisher ↗</a></dd><dt>Author</dt><dd>${esc(article.author || "—")}</dd><dt>Published</dt><dd>${esc(formatPublishedDateTime(article.published_at))}</dd><dt>Discovered</dt><dd>${esc(formatUtcDateTime(article.discovered_at))}</dd><dt>Approved</dt><dd>${esc(formatUtcDateTime(article.approved_at))}</dd><dt>Updated</dt><dd>${esc(formatUtcDateTime(article.updated_at))}</dd><dt>Approval</dt><dd>${esc(article.approval_method || "—")}${article.approval_author_rule_key ? ` · ${esc(article.approval_author_rule_key)}` : ""}</dd></dl></div>
         <section><h4>Article Status</h4><div class="media-inline-form" data-detail-status><label class="media-field"><span>Change to</span><select><option value="">Choose status…</option>${(STATUS_ACTIONS[article.status] || []).map(([next, label, action]) => `<option value="${next}" data-action="${action}">${esc(label)}</option>`).join("")}</select></label><button type="button" class="media-save-state" disabled aria-label="Saved/current" title="Saved/current">💾</button></div><div class="media-social-options" data-manual-social hidden><div>${manualBlueskyHtml(article, data)}</div><div>${manualFacebookHtml(article)}</div></div><div data-detail-status-message></div></section>
+        ${possibleDuplicateDetailHtml(data.possible_duplicate)}
         ${directPublishHtml(data, article)}
         ${blueskyHistoryHtml(data, article)}
         ${facebookHistoryHtml(data, article)}
@@ -1415,7 +1478,7 @@
     state.root.querySelectorAll("[data-ai-edit]").forEach(input => input.addEventListener("input", () => {
       const row = input.closest("[data-ai-id]");
       const title = input.value.trim() || row?.dataset.publisherTitle || "";
-      row?.querySelectorAll("[data-ai-preview-title]").forEach(preview => { preview.textContent = title; });
+      row?.querySelectorAll("[data-ai-preview-title]").forEach(preview => { preview.textContent = displayTitleWrapping(title); });
     }));
     state.root.querySelectorAll("[data-ai-preview-image]").forEach(image => image.addEventListener("error", () => image.remove(), { once: true }));
     state.root.querySelectorAll("[data-ai-action]").forEach(button => button.addEventListener("click", async () => {
@@ -1467,7 +1530,7 @@
   }
 
   function gdeltRunsTable(rows) {
-    return `<div class="media-table-wrap"><table class="media-table media-table--gdelt"><thead><tr><th>Started<br>UTC</th><th>Duration</th><th>Status</th><th>Window</th><th>Completed<br>through</th><th>Pairs<br>processed</th><th>Pairs<br>replayed</th><th>Missing<br>minutes</th><th>Matches</th><th>Candidates<br>inserted</th><th>Candidates<br>updated</th><th>UK<br>candidates</th><th>UK<br>promoted</th><th>Malformed</th><th>Diagnostics</th></tr></thead><tbody>${rows.length ? rows.map(run => `<tr><td>${esc(formatUtcDateTime(run.started_at, false))}</td><td>${esc(duration(run.started_at, run.finished_at))}</td><td>${esc(run.status)}</td><td class="media-gdelt-window">${esc(formatGdeltMinute(run.window_start))} →<br>${esc(formatGdeltMinute(run.window_end))}</td><td>${esc(formatGdeltMinute(run.completed_through))}</td><td>${esc(run.complete_pairs_processed)}</td><td>${esc(run.complete_pairs_replayed)}</td><td>${esc(run.missing_minutes)}</td><td>${esc(run.matches_seen)}</td><td>${esc(run.candidates_inserted)}</td><td>${esc(run.candidates_updated)}</td><td>${esc(run.candidates_uk)}</td><td>${esc(run.uk_promoted)}</td><td>${esc(run.malformed_rows)}</td><td>${run.error_code ? `<details><summary>${esc(run.error_code)} · stored run evidence</summary><pre>${esc(JSON.stringify(run, null, 2))}</pre></details>` : "—"}</td></tr>`).join("") : `<tr><td colspan="15" class="media-empty">No GDELT runs found.</td></tr>`}</tbody></table></div>`;
+    return `<div class="media-table-wrap"><table class="media-table media-table--gdelt"><thead><tr><th>Started<br>UTC</th><th>Duration</th><th>Status</th><th>Window</th><th>Completed<br>through</th><th>Pairs<br>processed</th><th>Pairs<br>replayed</th><th>Missing<br>minutes</th><th>Matches</th><th>Candidates<br>inserted</th><th>Candidates<br>updated</th><th>UK<br>candidates</th><th>UK<br>promoted</th><th>Blocked<br>skipped</th><th>Malformed</th><th>Diagnostics</th></tr></thead><tbody>${rows.length ? rows.map(run => `<tr><td>${esc(formatUtcDateTime(run.started_at, false))}</td><td>${esc(duration(run.started_at, run.finished_at))}</td><td>${esc(run.status)}</td><td class="media-gdelt-window">${esc(formatGdeltMinute(run.window_start))} →<br>${esc(formatGdeltMinute(run.window_end))}</td><td>${esc(formatGdeltMinute(run.completed_through))}</td><td>${esc(run.complete_pairs_processed)}</td><td>${esc(run.complete_pairs_replayed)}</td><td>${esc(run.missing_minutes)}</td><td>${esc(run.matches_seen)}</td><td>${esc(run.candidates_inserted)}</td><td>${esc(run.candidates_updated)}</td><td>${esc(run.candidates_uk)}</td><td>${esc(run.uk_promoted)}</td><td>${esc(run.blocked_skipped ?? 0)}</td><td>${esc(run.malformed_rows)}</td><td>${run.error_code ? `<details><summary>${esc(run.error_code)} · stored run evidence</summary><pre>${esc(JSON.stringify(run, null, 2))}</pre></details>` : "—"}</td></tr>`).join("") : `<tr><td colspan="16" class="media-empty">No GDELT runs found.</td></tr>`}</tbody></table></div>`;
   }
 
   function renderRunsView() {
@@ -1506,14 +1569,83 @@
     }
   }
 
-  async function renderSources() {
-    setView(`<section class="media-card"><div class="media-loading">Loading Sources…</div></section>`);
+  async function renderSources(append = false) {
+    const sequence = ++sourceRefreshSequence;
+    const visibility = state.sourcesVisibility;
+    if (!append) {
+      state.sourcesRows = []; state.sourceDomainRows = []; state.sourceAuthorRules = [];
+      state.sourcesOffset = 0; state.sourceDomainsOffset = 0;
+    }
+    setView(`<section class="media-card">${state.sourcesFeedback ? message(state.sourcesFeedback, "success") : ""}<div class="media-loading">Loading Sources…</div></section>`);
     try {
-      const data = await request("sources");
-      const rulesBySource = new Map(); (data.author_rules || []).forEach(rule => { const group = rulesBySource.get(rule.source_key) || []; group.push(rule); rulesBySource.set(rule.source_key, group); });
-      setView(`<section class="media-card"><div class="media-toolbar"><div><h3>Sources</h3><p>Publication and author-rule changes apply to future discovery. Image-policy revocation takes effect immediately.</p></div><button class="media-button media-button--primary" data-toggle-add-source>+ Add Source</button></div><div data-add-source></div><div class="media-source-list">${(data.sources || []).map(source => sourceCard(source, rulesBySource.get(source.source_key) || [])).join("") || `<div class="media-empty">No Media sources found.</div>`}</div></section>`);
+      const data = await request("sources", { params: new URLSearchParams({ visibility,
+        offset: String(state.sourcesOffset), domain_offset: String(state.sourceDomainsOffset) }) });
+      if (sequence !== sourceRefreshSequence || state.tab !== "sources") return;
+      state.sourcesRows.push(...(data.sources || []));
+      state.sourceDomainRows.push(...(data.domain_blocks || []));
+      const rules = new Map(state.sourceAuthorRules.map(rule => [rule.author_key, rule]));
+      (data.author_rules || []).forEach(rule => rules.set(rule.author_key, rule));
+      state.sourceAuthorRules = [...rules.values()];
+      state.sourcesOffset = data.next_offset;
+      state.sourceDomainsOffset = data.next_domain_offset;
+      const rulesBySource = new Map(); state.sourceAuthorRules.forEach(rule => { const group = rulesBySource.get(rule.source_key) || []; group.push(rule); rulesBySource.set(rule.source_key, group); });
+      setView(`<section class="media-card"><div class="media-toolbar"><div><h3>Sources</h3><p>Publication and author-rule changes apply to future discovery. Image-policy revocation takes effect immediately.</p></div><label class="media-source-visibility">Show: <select data-source-visibility aria-label="Source visibility">${[["non_blocked", "Non-blocked"], ["blocked", "Blocked"], ["all", "All"]].map(([value, label]) => `<option value="${value}"${visibility === value ? " selected" : ""}>${label}</option>`).join("")}</select></label><button class="media-button media-button--primary" data-toggle-add-source>+ Add Source</button></div>
+        <div role="status">${state.sourcesFeedback ? message(state.sourcesFeedback, "success") : ""}</div><div data-add-source></div>
+        <details class="media-domain-add"><summary>Block a publisher domain</summary><form class="media-inline-form" data-block-domain-form><label class="media-field"><span>Domain</span><input name="domain" required maxlength="254" placeholder="publisher.co.uk"></label><label class="media-field media-field--grow"><span>Reason (optional)</span><input name="reason" maxlength="1000"></label><button class="media-button" type="submit">Block domain</button></form><div data-domain-add-message></div></details>
+        <div class="media-source-list">${state.sourcesRows.map(source => sourceCard(source, rulesBySource.get(source.source_key) || [])).join("")}${state.sourceDomainRows.map(domainBlockCard).join("")}${!state.sourcesRows.length && !state.sourceDomainRows.length ? `<div class="media-empty">No matching sources or domain decisions.</div>` : ""}</div>${data.has_more ? `<button class="media-button" data-more-sources>Load more</button>` : ""}</section>`);
       bindSourceActions();
-    } catch (error) { setView(`<section class="media-card"><h3>Sources</h3>${message(error.message, "error")}</section>`); }
+      state.root.querySelector("[data-source-visibility]")?.addEventListener("change", event => {
+        state.sourcesVisibility = event.target.value; state.sourcesFeedback = ""; void renderSources();
+      });
+      state.root.querySelector("[data-more-sources]")?.addEventListener("click", () => void renderSources(true));
+      state.root.querySelectorAll("[data-domain-action]").forEach(button => button.addEventListener("click", () => void saveDomainBlock(button)));
+      state.root.querySelector("[data-block-domain-form]")?.addEventListener("submit", event => {
+        event.preventDefault(); void addDomainBlock(event.currentTarget);
+      });
+    } catch (error) {
+      if (sequence === sourceRefreshSequence && state.tab === "sources") {
+        setView(`<section class="media-card"><h3>Sources</h3>${state.sourcesFeedback ? message(state.sourcesFeedback, "success") : ""}${message(error.message, "error")}<button class="media-button" data-retry-sources>Refresh Sources</button></section>`);
+        state.root.querySelector("[data-retry-sources]")?.addEventListener("click", () => void renderSources());
+      }
+    }
+  }
+
+  function domainBlockControls(domain, blocked, reason) {
+    return `<section class="media-domain-controls"><h4>Publisher domain</h4><p><strong>${blocked ? "Blocked" : "Not blocked"}</strong> · ${esc(domain)}</p><div class="media-inline-form"><label class="media-field media-field--grow"><span>Reason (optional)</span><input data-domain-reason maxlength="1000" value="${esc(reason || "")}"></label><button class="media-button" data-domain-action="${blocked ? "unblock" : "block"}" data-domain="${esc(domain)}">${blocked ? "Unblock" : "Block"}</button></div><div data-domain-message></div></section>`;
+  }
+
+  function domainBlockCard(block) {
+    return `<details class="media-source"><summary>${esc(block.domain)} · No source definition · ${block.blocked ? "Blocked" : "Not blocked"}</summary>${domainBlockControls(block.domain, block.blocked, block.reason)}</details>`;
+  }
+
+  async function saveDomainBlock(button) {
+    const controls = button.closest(".media-domain-controls");
+    const output = controls.querySelector("[data-domain-message]");
+    const blocked = button.dataset.domainAction === "block";
+    const domain = button.dataset.domain;
+    button.disabled = true;
+    try {
+      const result = await request("source-domain-blocks", { method: "PUT", idempotent: "domain_block",
+        body: { domain, blocked, reason: controls.querySelector("[data-domain-reason]").value.trim() } });
+      state.sourcesFeedback = `${result.domain_block.domain} ${result.domain_block.blocked ? "blocked" : "unblocked"}. Sources refreshed; the domain may move out of this view. Saved source policies and historical articles are preserved.`;
+      await renderSources();
+    } catch (error) { button.disabled = false; output.innerHTML = message(error.message, "error"); }
+  }
+
+  async function addDomainBlock(form) {
+    const values = new FormData(form);
+    const button = form.querySelector("button");
+    button.disabled = true;
+    try {
+      const result = await request("source-domain-blocks", { method: "PUT", idempotent: "domain_block",
+        body: { domain: String(values.get("domain") || "").trim(), blocked: true,
+          reason: String(values.get("reason") || "").trim() } });
+      state.sourcesFeedback = `${result.domain_block.domain} blocked. Use the Blocked or All view to inspect it.`;
+      await renderSources();
+    } catch (error) {
+      button.disabled = false;
+      form.parentElement.querySelector("[data-domain-add-message]").innerHTML = message(error.message, "error");
+    }
   }
 
   function sourceImagePolicyHtml(source) {
@@ -1524,12 +1656,19 @@
 
   function sourceCard(source, rules) {
     let config = source.discovery_config_json; try { config = JSON.stringify(JSON.parse(config), null, 2); } catch (_error) {}
-    return `<details class="media-source${source.enabled ? "" : " media-danger-zone"}" data-source-key="${esc(source.source_key)}" data-current-image-policy="${esc(source.image_policy)}"><summary>${esc(source.name)} · ${source.enabled ? "Enabled" : "Disabled"} · ${esc(source.publication_policy)}</summary><div class="media-source__grid">
+    const domains = source.publisher_domains || [{ domain: source.canonical_domain,
+      blocked: source.domain_blocked, block_domain: source.domain_block_domain,
+      reason: source.domain_block_reason }];
+    const blockedCount = domains.filter(domain => domain.blocked).length;
+    const domainStatus = blockedCount === domains.length ? "Blocked" : blockedCount ? "Some domains blocked" : "Not blocked";
+    return `<details class="media-source${source.enabled ? "" : " media-danger-zone"}" data-source-key="${esc(source.source_key)}" data-current-image-policy="${esc(source.image_policy)}"><summary>${esc(source.name)} · ${source.enabled ? "Enabled" : "Disabled"} · ${domainStatus} · ${esc(source.publication_policy)}</summary><div class="media-source__grid">
       ${[["Canonical domain", source.canonical_domain], ["Source type", source.source_type], ["Discovery adapter", source.discovery_method], ["Review level", source.review_level], ["Content fetch", source.content_fetch_policy], ["AI content", source.ai_content_policy], ["Image policy", source.image_policy], ["Recent run", source.recent_run_status ? `${source.recent_run_status} · ${formatUtcDateTime(source.recent_run_started_at)}` : "No run"]].map(([label, value]) => `<div><span class="media-subtext">${label}</span>${esc(value)}</div>`).join("")}
       <label class="media-field"><span>Publication policy</span><select data-source-policy><option value="manual"${source.publication_policy === "manual" ? " selected" : ""}>manual</option><option value="auto_approve"${source.publication_policy === "auto_approve" ? " selected" : ""}>auto_approve</option></select></label>
       <label class="media-field"><span>Enabled</span><select data-source-enabled><option value="false"${!source.enabled ? " selected" : ""}>No</option><option value="true"${source.enabled ? " selected" : ""}>Yes</option></select></label>
       <button class="media-button media-button--primary" data-save-source>Save source policy</button></div>
       <details><summary>Bounded route/configuration</summary><pre>${esc(config)}</pre></details><div data-source-message></div>
+      ${domains.length > 1 ? `<p>Each publisher domain has its own decision. Unblocked alternatives remain eligible; a partly blocked source appears in both visibility views.</p>` : ""}
+      ${domains.map(domain => domainBlockControls(domain.block_domain || domain.domain, domain.blocked, domain.reason)).join("")}
       ${sourceImagePolicyHtml(source)}
       <div class="media-author-rules"><div class="media-toolbar"><h4>Author rules</h4>${source.source_key === "the-guardian" ? `<button class="media-button" data-add-author>+ Add author rule</button>` : ""}</div><div data-add-author-form></div>
       ${rules.length ? rules.map(authorRuleRow).join("") : `<p>No author rules.</p>`}</div></details>`;
