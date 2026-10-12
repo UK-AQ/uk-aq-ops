@@ -4,6 +4,7 @@ import {
   computeObservationContentHash,
   normalizeCanonicalObservationRow,
   resolveLegacyVerificationStatus,
+  selectObservationVerificationStatusColumn,
 } from "../../../workers/shared/uk_aq_observation_content_hash.mjs";
 import {
   compressors,
@@ -11,6 +12,7 @@ import {
   parquetRead,
   parquetSchema,
 } from "./uk_aq_parquet_dependencies.mjs";
+import { observationHistoryPhysicalSchemaForColumns } from "../../../workers/shared/uk_aq_observation_history_schema.mjs";
 
 function parquetIso(value) {
   const parsed = value instanceof Date ? value : new Date(value);
@@ -36,6 +38,7 @@ export async function inspectObservationParquetFile({ filePath, connectorId }) {
   const physicalColumns = parquetSchema(metadata).children.map((column) =>
     String(column.element.name)
   );
+  observationHistoryPhysicalSchemaForColumns(physicalColumns);
   const schemaColumns = new Set(physicalColumns);
   const required = [
     "connector_id",
@@ -51,11 +54,7 @@ export async function inspectObservationParquetFile({ filePath, connectorId }) {
       `Observation Parquet is missing canonical columns: ${missing.join(",")}`,
     );
   }
-  const statusColumn = schemaColumns.has("verification_status")
-    ? "verification_status"
-    : schemaColumns.has("status")
-    ? "status"
-    : null;
+  const statusColumn = selectObservationVerificationStatusColumn(schemaColumns);
   const columns = [...required, ...(statusColumn ? [statusColumn] : [])];
   let rows = [];
   await parquetRead({

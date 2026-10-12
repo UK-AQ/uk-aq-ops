@@ -6,10 +6,12 @@ import {
   hasRequiredR2Config,
   r2DeleteObjects,
   r2GetObject,
+  r2HeadObject,
   r2ListAllObjects,
   r2PutObject,
   sha256Hex,
 } from "../../workers/shared/r2_sigv4.mjs";
+import { verifyR2StoredSha256Head } from "../../workers/shared/uk_aq_r2_checksum_publication.mjs";
 import {
   computeEmptyObservationContentHash,
   computeObservationContentHash,
@@ -60,6 +62,13 @@ import {
 import {
   requireSosLightV2CoordinatorFreeze,
 } from "./lib/sos_light_v2_coordinator_validation.mjs";
+import {
+  requirePinnedSosLightConnectorGate,
+} from "./lib/sos_light_unreferenced_connector_gate.mjs";
+import {
+  FIXED_V2_SOS_LIGHT_RECOVERY_STATE_ENV,
+  markR2MutationStarted,
+} from "../operations/lib/uk_aq_sos_light_v2_lock_recovery.mjs";
 
 function parseArgs(argv) {
   const args = { runStateJson: "", writeR2: false };
@@ -1016,20 +1025,26 @@ export function createVerifiedGetBodyCache({
 
 const OBSERVATION_INTEGRITY_POLLUTANTS = new Set(["pm25", "pm10", "no2", "o3"]);
 const CANONICAL_CONNECTOR_DAY_PREFIX_PATTERNS = Object.freeze([
-  /^history\/v2\/observations\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)$/,
+  /^history\/v(?:2|3)\/observations\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)$/,
 ]);
 const CANONICAL_OBSERVATION_POLLUTANT_PREFIX_PATTERN =
-  /^history\/v2\/observations\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)$/;
+  /^history\/v(?:2|3)\/observations\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)$/;
 const CANONICAL_OBSERVATION_DAY_PREFIX_PATTERN =
-  /^history\/v2\/observations\/day_utc=(\d{4}-\d{2}-\d{2})$/;
+  /^history\/v(?:2|3)\/observations\/day_utc=(\d{4}-\d{2}-\d{2})$/;
 const CANONICAL_OBSERVATION_POLLUTANT_MANIFEST_PATTERN =
   /^history\/v(?:2|3)\/observations\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)\/manifest\.json$/;
+const GENERIC_V2_EMPTY_METADATA_KEY =
+  /^(?:history\/v2\/observations\/day_utc=(\d{4}-\d{2}-\d{2})(?:\/connector_id=([1-9]\d*))?|history\/_index_v2\/observations_timeseries\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=(pm25|pm10|no2|o3))\/manifest\.json$/;
 
-function validateDeletionDayConnector({ prefix, dayUtc, connectorIdRaw }) {
+function validateDeletionDay({ prefix, dayUtc }) {
   const parsedDay = new Date(`${dayUtc}T00:00:00.000Z`);
   if (Number.isNaN(parsedDay.getTime()) || parsedDay.toISOString().slice(0, 10) !== dayUtc) {
     throw new Error(`Deletion prefix has an invalid UTC day: ${prefix}`);
   }
+}
+
+function validateDeletionDayConnector({ prefix, dayUtc, connectorIdRaw }) {
+  validateDeletionDay({ prefix, dayUtc });
   const connectorId = Number(connectorIdRaw);
   if (!Number.isSafeInteger(connectorId) || connectorId <= 0 || String(connectorId) !== connectorIdRaw) {
     throw new Error(`Deletion prefix has an invalid connector ID: ${prefix}`);
@@ -1037,6 +1052,23 @@ function validateDeletionDayConnector({ prefix, dayUtc, connectorIdRaw }) {
 }
 
 function assertCanonicalDeletionPrefix(prefix, entry) {
+  if (entry?.exact_object === true) {
+    const match = prefix.match(GENERIC_V2_EMPTY_METADATA_KEY);
+    if (!match || entry.stage !== "generic_v2_empty_metadata"
+      || (match[2] && ![9, 10].includes(Number(match[2])))
+      || (match[4] && ![9, 10].includes(Number(match[4])))
+      || !/^[a-f0-9]{64}$/.test(String(entry.baseline_sha256 || ""))
+      || !Number.isSafeInteger(entry.baseline_bytes) || entry.baseline_bytes < 0
+      || !["dropbox", "overlay"].includes(entry.baseline_source)) {
+      throw new Error(`Generic fixed-v2 exact metadata deletion evidence is invalid: ${prefix}`);
+    }
+    if (match[2] || match[4]) {
+      validateDeletionDayConnector({ prefix, dayUtc: match[1] || match[3], connectorIdRaw: match[2] || match[4] });
+    } else {
+      validateDeletionDay({ prefix, dayUtc: match[1] });
+    }
+    return;
+  }
   const observationDayMatch = prefix.match(CANONICAL_OBSERVATION_DAY_PREFIX_PATTERN);
   if (observationDayMatch) {
     const dayUtc = observationDayMatch[1];
@@ -1154,7 +1186,7 @@ function changedScopeDeclaresKey(runState, dependencyKey) {
 
 function proposedDeletionPrefixes(runState) {
   return (runState?.tombstone_prefixes || [])
-    .filter((entry) => entry?.proposed)
+    .filter((entry) => entry?.proposed && entry?.exact_object !== true)
     .map((entry) => `${safeKey(entry.prefix).replace(/\/+$/, "")}/`);
 }
 
@@ -1183,6 +1215,10 @@ export function validateExternalDependencyRoot({
   if (proposedDeletionPrefixes(runState).some((prefix) => key.startsWith(prefix))) {
     throw new Error(`Proposed deletion would remove an unstaged dependency: ${objectKey} -> ${key}`);
   }
+  if ((runState.tombstone_prefixes || []).some((entry) =>
+    entry?.proposed && entry?.exact_object === true && safeKey(entry.prefix) === key)) {
+    throw new Error(`Exact metadata deletion would remove an unstaged dependency: ${objectKey} -> ${key}`);
+  }
   const root = identity.source === "dropbox"
     ? String(runState.base_dropbox_root || "")
     : String(runState.overlay_root || "");
@@ -1202,17 +1238,19 @@ export function validateExternalDependencyRoot({
   return { key, local_path: localPath, ...identity };
 }
 
-export function validateLocalProposal(runState) {
+export function validateLocalProposal(runState, { generation = "v2", allowEmpty = false } = {}) {
   if (!runState || typeof runState !== "object") throw new Error("run state must be an object");
   const objects = Object.entries(runState.objects || {}).sort(([left], [right]) => bytewiseKeyCompare(left, right));
   const prefixes = Array.isArray(runState.tombstone_prefixes) ? runState.tombstone_prefixes : [];
-  if (!objects.length && !prefixes.length) throw new Error("canonical proposal has no planned operations");
+  if (!objects.length && !prefixes.length && !allowEmpty) {
+    throw new Error("canonical proposal has no planned operations");
+  }
   const normalizedObjects = [];
   for (const [rawKey, entry] of objects) {
     const key = safeKey(rawKey);
     let classification;
     try {
-      classification = requireObservationHistoryIntegrityKey(key, { generation: "v2" });
+      classification = requireObservationHistoryIntegrityKey(key, { generation });
     } catch {
       throw new Error(`Non-observation history is outside the Integrity proposal contract: ${key}`);
     }
@@ -1259,6 +1297,7 @@ export function validateLocalProposal(runState) {
   const normalizedPrefixes = prefixes.map((entry) => {
     const prefix = safeKey(entry?.prefix).replace(/\/+$/, "");
     if (!entry?.proposed) throw new Error(`Deletion prefix is not proposed: ${prefix}`);
+    requireObservationHistoryIntegrityKey(prefix, { generation });
     assertCanonicalDeletionPrefix(prefix, entry);
     return { entry, prefix, domain: objectDomain(prefix) };
   });
@@ -1349,12 +1388,29 @@ export async function deleteAndVerifyPrefix({
   checkpoint,
   verifiedBodyCache = null,
 }) {
-  const prefix = `${prefixEntry.prefix}/`;
+  const exactObject = prefixEntry.entry?.exact_object === true;
+  const prefix = exactObject ? prefixEntry.prefix : `${prefixEntry.prefix}/`;
   const context = mutationContext(prefixEntry.prefix, prefixEntry.entry?.stage || "prefix_deletion");
   verifiedBodyCache?.invalidatePrefix(prefixEntry.prefix, "delete_prefix");
   try {
-    const entries = await adapters.listAllObjects({ r2, prefix, max_keys: 1000 });
-    const keys = entries.map((entry) => safeKey(entry.key)).filter((key) => key.startsWith(prefix)).sort();
+    let keys;
+    if (exactObject) {
+      const head = await adapters.headObject({ r2, key: prefix });
+      if (!head?.exists && !prefixEntry.entry.remote_attempted) {
+        throw new Error(`Exact metadata deletion baseline is absent before APPLY: ${prefix}`);
+      }
+      if (head?.exists) {
+        const object = await adapters.getObject({ r2, key: prefix });
+        if (Number(object.bytes) !== prefixEntry.entry.baseline_bytes
+          || sha256Hex(object.body) !== prefixEntry.entry.baseline_sha256) {
+          throw new Error(`Exact metadata deletion baseline identity changed: ${prefix}`);
+        }
+      }
+      keys = head?.exists ? [prefix] : [];
+    } else {
+      const entries = await adapters.listAllObjects({ r2, prefix, max_keys: 1000 });
+      keys = entries.map((entry) => safeKey(entry.key)).filter((key) => key.startsWith(prefix)).sort();
+    }
     const sidecar = persistence.writeDeletedKeysSidecar({ prefix: prefixEntry.prefix, keys });
     delete prefixEntry.entry.deleted_object_keys;
     const startedAt = new Date().toISOString();
@@ -1398,8 +1454,13 @@ export async function deleteAndVerifyPrefix({
       deleted_object_count: keys.length,
       deleted_keys_sidecar_path: prefixEntry.entry.deleted_keys_sidecar_path,
     });
-    const remaining = await adapters.listAllObjects({ r2, prefix, max_keys: 1000 });
-    if (remaining.length) throw new Error(`R2 prefix deletion verification failed: ${prefixEntry.prefix}`);
+    if (exactObject) {
+      const remaining = await adapters.headObject({ r2, key: prefix });
+      if (remaining?.exists) throw new Error(`R2 exact metadata deletion verification failed: ${prefix}`);
+    } else {
+      const remaining = await adapters.listAllObjects({ r2, prefix, max_keys: 1000 });
+      if (remaining.length) throw new Error(`R2 prefix deletion verification failed: ${prefixEntry.prefix}`);
+    }
     Object.assign(prefixEntry.entry, {
       deleted: true,
       deletion_verified: true,
@@ -1456,6 +1517,7 @@ export async function putAndVerifyObject({
   verifiedBodyCache = null,
 }) {
   const entry = object.entry;
+  const fixedV3Parquet = /^history\/v3\/observations\/.+\.parquet$/.test(object.key);
   const context = mutationContext(object.key, objectPublicationStage(object));
   const scheduleEvidence = {
     publication_schedule_sha256: runState?.apply?.publication_schedule?.schedule_sha256 || null,
@@ -1484,7 +1546,13 @@ export async function putAndVerifyObject({
     post_put_verification_count: 0,
   });
   try {
-    await adapters.putObject({ r2, key: object.key, body: object.body, content_type: contentTypeForKey(object.key) });
+    await adapters.putObject({
+      r2,
+      key: object.key,
+      body: object.body,
+      content_type: contentTypeForKey(object.key),
+      ...(fixedV3Parquet ? { sha256: entry.sha256 } : {}),
+    });
     Object.assign(entry, { uploaded: true, uploaded_at_utc: new Date().toISOString(), status: "uploaded" });
     persistence?.appendEvent({
       event_type: "put_completed",
@@ -1513,8 +1581,16 @@ export async function putAndVerifyObject({
       key: object.key,
       phase: `canonical_apply_post_put_readback_${objectPublicationStage(object)}`,
     });
-    if (Number(fresh.bytes) !== object.body.byteLength || sha256Hex(fresh.body) !== entry.sha256) {
+    if (Number(fresh.bytes) !== object.body.byteLength || sha256Hex(fresh.body) !== entry.sha256
+      || (fixedV3Parquet && !Buffer.from(fresh.body).equals(object.body))) {
       throw new Error(`R2 GET verification identity mismatch: ${object.key}`);
+    }
+    if (fixedV3Parquet) {
+      const head = await adapters.headObject({ r2, key: object.key });
+      verifyR2StoredSha256Head({
+        head,
+        intent: { key: object.key, byte_size: object.body.byteLength, sha256: entry.sha256 },
+      });
     }
     Object.assign(entry, {
       r2_verified: true,
@@ -1522,6 +1598,10 @@ export async function putAndVerifyObject({
       remote_completed: true,
       status: "get_verified",
       post_put_verification_get_count: 1,
+      ...(fixedV3Parquet ? {
+        stored_sha256_verified: true,
+        stored_byte_size_verified: true,
+      } : {}),
     });
     if (/^history\/v2\/observations\/.+\.parquet$/.test(object.key)
       && (runState.execution_path !== "sos_light" || entry.stage === "observations_data")) {
@@ -1552,6 +1632,11 @@ export async function putAndVerifyObject({
     Object.assign(entry, {
       status: "failed",
       error: message,
+      ...(fixedV3Parquet ? {
+        r2_verified: false,
+        stored_sha256_verified: false,
+        stored_byte_size_verified: false,
+      } : {}),
     });
     try {
       persistence?.appendEvent({
@@ -1791,9 +1876,9 @@ export function loadImmutableSourcePartition({ runState, dayUtc, connectorId, po
   )) {
     throw new Error(`Immutable source evidence selected pollutant is invalid: ${identity}`);
   }
-  const reconstructedRows = rows.map((row, index) => {
+  const reconstructRows = (rawRows, label) => rawRows.map((row, index) => {
     if (!row || typeof row !== "object" || Array.isArray(row)) {
-      throw new Error(`Immutable source evidence row is invalid: day=${dayUtc} connector=${connectorId} row=${index}`);
+      throw new Error(`Immutable ${label} evidence row is invalid: day=${dayUtc} connector=${connectorId} row=${index}`);
     }
     if (Object.hasOwn(row, "connector_id") && Number(row.connector_id) !== connectorId) {
       throw new Error(`Immutable source evidence row has conflicting connector_id: day=${dayUtc} connector=${connectorId} row=${index}`);
@@ -1819,6 +1904,7 @@ export function loadImmutableSourcePartition({ runState, dayUtc, connectorId, po
       verification_status: row.verification_status,
     });
   });
+  const reconstructedRows = reconstructRows(rows, "source");
   const reconstructedByPollutant = new Map();
   for (const row of reconstructedRows) {
     const partitionRows = reconstructedByPollutant.get(row.pollutant_code) || [];
@@ -1834,12 +1920,19 @@ export function loadImmutableSourcePartition({ runState, dayUtc, connectorId, po
   if (!sameJson(reconstructedCounts, recordedCounts)) {
     throw new Error(`Immutable source evidence per-pollutant counts changed: day=${dayUtc} connector=${connectorId}`);
   }
+  const officialRdata = ["waqn", "saqn"].includes(evidence.source_adapter)
+    && evidence.semantic_evidence_contract === "official_rdata_semantic_evidence";
   const recordedHashCodes = Object.keys(evidence?.observation_content_hashes || {}).sort();
-  if (!sameJson(Object.keys(reconstructedCounts), recordedHashCodes)) {
+  const sourceHashCodes = officialRdata
+    ? [...new Set([...Object.keys(reconstructedCounts), ...(evidence.source_available_pollutant_codes || [])])].sort()
+    : Object.keys(reconstructedCounts);
+  if (!sameJson(sourceHashCodes, recordedHashCodes)) {
     throw new Error(`Immutable source evidence content-hash partitions changed: day=${dayUtc} connector=${connectorId}`);
   }
-  for (const [code, partitionRows] of reconstructedByPollutant) {
-    const computedPartition = computeObservationContentHash(partitionRows);
+  for (const code of sourceHashCodes) {
+    const partitionRows = reconstructedByPollutant.get(code) || [];
+    const computedPartition = partitionRows.length
+      ? computeObservationContentHash(partitionRows) : computeEmptyObservationContentHash();
     const recordedPartition = evidence?.observation_content_hashes?.[code];
     validateObservationContentHashMetadata(recordedPartition, { rowCount: partitionRows.length });
     const partitionDifferences = semanticDifferences(computedPartition, recordedPartition);
@@ -1867,6 +1960,78 @@ export function loadImmutableSourcePartition({ runState, dayUtc, connectorId, po
       );
     }
   }
+  let finalTargetRows = selectedRows;
+  let finalTargetMetadata = computed;
+  let finalTargetEncodedRows = selectedRows.map(encodeCanonicalObservationRow).sort();
+  let finalTargetTimeseriesRowCounts = timeseriesRowCounts(selectedRows);
+  if (evidence.semantic_evidence_contract === "official_rdata_semantic_evidence") {
+    const preservedRowsPath = path.join(path.dirname(rowsPath), "preserved_baseline_rows.json");
+    const preservedRowsBody = fs.readFileSync(preservedRowsPath);
+    const preservedRows = JSON.parse(preservedRowsBody.toString("utf8"));
+    if (!Array.isArray(preservedRows)
+        || preservedRowsBody.byteLength !== Number(evidence.preserved_baseline_rows_bytes)
+        || sha256Hex(preservedRowsBody) !== evidence.preserved_baseline_rows_sha256
+        || preservedRows.length !== Number(evidence.preserved_baseline_row_count)) {
+      throw new Error(`Immutable preserved baseline identity is invalid: ${identity}`);
+    }
+    const reconstructedPreservedRows = reconstructRows(preservedRows, "preserved baseline");
+    const allTargetRows = [...reconstructedRows, ...reconstructedPreservedRows];
+    if (allTargetRows.length !== Number(evidence.final_target_row_count)) {
+      throw new Error(`Immutable final target row count changed: ${identity}`);
+    }
+    const targetByPollutant = new Map();
+    for (const row of allTargetRows) {
+      const partitionRows = targetByPollutant.get(row.pollutant_code) || [];
+      partitionRows.push(row);
+      targetByPollutant.set(row.pollutant_code, partitionRows);
+    }
+    const requestedPollutants = [...new Set(
+      (evidence.requested_pollutant_set || []).map(String),
+    )].sort();
+    // Wholly unavailable empty scopes have no target authority or synthetic hash.
+    const targetCodes = requestedPollutants.filter((code) => targetByPollutant.has(code)
+      || (evidence.source_available_pollutant_codes || []).includes(code));
+    const targetCounts = Object.fromEntries(targetCodes.map((code) => [
+      code, (targetByPollutant.get(code) || []).length,
+    ]));
+    const recordedTargetCounts = Object.fromEntries(Object.entries(
+      evidence.final_target_pollutant_counts || {},
+    ).sort(([left], [right]) => left.localeCompare(right)).map(([code, count]) => [
+      code, Number(count),
+    ]));
+    if (!sameJson(targetCounts, recordedTargetCounts)) {
+      throw new Error(`Immutable final target pollutant counts changed: ${identity}`);
+    }
+    const targetTimeseriesCounts = timeseriesRowCounts(allTargetRows);
+    const recordedTargetTimeseriesCounts = Object.fromEntries(Object.entries(
+      evidence.final_target_timeseries_row_counts || {},
+    ).sort(([left], [right]) => Number(left) - Number(right)).map(([key, count]) => [
+      key, Number(count),
+    ]));
+    if (!sameJson(targetTimeseriesCounts, recordedTargetTimeseriesCounts)) {
+      throw new Error(`Immutable final target timeseries counts changed: ${identity}`);
+    }
+    for (const code of targetCodes) {
+      const partitionRows = targetByPollutant.get(code) || [];
+      const targetHash = partitionRows.length
+        ? computeObservationContentHash(partitionRows)
+        : computeEmptyObservationContentHash();
+      const recordedTargetHash = evidence.final_target_observation_content_hashes?.[code];
+      validateObservationContentHashMetadata(recordedTargetHash, { rowCount: partitionRows.length });
+      const targetDifferences = semanticDifferences(targetHash, recordedTargetHash);
+      if (targetDifferences.length) {
+        throw new Error(
+          `Immutable final target semantic identity changed: day=${dayUtc} connector=${connectorId} pollutant=${code} differing_fields=${targetDifferences.join(",")}`,
+        );
+      }
+    }
+    finalTargetRows = targetByPollutant.get(pollutantCode) || [];
+    finalTargetMetadata = finalTargetRows.length
+      ? computeObservationContentHash(finalTargetRows)
+      : computeEmptyObservationContentHash();
+    finalTargetEncodedRows = finalTargetRows.map(encodeCanonicalObservationRow).sort();
+    finalTargetTimeseriesRowCounts = timeseriesRowCounts(finalTargetRows);
+  }
   return {
     evidence,
     evidencePath,
@@ -1878,6 +2043,10 @@ export function loadImmutableSourcePartition({ runState, dayUtc, connectorId, po
     encodedRows: selectedRows.map(encodeCanonicalObservationRow).sort(),
     metadata: semanticMetadata(computed),
     timeseriesRowCounts: timeseriesRowCounts(selectedRows),
+    finalTargetRows,
+    finalTargetEncodedRows,
+    finalTargetMetadata: semanticMetadata(finalTargetMetadata),
+    finalTargetTimeseriesRowCounts,
   };
 }
 
@@ -2063,7 +2232,12 @@ function validateFinalParentReferences({ proposal, runState }) {
   }
 }
 
-export async function validateFinalProposalGraph({ runState, proposal, runStatePath = null }) {
+export async function validateFinalProposalGraph({
+  runState,
+  proposal,
+  runStatePath = null,
+  genericSelectedScopeAuthority = null,
+}) {
   const audit = {
     status: "running",
     started_at_utc: new Date().toISOString(),
@@ -2075,12 +2249,20 @@ export async function validateFinalProposalGraph({ runState, proposal, runStateP
   if (runStatePath) atomicWriteJson(runStatePath, runState);
   try {
     const sosLight = runState.execution_path === "sos_light";
+    const authorityByPrefix = new Map((genericSelectedScopeAuthority?.selected_scopes || [])
+      .filter((scope) => scope?.pollutant_prefix)
+      .map((scope) => [String(scope.pollutant_prefix), scope]));
     const selectedPrefixes = sosLight
       ? Object.keys(runState.source_evidence_partitions || {}).map((identity) => ({
         prefix: `history/v2/observations/${identity}`,
       }))
-      : proposal.prefixes.filter((item) =>
-        CANONICAL_OBSERVATION_POLLUTANT_PREFIX_PATTERN.test(item.prefix));
+      : genericSelectedScopeAuthority
+        ? genericSelectedScopeAuthority.selected_scopes
+          .filter((scope) => scope.outcome !== "source_artifact_unavailable_preserved")
+          .map((scope) => ({ prefix: scope.pollutant_prefix, authority_scope: scope }))
+        : proposal.prefixes.filter((item) =>
+        CANONICAL_OBSERVATION_POLLUTANT_PREFIX_PATTERN.test(item.prefix))
+        .map((item) => ({ ...item, authority_scope: authorityByPrefix.get(item.prefix) || null }));
     audit.selected_partition_count = selectedPrefixes.length;
     const objects = new Map(proposal.objects.map((object) => [object.key, object]));
     const tombstoneCounts = new Map();
@@ -2115,15 +2297,22 @@ export async function validateFinalProposalGraph({ runState, proposal, runStateP
       const manifestObject = objects.get(manifestKey);
       const stagedParts = proposal.objects.filter((object) =>
         object.key.startsWith(`${selected.prefix}/`) && object.key.endsWith(".parquet"));
+      const authoritativeEmpty = selected.authority_scope?.outcome
+        === "authoritative_no_data_replacement";
       const dedicatedEmptyAllowed = runState.execution_path === "sos_light";
-      if (!manifestObject || (!stagedParts.length && !dedicatedEmptyAllowed)) {
+      if ((!manifestObject && !authoritativeEmpty)
+          || (!stagedParts.length && !dedicatedEmptyAllowed && !authoritativeEmpty)
+          || (authoritativeEmpty && (manifestObject || stagedParts.length))) {
         throw finalProposalError({
           key: manifestKey,
           object: manifestObject,
           differingFields: [
-            ...(!manifestObject ? ["matching_staged_pollutant_manifest"] : []),
+            ...(!manifestObject && !authoritativeEmpty ? ["matching_staged_pollutant_manifest"] : []),
             ...(!stagedParts.length && !dedicatedEmptyAllowed
+              && !authoritativeEmpty
               ? ["matching_staged_parquet"] : []),
+            ...(authoritativeEmpty && (manifestObject || stagedParts.length)
+              ? ["authoritative_empty_has_synthetic_children"] : []),
           ],
         });
       }
@@ -2134,7 +2323,9 @@ export async function validateFinalProposalGraph({ runState, proposal, runStateP
       const connectorId = Number(connectorIdRaw);
       const manifestKey = `${selected.prefix}/manifest.json`;
       const manifestObject = objects.get(manifestKey);
-      if (!manifestObject) {
+      const authoritativeEmpty = selected.authority_scope?.outcome
+        === "authoritative_no_data_replacement";
+      if (!manifestObject && !authoritativeEmpty) {
         throw finalProposalError({ key: manifestKey, object: null, differingFields: ["missing_final_pollutant_manifest"] });
       }
       const partObjects = proposal.objects.filter((object) =>
@@ -2149,7 +2340,35 @@ export async function validateFinalProposalGraph({ runState, proposal, runStateP
           differingFields: [`immutable_source_evidence:${error instanceof Error ? error.message : String(error)}`],
         });
       }
-      if (!partObjects.length && source.rows.length) {
+      const expected = selected.authority_scope?.source_evidence_authority
+        ? {
+          rows: source.finalTargetRows,
+          encodedRows: source.finalTargetEncodedRows,
+          metadata: source.finalTargetMetadata,
+          timeseriesRowCounts: source.finalTargetTimeseriesRowCounts,
+        }
+        : source;
+      if (authoritativeEmpty) {
+        if (expected.rows.length !== 0 || manifestObject || partObjects.length) {
+          throw finalProposalError({
+            key: manifestKey,
+            object: manifestObject,
+            differingFields: ["authoritative_empty_source_or_staged_children"],
+          });
+        }
+        audit.partitions.push({
+          manifest_key: null,
+          partition_prefix: selected.prefix,
+          proposal_owner: "source_derived_authoritative_empty_repair",
+          source_content_hash: source.metadata.observation_content_hash,
+          final_target_content_hash: expected.metadata.observation_content_hash,
+          row_count: 0,
+          status: "validated_authoritative_empty",
+        });
+        audit.validated_partition_count += 1;
+        continue;
+      }
+      if (!partObjects.length && expected.rows.length) {
         throw finalProposalError({
           key: manifestKey,
           object: manifestObject,
@@ -2179,24 +2398,24 @@ export async function validateFinalProposalGraph({ runState, proposal, runStateP
         ? computeObservationContentHash(stagedRows)
         : computeEmptyObservationContentHash();
       const stagedEncodedRows = stagedRows.map(encodeCanonicalObservationRow).sort();
-      const stagedDifferences = semanticDifferences(source.metadata, staged);
-      if (!sameJson(source.encodedRows, stagedEncodedRows)) stagedDifferences.push("canonical_row_identity_and_duplicate_multiplicity");
+      const stagedDifferences = semanticDifferences(expected.metadata, staged);
+      if (!sameJson(expected.encodedRows, stagedEncodedRows)) stagedDifferences.push("canonical_row_identity_and_duplicate_multiplicity");
       if (stagedDifferences.length) {
         throw finalProposalError({ key: manifestKey, object: manifestObject, differingFields: stagedDifferences });
       }
       const manifest = parseManifestObject(manifestObject, "pollutant");
-      const manifestDifferences = semanticDifferences(source.metadata, manifest);
+      const manifestDifferences = semanticDifferences(expected.metadata, manifest);
       if (manifest.day_utc !== dayUtc || Number(manifest.connector_id) !== connectorId
         || manifest.pollutant_code !== pollutantCode || manifest.manifest_key !== manifestKey) {
         manifestDifferences.push("manifest_scope_identity");
       }
-      if (Number(manifest.source_row_count) !== source.rows.length
-        || Number(manifest.row_count) !== source.rows.length) {
+      if (Number(manifest.source_row_count) !== expected.rows.length
+        || Number(manifest.row_count) !== expected.rows.length) {
         manifestDifferences.push("manifest_row_count");
       }
       const manifestTimeseriesRowCounts = manifest.timeseries_row_counts
-        ?? (source.rows.length === 0 ? {} : null);
-      if (!sameJson(manifestTimeseriesRowCounts, source.timeseriesRowCounts)) {
+        ?? (expected.rows.length === 0 ? {} : null);
+      if (!sameJson(manifestTimeseriesRowCounts, expected.timeseriesRowCounts)) {
         manifestDifferences.push("manifest_timeseries_row_counts");
       }
       const manifestPartKeys = [...new Set((manifest.parquet_object_keys || []).map(String))].sort();
@@ -2235,6 +2454,10 @@ export async function validateFinalProposalGraph({ runState, proposal, runStateP
         immutable_source_content_hash: source.metadata.observation_content_hash,
         immutable_source_row_count: source.rows.length,
         immutable_source_verification_status_counts: source.metadata.verification_status_counts,
+        immutable_final_target_content_hash: expected.metadata.observation_content_hash,
+        immutable_final_target_row_count: expected.rows.length,
+        immutable_final_target_verification_status_counts:
+          expected.metadata.verification_status_counts,
       });
       for (const part of partObjects) {
         Object.assign(part.entry, {
@@ -2246,9 +2469,10 @@ export async function validateFinalProposalGraph({ runState, proposal, runStateP
         manifest_key: manifestKey,
         proposal_owner: "source_derived_observation_repair",
         source_content_hash: source.metadata.observation_content_hash,
+        final_target_content_hash: expected.metadata.observation_content_hash,
         staged_content_hash: staged.observation_content_hash,
         proposed_manifest_content_hash: manifest.observation_content_hash,
-        row_count: source.rows.length,
+        row_count: expected.rows.length,
         status: "validated",
       });
       audit.validated_partition_count += 1;
@@ -2357,15 +2581,27 @@ export async function verifyLiveObservationPartition({
   const liveMetadata = canonicalRows.length
     ? computeObservationContentHash(canonicalRows)
     : computeEmptyObservationContentHash();
-  const liveSourceDifferences = semanticDifferences(source.metadata, liveMetadata);
+  const officialRdata = source.evidence.semantic_evidence_contract === "official_rdata_semantic_evidence"
+    && ["waqn", "saqn"].includes(source.evidence.source_adapter);
+  const expectedMetadata = officialRdata ? source.finalTargetMetadata : source.metadata;
+  const targetDifferences = semanticDifferences(expectedMetadata, liveMetadata);
   Object.assign(object.entry, {
     live_observation_body_sources: bodySources,
     live_observation_content_hash: liveMetadata.observation_content_hash,
     live_verification_status_counts: liveMetadata.verification_status_counts,
     live_observation_source_evidence_hash: source.metadata.observation_content_hash,
-    live_observation_content_verified_against_source: liveSourceDifferences.length === 0,
+    live_observation_content_verified_against_source:
+      semanticDifferences(source.metadata, liveMetadata).length === 0,
+    ...(officialRdata ? {
+      live_observation_final_target_evidence_hash: expectedMetadata.observation_content_hash,
+      live_observation_content_verified_against_final_target: targetDifferences.length === 0,
+    } : {}),
   });
-  if (liveSourceDifferences.length) {
+  const authorityLabel = officialRdata ? "immutable_final_target" : "immutable_source";
+  const targetAudit = officialRdata ? {
+    immutable_final_target_content_hash: expectedMetadata.observation_content_hash,
+  } : {};
+  if (targetDifferences.length) {
     object.entry.live_observation_failure_classification = "live_observation_content_mismatch";
     persistence?.appendEvent({
       event_type: "semantic_verification_failed",
@@ -2374,13 +2610,14 @@ export async function verifyLiveObservationPartition({
       bytes: object.body.byteLength,
       sha256: object.entry.sha256,
       status: "failed",
-      failure_message: `immutable_source_mismatch:${liveSourceDifferences.join(",")}`,
+      failure_message: `${authorityLabel}_mismatch:${targetDifferences.join(",")}`,
       live_observation_content_hash: liveMetadata.observation_content_hash,
       immutable_source_content_hash: source.metadata.observation_content_hash,
+      ...targetAudit,
     });
     persistence?.flush();
     throw new Error(
-      `Live repaired observation content does not match immutable source evidence: day=${dayUtc} connector=${connectorId} pollutant=${pollutantCode} differing_fields=${liveSourceDifferences.join(",")}`,
+      `Live repaired observation content does not match ${authorityLabel} evidence: day=${dayUtc} connector=${connectorId} pollutant=${pollutantCode} differing_fields=${targetDifferences.join(",")}`,
     );
   }
   const manifestDifferences = semanticDifferences(liveMetadata, manifest);
@@ -2405,6 +2642,7 @@ export async function verifyLiveObservationPartition({
       failure_message: `proposal_manifest_mismatch:${[...new Set(manifestDifferences)].join(",")}`,
       live_observation_content_hash: liveMetadata.observation_content_hash,
       immutable_source_content_hash: source.metadata.observation_content_hash,
+      ...targetAudit,
     });
     persistence?.flush();
     throw new Error(
@@ -2429,6 +2667,7 @@ export async function verifyLiveObservationPartition({
     status: "verified",
     live_observation_content_hash: liveMetadata.observation_content_hash,
     immutable_source_content_hash: source.metadata.observation_content_hash,
+    ...targetAudit,
     proposed_manifest_matches_live_observation: true,
     body_sources: bodySources,
   });
@@ -2676,8 +2915,25 @@ export async function applyValidatedProposal({
   r2,
   adapters = {},
   env = process.env,
+  generation = "v2",
+  expectedExecutionPath = null,
+  generationEligibilityValidator = null,
+  coordinatorFreezeValidator = null,
+  localProposalValidator = null,
+  finalProposalGraphValidator = null,
+  proposalAdmissionPlanner = null,
 }) {
-  assertIntegrityApplyGenerationEligible(env);
+  const runState = JSON.parse(fs.readFileSync(runStatePath, "utf8"));
+  if (generation === "v3") {
+    if (env.UK_AQ_R2_HISTORY_VERSION !== "v3"
+        || env.UK_AQ_R2_HISTORY_INDEX_VERSION !== "v3") {
+      throw new Error("Generic fixed-v3 APPLY requires fixed v3 history and index authority");
+    }
+  } else if (generationEligibilityValidator) {
+    generationEligibilityValidator({ runState, env, generation });
+  } else {
+    assertIntegrityApplyGenerationEligible(env);
+  }
   const baseGetObject = adapters.getObject || r2GetObject;
   const retryLog = adapters.progressLog
     ? (event) => adapters.progressLog(
@@ -2692,14 +2948,26 @@ export async function applyValidatedProposal({
       phase: phase || "canonical_apply_r2_get",
       ...(retryLog ? { log: retryLog } : {}),
     }),
+    headObject: adapters.headObject || r2HeadObject,
     listAllObjects: adapters.listAllObjects || r2ListAllObjects,
     putObject: adapters.putObject || r2PutObject,
   };
   const indexConfig = resolveR2HistoryIndexConfig(env);
-  const runState = JSON.parse(fs.readFileSync(runStatePath, "utf8"));
+  if (expectedExecutionPath && runState.execution_path !== expectedExecutionPath) {
+    throw new Error(`Canonical apply execution path mismatch: ${String(runState.execution_path)}`);
+  }
   let sosLightV2CoordinatorFreeze;
   try {
-    sosLightV2CoordinatorFreeze = requireSosLightV2CoordinatorFreeze(runState);
+    if (!coordinatorFreezeValidator && (
+      ["waqn", "saqn"].includes(runState.official_rdata_source_adapter) ||
+      (runState.changed_scopes?.OBSERVS_CHANGED || []).some((scope) =>
+        [9, 10].includes(Number(scope?.connector_id)))
+    )) {
+      throw new Error("Generic fixed-v2 official-RData APPLY authority is unavailable");
+    }
+    sosLightV2CoordinatorFreeze = coordinatorFreezeValidator
+      ? { dedicated: false, ...coordinatorFreezeValidator(runState) }
+      : requireSosLightV2CoordinatorFreeze(runState);
     if (sosLightV2CoordinatorFreeze.dedicated) {
       runState.sos_light_v2_node_transition_validation = {
         ...sosLightV2CoordinatorFreeze,
@@ -2711,7 +2979,9 @@ export async function applyValidatedProposal({
   } catch (error) {
     runState.apply = {
       status: "failed",
-      current_phase: "sos_light_v2_coordinator_freeze_validation",
+      current_phase: coordinatorFreezeValidator
+        ? "generic_v3_coordinator_freeze_validation"
+        : "sos_light_v2_coordinator_freeze_validation",
       r2_mutation_possible: false,
       error: error instanceof Error ? error.message : String(error),
       finished_at_utc: new Date().toISOString(),
@@ -2741,18 +3011,56 @@ export async function applyValidatedProposal({
     atomicWriteJson(runStatePath, runState);
     throw error;
   }
-  const proposal = validateLocalProposal(runState);
-  const dedicatedSosProposal = validateDedicatedSosHistoricalProposal({
-    runState,
-    proposal,
-  });
+  // The official-network planner is local-only and returns the exact admitted
+  // bodies and schedule used below. Other callers retain their existing path.
+  let admittedPlan = null;
+  if (proposalAdmissionPlanner) {
+    try {
+      admittedPlan = await proposalAdmissionPlanner({ runState, env });
+    } catch (error) {
+      runState.apply = {
+        status: "failed", generation, error: error.message,
+        r2_mutation_possible: false, final_admission_validation_failed: true,
+        finished_at_utc: new Date().toISOString(),
+      };
+      atomicWriteJson(runStatePath, runState);
+      throw error;
+    }
+  }
+  const proposal = admittedPlan ? admittedPlan.proposal : localProposalValidator
+    ? localProposalValidator(runState)
+    : validateLocalProposal(runState, { generation });
+  let dedicatedSosProposal;
   try {
-    await validateFinalProposalGraph({ runState, proposal });
+    dedicatedSosProposal = validateDedicatedSosHistoricalProposal({
+      runState,
+      proposal,
+    });
+    if (dedicatedSosProposal.dedicated) {
+      requirePinnedSosLightConnectorGate({
+        runState, generation: "v2", selectedDays: dedicatedSosProposal.selected_days,
+      });
+    }
+    if (admittedPlan) {
+      if (admittedPlan.final_proposal_graph_validation?.status !== "succeeded") {
+        throw new Error("Canonical APPLY received an unvalidated admission plan");
+      }
+    } else if (finalProposalGraphValidator) {
+      await finalProposalGraphValidator({ runState, proposal });
+    } else {
+      await validateFinalProposalGraph({ runState, proposal });
+    }
   } catch (error) {
     runState.apply = {
       status: "failed",
       current_phase: "final_proposal_validation",
+      r2_mutation_possible: false,
       error: error instanceof Error ? error.message : String(error),
+      ...(error?.classification ? {
+        classification: error.classification,
+        blocked_connectors: error.evidence,
+        r2_observation_index_mutation_count: 0,
+      } : {}),
       finished_at_utc: new Date().toISOString(),
       persistence: {
         compact_checkpoint_count: 0,
@@ -2777,7 +3085,7 @@ export async function applyValidatedProposal({
   let publicationSchedule;
   let sosLightPublicationScheduleValidation = null;
   try {
-    publicationSchedule = buildFrozenPublicationSchedule({
+    publicationSchedule = admittedPlan ? admittedPlan.publication_schedule : buildFrozenPublicationSchedule({
       proposal,
       selectedDays,
       publicationMode: dedicatedSosProposal.dedicated ? "sos_light" : "generic",
@@ -3004,10 +3312,26 @@ export async function applyValidatedProposal({
       object.schedule = scheduleEntry;
       operations.push({ kind: "put", key: object.key, object });
     }
+    if (sosLightV2CoordinatorFreeze.dedicated && operations.length > 0) {
+      markR2MutationStarted({
+        statePath: env[FIXED_V2_SOS_LIGHT_RECOVERY_STATE_ENV],
+        expectedRunId: String(
+          runState.observations_global_operation_lock?.run_id || "",
+        ),
+      });
+      runState.apply.r2_mutation_started = true;
+      runState.apply.r2_mutation_started_at_utc = new Date().toISOString();
+      writeCompleteRunState();
+    }
     const connectorGroups = new Map();
     const dayGroups = new Map();
     const globalOperations = [];
+    const genericDeletionOperations = [];
     for (const operation of operations) {
+      if (!dedicatedSosProposal.dedicated && operation.kind === "delete") {
+        genericDeletionOperations.push(operation);
+        continue;
+      }
       if (isObservationHistoryIntegrityIndexKey(operation.key)) {
         globalOperations.push(operation);
         continue;
@@ -3149,9 +3473,15 @@ export async function applyValidatedProposal({
         },
       });
     };
+    const absentAffectedDays = proposal.prefixes
+      .filter((entry) => entry.entry?.exact_object === true
+        && entry.entry?.authority === "generic_v2_authenticated_empty_day")
+      .map((entry) => entry.prefix.match(/\/day_utc=(\d{4}-\d{2}-\d{2})\/manifest\.json$/)?.[1])
+      .filter(Boolean);
     const affectedDays = Array.from(new Set([
       ...Array.from(connectorGroups.values()).map((group) => group.day_utc),
       ...dayGroups.keys(),
+      ...absentAffectedDays,
     ])).sort();
     const publishAffectedIndexes = async () => {
       if (!globalOperations.length && !affectedDays.length) return;
@@ -3173,8 +3503,11 @@ export async function applyValidatedProposal({
         diagnosticEnvironment: runState.environment,
         diagnostics: runState.writer_locks,
         r2,
-        observationsPrefix: indexConfig.observations_prefix_v2,
+        observationsPrefix: generation === "v3"
+          ? "history/v3/observations"
+          : indexConfig.observations_prefix_v2,
         affectedDaysUtc: affectedDays,
+        absentAffectedDaysUtc: absentAffectedDays,
         maxKeys: indexConfig.max_keys || 1000,
         hierarchyFinalizerAdapter: adapters.observationsHierarchyFinalizer,
         finalizeExistingIndexes: async () => {
@@ -3202,6 +3535,17 @@ export async function applyValidatedProposal({
       await checkpoint("after_affected_index_publication");
       report({ message: progressMessage("index publication completed"), completedObjects: counts.completed_writes, force: true });
     };
+    if (!dedicatedSosProposal.dedicated) {
+      const deletionRank = (operation) => operation.prefixEntry.entry?.exact_object === true
+        ? operation.key.startsWith("history/_index_v2/") ? 0
+          : /\/connector_id=[1-9]\d*\/manifest\.json$/.test(operation.key) ? 20 : 30
+        : 10;
+      for (const operation of genericDeletionOperations.sort((left, right) =>
+        deletionRank(left) - deletionRank(right)
+          || bytewiseKeyCompare(left.key, right.key))) {
+        await executeOperation(operation);
+      }
+    }
     if (dedicatedSosProposal.dedicated) {
       runState.apply.sos_light_day_publication = perDayStatus;
       await applySosLightPerDayUnits({
