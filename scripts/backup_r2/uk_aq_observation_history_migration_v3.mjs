@@ -32,6 +32,7 @@ import {
   r2ListObjectsV2,
   r2PutObject,
   sha256Hex,
+  isRetryableR2Status,
 } from "../../workers/shared/r2_sigv4.mjs";
 import {
   buildR2HistoryV2ObservationsTimeseriesLatestKey,
@@ -49,6 +50,15 @@ import {
   readAndValidateRecoveryJournal,
   inspectRecoveryJournalForInterruptedAppend,
 } from "../index_v3_migration/recovery_journal_authority.mjs";
+import {
+  appendExceptionalRecoveryEpoch,
+  exceptionalRecoveryCodeSha256,
+  getExceptionalRecoveryCodeIdentity,
+  getExceptionalRecoveryJournalFrontier,
+  isExceptionalRecoveryAuthorization,
+  validateExceptionalRecoveryAdmission,
+  verifyOriginalRecoveryImplementation,
+} from "../index_v3_migration/exceptional_recovery_authority.mjs";
 import {
   validateIndexV3OperatorEvidence,
 } from "../index_v3_migration/index_v3_operator_evidence.mjs";
@@ -90,6 +100,57 @@ const MODES = new Set([
   "rollback-plan",
   "rollback",
 ]);
+
+const MIGRATION_VERIFY_MAX_ROUNDS = 5;
+const MIGRATION_VERIFY_RETRY_BASE_MS = 750;
+const MIGRATION_VERIFY_RETRY_MAX_MS = 12_000;
+const MIGRATION_TRANSIENT_NETWORK_CODES = new Set([
+  "ECONNABORTED", "ECONNREFUSED", "ECONNRESET", "EAI_AGAIN", "EHOSTUNREACH",
+  "ENETUNREACH", "EPIPE", "ETIMEDOUT", "UND_ERR_BODY_TIMEOUT", "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_SOCKET",
+]);
+
+function isRetryableMigrationVerificationError(error) {
+  if (isRetryableR2Status(Number(error?.status))) return true;
+  const seen = new Set();
+  let current = error;
+  for (let depth = 0; current && depth < 8; depth += 1) {
+    if (seen.has(current)) break;
+    seen.add(current);
+    if (MIGRATION_TRANSIENT_NETWORK_CODES.has(String(current.code || "").toUpperCase())) return true;
+    current = current.cause;
+  }
+  return false;
+}
+
+async function verifyMigrationPostPut({ r2, key, expectedBody, expectedByteSize }) {
+  const expectedSha256 = sha256Hex(expectedBody);
+  let lastError;
+  for (let round = 1; round <= MIGRATION_VERIFY_MAX_ROUNDS; round += 1) {
+    try {
+      const current = await r2GetObject({ r2, key });
+      const bytes = Buffer.from(current.body);
+      if (current.bytes !== expectedByteSize || bytes.byteLength !== expectedByteSize ||
+          sha256Hex(bytes) !== expectedSha256 || !bytes.equals(expectedBody)) {
+        const error = new Error(`Migration post-PUT exact identity mismatch for key=${key}`);
+        error.code = "R2_IDENTITY_MISMATCH";
+        throw error;
+      }
+      return current;
+    } catch (error) {
+      if (!isRetryableMigrationVerificationError(error) || round === MIGRATION_VERIFY_MAX_ROUNDS) {
+        throw error;
+      }
+      lastError = error;
+      const ceiling = Math.min(MIGRATION_VERIFY_RETRY_MAX_MS,
+        MIGRATION_VERIFY_RETRY_BASE_MS * (2 ** (round - 1)));
+      const delayMs = Math.floor(ceiling * (0.5 + Math.random() * 0.5));
+      process.stderr.write(`V3 migration: transient post-PUT GET retry ${round + 1}/${MIGRATION_VERIFY_MAX_ROUNDS} key=${key} status=${error.status || "network"} delay_ms=${delayMs}\n`);
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  throw lastError || new Error(`Migration post-PUT GET verification exhausted for key=${key}`);
+}
 
 function usage() {
   return [
@@ -160,7 +221,7 @@ export function parsePublicationConcurrency(value, runnerPermit = null) {
   return Number(value);
 }
 
-export function parseObservationHistoryMigrationArgs(argv, runnerPermit = null) {
+export function parseObservationHistoryMigrationArgs(argv, runnerPermit = null, { allowRecoveryPreflight = false } = {}) {
   const limits = migrationConcurrencyLimits(runnerPermit);
   const args = {
     mode: "plan",
@@ -231,7 +292,9 @@ export function parseObservationHistoryMigrationArgs(argv, runnerPermit = null) 
     else throw new Error(`Unknown argument: ${flag}`);
   }
   validateMigrationConcurrency({ ...args, runnerPermit });
-  if (!MODES.has(args.mode)) throw new Error(`Unsupported --mode: ${args.mode}`);
+  if (!MODES.has(args.mode) && !(allowRecoveryPreflight && args.mode === "recovery-preflight")) {
+    throw new Error(`Unsupported --mode: ${args.mode}`);
+  }
   if (
     !args.help &&
     !new Set(["v2-to-v3", "v3-rebuild"]).has(String(args.transition || ""))
@@ -279,6 +342,16 @@ export function parseObservationHistoryMigrationArgs(argv, runnerPermit = null) 
   return Object.freeze(args);
 }
 
+export function createObservationHistoryMigrationExecutionContext(parsedArgs, exceptionalRecoveryApproval = null) {
+  if (!Object.isFrozen(parsedArgs)) throw new Error("Migration execution requires immutable parsed arguments");
+  if (exceptionalRecoveryApproval &&
+      (!Object.isFrozen(exceptionalRecoveryApproval) ||
+       !Object.isFrozen(exceptionalRecoveryApproval.approval_context))) {
+    throw new Error("Exceptional recovery approval context must be immutable");
+  }
+  return Object.freeze({ args: parsedArgs, exceptionalRecoveryApproval });
+}
+
 function readJsonFile(filePath, label) {
   if (!filePath) throw new Error(`${label} path is required`);
   try {
@@ -318,6 +391,18 @@ function ensureDurableDirectory(directory, mode = 0o700) {
     fs.mkdirSync(target, { mode });
     const parent = fs.openSync(path.dirname(target), 'r');
     try { fs.fsyncSync(parent); } finally { fs.closeSync(parent); }
+  }
+}
+
+function requireExistingRecoveryArtifact(target, label, kind) {
+  let stat;
+  try { stat = fs.lstatSync(target); }
+  catch (error) {
+    if (error.code === "ENOENT") throw new Error(`${label} is missing: ${target}`, { cause: error });
+    throw error;
+  }
+  if (stat.isSymbolicLink() || (kind === "directory" ? !stat.isDirectory() : !stat.isFile())) {
+    throw new Error(`${label} must be an existing regular ${kind}: ${target}`);
   }
 }
 
@@ -477,7 +562,7 @@ function recoveryManifestPayload({
       recoveryImplementation || recoveryImplementationIdentity(repositoryRoot,
         checkpoint.progress_format === 'authenticated-journal-v1'
           ? recoveryRunnerIdentity(plan) : null,
-        plan.environment.environment),
+        plan.environment?.environment || null),
   });
 }
 
@@ -570,8 +655,17 @@ function applyRecoveryUpdates(checkpoint, updates) {
   }
 }
 
-function replayRecoveryJournal({ paths, checkpoint, manifest, repairHead = false, diagnostics = false }) {
-  ensureDurableDirectory(paths.entries);
+function replayRecoveryJournal({ paths, checkpoint, manifest, repairHead = false,
+  allowInterruptedTail = false, onAuthenticatedReplay = null, diagnostics = false,
+  readOnly = false }) {
+  if (readOnly) {
+    requireExistingRecoveryArtifact(paths.root, "Recovery state directory", "directory");
+    requireExistingRecoveryArtifact(paths.manifest, "Recovery manifest", "file");
+    requireExistingRecoveryArtifact(paths.head, "Recovery journal head", "file");
+    requireExistingRecoveryArtifact(paths.entries, "Recovery journal entries directory", "directory");
+  } else {
+    ensureDurableDirectory(paths.entries);
+  }
   const names = fs.readdirSync(paths.entries)
     .sort();
   if (!fs.existsSync(paths.head) && repairHead && names.length === 0) {
@@ -586,7 +680,10 @@ function replayRecoveryJournal({ paths, checkpoint, manifest, repairHead = false
     ));
   }
   const authenticationStartedAt = Date.now();
-  const authenticationProgress = createOperatorProgress({ label: "V3 recovery: authenticating historical journal", enabled: diagnostics || Boolean(process.env.UK_AQ_OPERATOR_RUN_DIR) });
+  // Operator progress can create run directories and phase-marker files.
+  // Strict read-only inspection uses stream diagnostics only.
+  const authenticationProgress = createOperatorProgress({ label: "V3 recovery: authenticating historical journal",
+    enabled: !readOnly && (diagnostics || Boolean(process.env.UK_AQ_OPERATOR_RUN_DIR)) });
   if (diagnostics) process.stderr.write(`V3 recovery: authenticating ${names.length} journal entries start=${new Date(authenticationStartedAt).toISOString()}\n`);
   const journalOptions = {
     recoveryRoot: paths.root,
@@ -598,13 +695,13 @@ function replayRecoveryJournal({ paths, checkpoint, manifest, repairHead = false
     expectedTargetWriterGitSha: manifest.payload.target_writer_git_sha,
     allowEmpty: true,
   };
-  const replay = repairHead
+  const replay = repairHead || allowInterruptedTail
     ? inspectRecoveryJournalForInterruptedAppend(journalOptions)
     : readAndValidateRecoveryJournal(journalOptions);
   authenticationProgress.finish();
   if (diagnostics) process.stderr.write(`V3 recovery: authentication complete entries=${replay.entries.length} elapsed_ms=${Date.now() - authenticationStartedAt}\n`);
   const replayProgress = createMigrationProgressReporter({
-    label: "V3 recovery: applying authenticated journal", total: replay.entries.length, enabled: diagnostics,
+    label: "V3 recovery: applying authenticated journal", total: replay.entries.length, enabled: !readOnly && diagnostics,
   });
   replayProgress.report(0, { force: true });
   const publicationEvidence = [];
@@ -630,18 +727,29 @@ function replayRecoveryJournal({ paths, checkpoint, manifest, repairHead = false
         if (checkpoint.completed_objects[entry.key] && !recovered.has(entry.key)) throw new Error(`Recovery v3 completion lacks publication journal authority: ${entry.key}`);
       }
     }
-    const tail = replay.interrupted_append;
-    // The entry may have been renamed immediately before interruption: flush
-    // it and the entries directory again before committing its head.
-    const entryFd = fs.openSync(path.join(paths.entries, `${String(tail.sequence).padStart(10, '0')}.json`), 'r');
-    try { fs.fsyncSync(entryFd); } finally { fs.closeSync(entryFd); }
-    const entriesFd = fs.openSync(paths.entries, 'r');
-    try { fs.fsyncSync(entriesFd); } finally { fs.closeSync(entriesFd); }
-    atomicWriteJson(paths.head, recoveryEnvelope('uk_aq_observation_history_v3_recovery_head', {
-      ...replay.head.payload, last_sequence: tail.sequence, last_entry_sha256: tail.payload_sha256,
-    }), paths.pending);
-    // Re-enter the unchanged exact reader after durable promotion.
-    readAndValidateRecoveryJournal(journalOptions);
+    if (repairHead) {
+      const tail = replay.interrupted_append;
+      // Flush a renamed candidate before the exceptional epoch can durably
+      // bind to it, then commit it to the ordinary journal head.
+      const entryFd = fs.openSync(path.join(paths.entries, `${String(tail.sequence).padStart(10, '0')}.json`), 'r');
+      try { fs.fsyncSync(entryFd); } finally { fs.closeSync(entryFd); }
+      const entriesFd = fs.openSync(paths.entries, 'r');
+      try { fs.fsyncSync(entriesFd); } finally { fs.closeSync(entriesFd); }
+    }
+    if (onAuthenticatedReplay) onAuthenticatedReplay({ sequence: replay.interrupted_append.sequence,
+      entry_sha256: replay.interrupted_append.payload_sha256, interrupted_append: true });
+    if (repairHead) {
+      const tail = replay.interrupted_append;
+      atomicWriteJson(paths.head, recoveryEnvelope('uk_aq_observation_history_v3_recovery_head', {
+        ...replay.head.payload, last_sequence: tail.sequence, last_entry_sha256: tail.payload_sha256,
+      }), paths.pending);
+      // Re-enter the unchanged exact reader after durable promotion.
+      readAndValidateRecoveryJournal(journalOptions);
+    }
+  } else if (onAuthenticatedReplay) {
+    buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint, validateOnly: true });
+    onAuthenticatedReplay({ sequence: replay.last_sequence,
+      entry_sha256: replay.last_entry_sha256, interrupted_append: false });
   }
   if (diagnostics) process.stderr.write(`V3 recovery: replay complete entries=${replay.entries.length} elapsed_ms=${Date.now() - authenticationStartedAt}\n`);
   return {
@@ -705,10 +813,24 @@ export function buildObservationHistoryV3RecoveryProgressContext({
   create = false,
   repairHead = false,
   requireCurrentImplementation = true,
+  exceptionalRecoveryAuthorization = null,
+  allowInterruptedTail = false,
+  onAuthenticatedReplay = null,
   diagnostics = false,
+  readOnly = false,
 }) {
   if (diagnostics) process.stderr.write("V3 recovery: authenticating original checkpoint and recovery manifest\n");
   const paths = recoveryProgressPaths(checkpointPath);
+  if (readOnly) {
+    if (create || repairHead || onAuthenticatedReplay) {
+      throw new Error("Read-only recovery inspection cannot create, repair or append recovery state");
+    }
+    requireExistingRecoveryArtifact(path.resolve(checkpointPath), "Migration checkpoint", "file");
+    requireExistingRecoveryArtifact(paths.root, "Recovery state directory", "directory");
+    requireExistingRecoveryArtifact(paths.manifest, "Recovery manifest", "file");
+    requireExistingRecoveryArtifact(paths.head, "Recovery journal head", "file");
+    requireExistingRecoveryArtifact(paths.entries, "Recovery journal entries directory", "directory");
+  }
   let createdManifest = false;
   if (!fs.existsSync(paths.manifest)) {
     if (!create) throw new Error("Recovery progress manifest is missing; run resume preflight first");
@@ -723,6 +845,16 @@ export function buildObservationHistoryV3RecoveryProgressContext({
     paths.manifest,
     "uk_aq_observation_history_v3_recovery_manifest",
   );
+  if (exceptionalRecoveryAuthorization &&
+      (!isExceptionalRecoveryAuthorization(exceptionalRecoveryAuthorization) ||
+       exceptionalRecoveryAuthorization.checkpoint_path !== path.resolve(checkpointPath) ||
+       exceptionalRecoveryAuthorization.auth.checkpointSha256 !== manifest.payload.original_checkpoint.sha256 ||
+       exceptionalRecoveryAuthorization.auth.journal.manifest.payload.immutable_authority_sha256 !== manifest.payload.immutable_authority_sha256 ||
+       exceptionalRecoveryAuthorization.auth.journal.manifest.payload.migration_run_id !== manifest.payload.migration_run_id ||
+       exceptionalRecoveryAuthorization.auth.journal.manifest.payload.plan_sha256 !== manifest.payload.plan_sha256 ||
+       !requireCurrentImplementation)) {
+    throw new Error("Exceptional recovery authority does not authenticate this immutable checkpoint or preserve the normal implementation gate");
+  }
   if (manifest.payload.recovery_implementation.runner !== undefined &&
       stableMigrationJson(manifest.payload.recovery_implementation.runner) !== stableMigrationJson(recoveryRunnerIdentity(checkpoint.authority))) {
     throw new Error('Recovery implementation profile differs from immutable checkpoint runner');
@@ -731,7 +863,10 @@ export function buildObservationHistoryV3RecoveryProgressContext({
     checkpointPath,
     checkpoint,
     repositoryRoot,
-    recoveryImplementation: requireCurrentImplementation
+    // The original manifest stays immutable. Only the branded exact-run
+    // exceptional authority permits replay under its separately approved
+    // current implementation; ordinary recovery keeps the exact-head gate.
+    recoveryImplementation: requireCurrentImplementation && !exceptionalRecoveryAuthorization
       ? (manifest.payload.recovery_implementation.runner === undefined
         ? recoveryImplementationIdentity(repositoryRoot) : null)
       : manifest.payload.recovery_implementation,
@@ -758,8 +893,18 @@ export function buildObservationHistoryV3RecoveryProgressContext({
     checkpoint: recoveredCheckpoint,
     manifest,
     repairHead: repairHead || createdManifest,
+    allowInterruptedTail,
+    onAuthenticatedReplay,
     diagnostics,
+    readOnly,
   });
+  const authenticatedJournalFrontier = exceptionalRecoveryAuthorization
+    ? getExceptionalRecoveryJournalFrontier(exceptionalRecoveryAuthorization.auth.journal) : null;
+  if (exceptionalRecoveryAuthorization &&
+      (authenticatedJournalFrontier.sequence !== replay.sequence ||
+       authenticatedJournalFrontier.entry_sha256 !== replay.entrySha256)) {
+    throw new Error("Exceptional recovery journal frontier changed before semantic replay");
+  }
   if (diagnostics) {
     process.stderr.write(`V3 recovery: authenticated entries=${replay.sequence} prepared_units=${
       Object.keys(recoveredCheckpoint.prepared_units || {}).length
@@ -794,6 +939,13 @@ export function buildObservationHistoryV3RecoveryProgressContext({
       last_entry_sha256: replay.entrySha256,
       replayed_checkpoint_sha256:
         buildObservationHistoryV3RecoveryReplayStateSha256(recoveredCheckpoint),
+      ...(exceptionalRecoveryAuthorization ? { exceptional_recovery: Object.freeze({
+        kind: exceptionalRecoveryAuthorization.kind,
+        recovery_epoch_sequence: exceptionalRecoveryAuthorization.approval.approval_context.next_epoch_sequence,
+        previous_epoch_sha256: exceptionalRecoveryAuthorization.approval.approval_context.previous_epoch_sha256,
+        approval_file_sha256: exceptionalRecoveryAuthorization.approval.approval_file_sha256,
+        recovery_implementation_sha256: exceptionalRecoveryAuthorization.approval.approval_context.recovery_implementation_sha256,
+      }) } : {}),
     }),
   };
   context.cleanStart = recoveredCheckpoint.clean_target_admission || null;
@@ -1944,6 +2096,8 @@ function buildR2Adapters({
       body: object.body,
       content_type: object.content_type,
       writeR2: true,
+      postPutVerify: verifyMigrationPostPut,
+      verifyExisting: verifyMigrationPostPut,
     }); },
     recordDurableEvidence: (entry) => recordDurableEvidenceBatch([entry]),
     recordDurableEvidenceBatch,
@@ -2122,7 +2276,7 @@ export function createSideBySideLockAssertion({ env, migrationRunId }) {
 
 async function runSideBySideMigrationOperator({
   args, argv, reentryArgv = argv, env, now, runLockedCommand, adapterFactory,
-  runnerPermit = null, entrypoint = fileURLToPath(import.meta.url),
+  runnerPermit = null, entrypoint = fileURLToPath(import.meta.url), exceptionalRecoveryApproval = null,
 }) {
   const missing = [
     ["--environment", args.environment], ["--expected-bucket", args.expectedBucket],
@@ -2141,7 +2295,20 @@ async function runSideBySideMigrationOperator({
   const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
   const head = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: repositoryRoot, encoding: 'utf8' });
   const dirty = spawnSync('git', ['status', '--porcelain=v1', '--untracked-files=normal'], { cwd: repositoryRoot, encoding: 'utf8' });
-  if (head.status !== 0 || dirty.status !== 0 || head.stdout.trim() !== args.targetWriterGitSha || dirty.stdout.trim()) {
+  let approvedRecoveryCode = null;
+  if (exceptionalRecoveryApproval) {
+    approvedRecoveryCode = getExceptionalRecoveryCodeIdentity(repositoryRoot);
+    const approvedContext = exceptionalRecoveryApproval.approval_context;
+    const branch = spawnSync('git', ['branch', '--show-current'], { cwd: repositoryRoot, encoding: 'utf8' });
+    if (approvedContext?.recovery_implementation?.repository_head !== approvedRecoveryCode.repository_head ||
+        approvedContext.recovery_implementation_sha256 !== exceptionalRecoveryCodeSha256(approvedRecoveryCode) ||
+        head.stdout.trim() !== approvedRecoveryCode.repository_head || branch.status !== 0 ||
+        branch.stdout.trim() !== 'main' || args.targetWriterGitSha !== 'e84f52a6b0ddb6212fc6f321b875bb15244c4090') {
+      throw new Error('Exceptional recovery current implementation or original writer identity differs from operator approval');
+    }
+  }
+  if (head.status !== 0 || dirty.status !== 0 ||
+      (!exceptionalRecoveryApproval && head.stdout.trim() !== args.targetWriterGitSha) || dirty.stdout.trim()) {
     throw new Error('Side-by-side execution requires clean reviewed code at the exact target writer Git SHA');
   }
   const config = resolveR2HistoryIndexConfig(env);
@@ -2156,10 +2323,11 @@ async function runSideBySideMigrationOperator({
     readJsonFile(args.writerLimitsPath, "writer limits"), "side-by-side writer limits",
   );
   const checkpointPath = args.checkpointOut || args.checkpointIn;
-  const checkpointArtifacts = checkpointPath ? ["", ".authority", ".staging", ".recovery", ".publication.json"]
+  const checkpointArtifacts = checkpointPath ? ["", ".authority", ".staging", ".recovery", ".publication.json", ".exceptional-recovery-epochs"]
     .map((suffix) => `${path.resolve(checkpointPath)}${suffix}`) : [];
   const reportPath = path.resolve(args.reportOut);
-  if (reportPath === path.resolve(args.writerLimitsPath) || checkpointArtifacts.some((entry) =>
+  if (reportPath === path.resolve(args.writerLimitsPath) ||
+      (exceptionalRecoveryApproval && reportPath === exceptionalRecoveryApproval.approval_file_path) || checkpointArtifacts.some((entry) =>
     reportPath === entry || reportPath.startsWith(`${entry}${path.sep}`))) {
     throw new Error("Report path must be separate from writer limits and checkpoint/recovery artifacts");
   }
@@ -2200,6 +2368,9 @@ async function runSideBySideMigrationOperator({
   let plan = null;
   let checkpoint = null;
   let recoveryProgress = null;
+  let lockedSourceRoot = null;
+  let exceptionalRecoveryAuthorization = null;
+  let exceptionalRecoveryEpoch = null;
   let planningAdmission = null;
   let initialSourceRoot = null;
   let postPlanApproval = null;
@@ -2240,11 +2411,15 @@ async function runSideBySideMigrationOperator({
     if (args.checkpointIn) {
       assertLockHeld();
       checkpoint = readMigrationCheckpoint(args.checkpointIn);
+      if (exceptionalRecoveryApproval && (!args.checkpointOut ||
+          path.resolve(args.checkpointOut) !== path.resolve(args.checkpointIn))) {
+        throw new Error('Exceptional recovery must retain the original checkpoint as both checkpoint-in and checkpoint-out');
+      }
       plan = buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint });
       assertSideBySideMigrationPlan(plan);
       if (!runnerPermit && plan.plan_identity.runner_policy?.runner_kind === 'gcp') throw new Error('GCP checkpoint recovery requires the metadata-admitted GCP entrypoint');
       // Check pinned source BEFORE recovery journal initialization or target work.
-      await verifySideBySideSourceRoot({ plan, getObject });
+      lockedSourceRoot = await verifySideBySideSourceRoot({ plan, getObject });
     } else {
       plan = await buildObservationHistorySideBySideMigrationPlan({
         getR2Object: getObject, getR2ObjectBounded: getObjectBounded,
@@ -2268,6 +2443,21 @@ async function runSideBySideMigrationOperator({
       throw new Error('Canonical v2 root changed between initial lock-held capture and completed plan');
     }
     if (runnerPermit && stableMigrationJson(plan.plan_identity.runner_policy) !== stableMigrationJson(GCP_CLEAN_POLICY)) throw new Error('GCP runner requires its own complete clean-build plan; local/historical checkpoint is incompatible');
+    if (exceptionalRecoveryApproval) {
+      const recordedRunner = plan.runner;
+      if (!recordedRunner || recordedRunner.runner_kind !== 'gcp' || recordedRunner.runner_profile !== 'gcp-c4a-32' ||
+          recordedRunner.inventory_concurrency !== 48 || recordedRunner.partition_concurrency !== 16 ||
+          recordedRunner.publication_concurrency !== 80 || args.inventoryConcurrency !== recordedRunner.inventory_concurrency ||
+          args.partitionConcurrency !== recordedRunner.partition_concurrency ||
+          args.publicationConcurrency !== recordedRunner.publication_concurrency) {
+        throw new Error('Exceptional recovery concurrency must exactly match the immutable checkpoint runner settings (inventory 48, partition 16, publication 80)');
+      }
+      if (!lockedSourceRoot) throw new Error('Exceptional recovery lacks lock-held source-root verification');
+      exceptionalRecoveryAuthorization = validateExceptionalRecoveryAdmission({
+        checkpointPath: args.checkpointIn, repositoryRoot, approval: exceptionalRecoveryApproval,
+        sourceRoot: lockedSourceRoot, runner: runnerPermit,
+      });
+    }
     if (!checkpoint) plan = Object.freeze({ ...plan,
       runner: { ...(runnerPermit || { runner_kind: 'local', runner_profile: 'local-conservative' }),
         partition_concurrency: args.partitionConcurrency, publication_concurrency: args.publicationConcurrency,
@@ -2287,6 +2477,17 @@ async function runSideBySideMigrationOperator({
         recoveryProgress = buildObservationHistoryV3RecoveryProgressContext({
           checkpointPath: args.checkpointIn, checkpoint, repositoryRoot,
           create: args.mode === "migrate", repairHead: args.mode === "migrate", requireCurrentImplementation: true,
+          exceptionalRecoveryAuthorization,
+          onAuthenticatedReplay: exceptionalRecoveryAuthorization ? (frontier) => {
+            const approvedFrontier = getExceptionalRecoveryJournalFrontier(exceptionalRecoveryAuthorization.auth.journal);
+            if (frontier.sequence !== approvedFrontier.sequence || frontier.entry_sha256 !== approvedFrontier.entry_sha256) {
+              throw new Error('Exceptional recovery journal frontier changed before epoch admission');
+            }
+            assertLockHeld();
+            exceptionalRecoveryEpoch = appendExceptionalRecoveryEpoch({
+              admission: exceptionalRecoveryAuthorization, assertLockHeld,
+            });
+          } : null,
         });
         checkpoint = recoveryProgress.checkpoint;
         plan = buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint });
@@ -2401,6 +2602,19 @@ async function runSideBySideMigrationOperator({
       source_in_flight_bytes: migrationConcurrencyLimits(runnerPermit).sourceInFlightBytes,
       publication_in_flight_bytes: migrationConcurrencyLimits(runnerPermit).publicationInFlightBytes };
     output.audit.global_lock = lockAuditIdentity(assertLockHeld());
+  if (exceptionalRecoveryApproval) {
+    output.audit.exceptional_recovery_approval = {
+      kind: exceptionalRecoveryApproval.kind,
+      approval_file_sha256: exceptionalRecoveryApproval.approval_file_sha256,
+      approval_phrase_sha256: exceptionalRecoveryApproval.approval_phrase_sha256,
+      original_journal_anchor: exceptionalRecoveryApproval.approval_context.original_journal_anchor,
+      approved_journal_frontier: exceptionalRecoveryApproval.approval_context.journal_frontier,
+      recovery_implementation_sha256: exceptionalRecoveryApproval.approval_context.recovery_implementation_sha256,
+      recovery_epoch_sequence: exceptionalRecoveryEpoch?.sequence || exceptionalRecoveryApproval.approval_context.next_epoch_sequence,
+      recovery_epoch_sha256: exceptionalRecoveryEpoch?.payload_sha256 || null,
+      recovery_epoch_append_confirmed: Boolean(exceptionalRecoveryEpoch),
+    };
+  }
     output.audit.clean_target_admission = checkpoint?.clean_target_admission || planningAdmission;
     output.audit.initial_runner = plan.runner;
     output.audit.planning_clean_target_admission = plan.planning_clean_target_admission;
@@ -2448,6 +2662,17 @@ async function runSideBySideMigrationOperator({
         plan_sha256: plan?.plan_sha256 || null, blockers: plan?.blockers || [],
         error: error.message, failure_evidence: migrationFailureEvidence(error), runtime_switch_performed: false },
       audit: { runner: runnerPermit, post_plan_approval: postPlanApproval,
+        ...(exceptionalRecoveryApproval ? { exceptional_recovery_approval: {
+          kind: exceptionalRecoveryApproval.kind,
+          approval_file_sha256: exceptionalRecoveryApproval.approval_file_sha256,
+          approval_phrase_sha256: exceptionalRecoveryApproval.approval_phrase_sha256,
+          original_journal_anchor: exceptionalRecoveryApproval.approval_context.original_journal_anchor,
+          approved_journal_frontier: exceptionalRecoveryApproval.approval_context.journal_frontier,
+          recovery_implementation_sha256: exceptionalRecoveryApproval.approval_context.recovery_implementation_sha256,
+          recovery_epoch_sequence: exceptionalRecoveryEpoch?.sequence || exceptionalRecoveryApproval.approval_context.next_epoch_sequence,
+          recovery_epoch_sha256: exceptionalRecoveryEpoch?.payload_sha256 || null,
+          recovery_epoch_append_confirmed: Boolean(exceptionalRecoveryEpoch),
+        } } : {}),
         complete_plan_path: completePlanPath ? path.join(completePlanPath, 'master.json') : null, phase_durations_ms: phaseDurations,
         r2_adapter_calls: r2AdapterCalls,
         clean_target_admission: error.clean_target_admission || checkpoint?.clean_target_admission || null },
@@ -2464,8 +2689,28 @@ export async function runObservationHistoryMigrationV3({
   sideBySideAdapterFactory = buildSideBySideR2Adapters,
   runnerPermit = null, entrypoint = fileURLToPath(import.meta.url),
   reentryArgv = argv,
+  exceptionalRecoveryApproval = null,
 } = {}) {
-  const args = parseObservationHistoryMigrationArgs(argv, runnerPermit);
+  const parsedArgs = parseObservationHistoryMigrationArgs(argv, runnerPermit);
+  const executionContext = createObservationHistoryMigrationExecutionContext(parsedArgs, exceptionalRecoveryApproval);
+  const args = executionContext.args;
+  const recoveryApproval = executionContext.exceptionalRecoveryApproval;
+  if (recoveryApproval) {
+    const approvalContext = recoveryApproval.approval_context;
+    if (runnerPermit?.runner_kind !== "gcp" || args.mode !== "migrate" || args.environment !== "LIVE" ||
+        args.transition !== "v2-to-v3" || args.migrationRunId !== "live-v3-20261015T114250Z-e84f52a" ||
+        args.expectedPlanSha256 !== "1e960674e53cd2ddb3c5d08a3318fcce1abc72ebe7a2dc92e11e9ce9a4d79600" ||
+        args.targetWriterGitSha !== "e84f52a6b0ddb6212fc6f321b875bb15244c4090" ||
+        recoveryApproval.kind !== "uk_aq_observation_history_v3_exceptional_resume_approval_v1" ||
+        !/^[0-9a-f]{64}$/.test(String(recoveryApproval.approval_file_sha256 || "")) ||
+        approvalContext?.migration_run_id !== args.migrationRunId ||
+        approvalContext?.plan_sha256 !== args.expectedPlanSha256 ||
+        approvalContext?.immutable_authority_sha256 !== "80ac1e8b1c975d66036a170cd78bce2680c256b36131f3505530789b6c3599b6" ||
+        !/^[0-9a-f]{64}$/.test(String(approvalContext?.recovery_implementation_sha256 || "")) ||
+        !Object.isFrozen(approvalContext)) {
+      throw new Error("Exceptional recovery approval object is invalid for this invocation");
+    }
+  }
   if (args.help) return { help: true, text: usage() };
   if (runnerPermit && ((args.environment !== "TEST" &&
       !isReviewedLiveGcpInvocation({ args, runnerPermit, entrypoint })) ||
@@ -2476,6 +2721,7 @@ export async function runObservationHistoryMigrationV3({
     return runSideBySideMigrationOperator({
       args, argv, reentryArgv, env, now, runLockedCommand,
       adapterFactory: sideBySideAdapterFactory, runnerPermit, entrypoint,
+      exceptionalRecoveryApproval: recoveryApproval,
     });
   }
   if (args.checkpointIn && ["rollback", "rollback-plan"].includes(args.mode) &&
@@ -2632,16 +2878,23 @@ export async function runObservationHistoryMigrationV3({
       requireCurrentImplementation: false,
       diagnostics: true,
     });
-    const recoveryExecutorCheck = spawnSync("bash", [
-      "scripts/index_v3_migration/index_v3_migration.sh",
-      "--resume-implementation-authority",
-      path.resolve(args.checkpointIn),
-      args.targetWriterGitSha,
-    ], { cwd: repositoryRoot, encoding: "utf8" });
-    if (recoveryExecutorCheck.status !== 0) {
-      throw new Error(`Resume recovery executor is not authorized: ${
-        recoveryExecutorCheck.stderr || recoveryExecutorCheck.error?.message || "local authority check failed"
-      }`);
+    if (recoveryApproval) {
+      verifyOriginalRecoveryImplementation({
+        manifest: recoveryProgress.manifest,
+        repositoryRoot,
+      });
+    } else {
+      const recoveryExecutorCheck = spawnSync("bash", [
+        "scripts/index_v3_migration/index_v3_migration.sh",
+        "--resume-implementation-authority",
+        path.resolve(args.checkpointIn),
+        args.targetWriterGitSha,
+      ], { cwd: repositoryRoot, encoding: "utf8" });
+      if (recoveryExecutorCheck.status !== 0) {
+        throw new Error(`Resume recovery executor is not authorized: ${
+          recoveryExecutorCheck.stderr || recoveryExecutorCheck.error?.message || "local authority check failed"
+        }`);
+      }
     }
     checkpoint = recoveryProgress.checkpoint;
   } else if (checkpoint && new Set(["rollback-plan", "rollback"]).has(args.mode)) {
