@@ -1,26 +1,27 @@
 import { createHash } from 'node:crypto';
 import { demand, same, sha256 } from './bounded_verify_store.mjs';
-import { r2GetMigrationObjectBounded } from '../backup_r2/lib/observation_history_migration_bounded_r2.mjs';
-import { r2HeadObject } from '../../workers/shared/r2_sigv4.mjs';
+import { createBoundedVerifierR2Transport } from './bounded_verify_r2_transport.mjs';
 import { verifyR2StoredSha256Head } from '../../workers/shared/uk_aq_r2_checksum_publication.mjs';
 import { readCanonicalObservationRowsFromParquetBytes } from '../backup_r2/lib/observation_history_migration_v3.mjs';
 import {
   encodeCanonicalObservationRow, OBSERVATION_CONTENT_HASH_PREFIX, OBSERVATION_CONTENT_HASH_COLUMNS,
 } from '../../workers/shared/uk_aq_observation_content_hash.mjs';
 
-// The capability supplied to verification has only GET/HEAD. No mutation or
-// migration adapter is constructed, and no publication API is invoked.
+// The capability supplied to verification has only bounded GET and HEAD. The
+// private transport uses one network attempt per call and owns the finite retry
+// policy, lock assertions, request timeout and response validation.
 export function boundedR2Reads({ r2, store, maxObjectBytes }) {
+  const transport = createBoundedVerifierR2Transport({ r2, assertHeld: () => store.assertHeld() });
   return Object.freeze({
     getObject: async ({ key, max_bytes = maxObjectBytes }) => {
       store.assertHeld();
       demand(Number.isSafeInteger(max_bytes) && max_bytes > 0 && max_bytes <= maxObjectBytes,
         `R2 object exceeds response buffer budget: ${key}`);
-      const result = await r2GetMigrationObjectBounded({ r2, key, max_bytes });
+      const result = await transport.getObject({ key, max_bytes });
       store.assertHeld(); return result;
     },
     headObject: async ({ key }) => {
-      store.assertHeld(); const result = await r2HeadObject({ r2, key, accept_encoding_identity: true });
+      store.assertHeld(); const result = await transport.headObject({ key });
       store.assertHeld(); return result;
     },
   });

@@ -1,6 +1,6 @@
 # Bounded immutable migration-generation verification
 
-Implementation/review handover, 16 October 2026. This document is not operational
+Implementation/review handover, 17 October 2026. This document is not operational
 authorisation, a system contract, or evidence of real TEST acceptance. No LIVE
 repository, R2, Supabase, deployment, scheduler or generation was changed.
 
@@ -84,6 +84,15 @@ concurrency alone does not remove those allocations.
    SQLite BINARY order exactly matches JS string sort. Source/target/planned row
    counts, full content metadata, P/R/null counts and every target stable binding
    must agree. No sampling or approximate identity is used.
+   Logical-row writes are committed in internal 1,024-row batches (with a final
+   commit at each Parquet-file boundary). Ordered-row hashing uses a separate
+   read-only boundary at the same cadence: it rechecks the supervised lock,
+   invokes the existing throttled resource/progress gate and yields without
+   issuing `COMMIT; BEGIN` against the active SQLite iterator. Target binding
+   checks use a bounded 8,192-entry LRU cache whose values are copied from the
+   authenticated SQLite `bindings` table; every target row still performs the
+   connector/pollutant comparison, and a cache miss still fails closed for
+   missing or malformed data.
 10. The unchanged v2 source root is checked before and after all current R2
     checks. Checkpoint and recovery anchors are rechecked before completion.
     Every expected R2 dependency and every partition must have completed.
@@ -111,8 +120,10 @@ Defaults and admission limits:
 |---|---|
 | Node old-space setting | Operator command uses 4096 MiB |
 | Process RSS | Fail incomplete if observed above 6 GiB at progress boundaries |
-| R2 concurrency | 1; configurable 1..4 |
+| R2 concurrency | 1 by default; explicitly configurable 1..16 |
 | Transaction/yield batch | 128; configurable 1..1024 |
+| Logical-row write/read batch | 1,024 internal rows; not a new CLI setting |
+| Stable binding cache | At most 8,192 authenticated entries; bounded LRU |
 | GET body | 128 MiB maximum; configurable up to 256 MiB |
 | One Parquet decode | 250,000 rows / 256 MiB declared uncompressed bytes; caps configurable up to 500,000 / 512 MiB |
 | Checkpoint/report/master/shard | 4 MiB each |
@@ -147,11 +158,48 @@ fail closed; ENOSPC cannot turn progress into acceptance. SQLite spills may be
 unlinked while open, so the free-space check also matters. These are scratch-only
 writes, never evidence repair or migration authority.
 
-Bounded GET has one attempt and an existing 30-second request/body deadline;
-existing HEAD transport retains its bounded retry policy. There is no full-run
-deadline, aggressive polling or unlimited retry loop. One logical decoder and
-concurrency 1 preserve headroom for operational services, Plex, Dropbox and Time
-Machine. Use nice priority as below.
+Verifier GET and HEAD requests go through the private
+`bounded_verify_r2_transport.mjs` module. It is limited to read-only `getObject`
+and `headObject` capabilities and does not import TEST-only shared R2 features.
+Bounded GET uses the migration-local one-attempt body reader; signed HEAD uses the
+stable shared signer, timeout and checksum-normalisation primitives. Neither
+one-attempt path contains its own retry loop, so each logical GET or HEAD makes
+at most four network attempts.
+
+Both methods retry only HTTP 408, 429, 500, 502, 503 and 504, plus the bounded
+cause-chain transport failures recognised by the shared client. The private
+classifier inspects at most eight causes and does not classify response-size,
+checksum, malformed-evidence or logical-integrity failures as transient. Each
+attempt has a 30-second request-and-body deadline, followed by fixed delays of
+500, 1,000 and 2,000 ms. The existing supervised lock assertion runs before and
+after every attempt, before and after each delay, and before returning success.
+Lock loss stops the operation without another retry.
+
+Failed GET and HEAD responses are cancelled. GET retains Content-Length, streamed
+byte-count and object-size bounds. Signed HEAD sends
+`x-amz-checksum-mode: ENABLED` and `Accept-Encoding: identity`; malformed size or
+checksum headers fail closed. Missing stored SHA-256 evidence remains terminal
+for external canonical Parquet because `verifyR2StoredSha256Head()` requires it.
+HTTP 404, 401/403, malformed evidence, size errors and checksum/logical identity
+mismatches are not retried. Retry-After and jitter are not used. A bounded
+Retry-After override could reduce repeated 429 responses, but would extend the
+per-object time under the same lock; jitter could de-synchronise parallel
+requests, but would replace the specified fixed delay schedule with variable
+timing. Either change needs a separately reviewed finite cap and coordinator
+time-budget assessment. Sustained R2 throttling can still fail after four
+attempts; retries do not make an incomplete verification resumable.
+
+There is no full-run deadline, aggressive polling or unlimited retry loop. One
+logical decoder and default R2 concurrency 1 preserve headroom for operational
+services, Plex, Dropbox and Time Machine. An explicitly authorised
+`--r2-concurrency 16` runs at most 16 bounded GET/HEAD operations together,
+without relaxing per-object size/SHA verification, the per-attempt deadline, the
+6 GiB process RSS gate or the 8 GiB scratch reserve. Up to sixteen 128 MiB GET
+bodies can require 2 GiB of payload buffers plus transient copies; peak memory,
+R2 error rate and throughput at 16 are not yet measured. A LIVE verifier attempt
+at concurrency 16 encountered HTTP 429 after approximately 155,820 successful
+dependency checks; use concurrency 8 for the next separately authorised LIVE
+attempt and reassess from its progress/error evidence. Use nice priority as below.
 
 ## Proposed Pro procedure (requires later operational authorisation)
 
@@ -286,6 +334,17 @@ Missing/contradictory evidence, absent stored SHA, source drift, graph/row/hash
 mismatch, insufficient resources or an unknown mandatory format also mean STOP.
 Retain the writer freeze and resolve the operational state separately.
 
+Changing `--r2-concurrency` does not affect an already running verifier.
+A different setting requires the existing supervisor to finish or stop,
+confirmed release of its lock, an unchanged writer freeze and a fresh
+invocation using new scratch/log directories and reviewed current Git SHA.
+
+The existing `--batch-size` remains the general journal/index transaction and
+yield setting. Logical observation rows use the fixed internal 1,024-row
+cadence above so increasing logical throughput does not broaden every other
+SQLite transaction. The verifier still defaults to `--batch-size 128`; no new
+environment variable or command-line option is required.
+
 There is **no acceptance resume** and no R2-check reuse in this version, including
 after a controlled interruption. Every invocation creates a fresh private store,
 reauthenticates the complete original evidence and repeats EVERY R2/logical check
@@ -309,6 +368,7 @@ Active implementation additions:
 - `scripts/index_v3_migration/bounded_verify_journal.mjs`
 - `scripts/index_v3_migration/bounded_verify_baseline.mjs`
 - `scripts/index_v3_migration/bounded_verify_r2.mjs`
+- `scripts/index_v3_migration/bounded_verify_r2_transport.mjs`
 
 Narrow modifications:
 
@@ -346,6 +406,33 @@ and `--help`, the narrow boundary check, review of bounded loops/limits and
 GET/HEAD-only capability, unchanged historical pin list and mutation call sites,
 current import-closure inventory, and `git diff --check`. No broad suite,
 full-evidence run, LIVE R2/Supabase access, migration, rollback or cutover was run.
+
+The logical verifier optimisation preserves the existing concurrency-16 opt-in
+and publication primary-key scheduling change. Full-archive timing, SQLite
+index expansion, peak RSS/disk use and the hit rate of the 8,192-entry binding
+cache remain unmeasured until separately authorised real TEST validation.
+
+### Transport isolation update, 17 October 2026
+
+- `scripts/index_v3_migration/bounded_verify_r2.mjs` now delegates all verifier
+  GET and HEAD operations to the private transport while keeping its public
+  capability limited to those two methods.
+- `scripts/index_v3_migration/bounded_verify_r2_transport.mjs` supplies the
+  verifier-only bounded, signed read transport and finite retry policy.
+- This README records the transport boundary, retry limits and remaining
+  throttling risk.
+
+`authenticateCutoverVerifierDependencies()` follows literal relative imports
+from its existing trusted roots, so it includes the private module automatically;
+no historical semantic pin or explicit root list change is needed. Its existing
+tracked-file and clean-HEAD gates still apply. The new module must be committed
+and reviewed before an operational verifier invocation can authenticate the
+updated import closure. No successful full TEST verification is claimed here.
+Structural validation for this update used `node --check` on both changed
+JavaScript modules, direct module imports, a static walk of the current literal
+relative-import closure, GET/HEAD capability and finite-loop inspection, and
+`git diff --check` including the untracked module. No migration, verifier
+operation or R2 request was started.
 
 ## System-doc handover and remaining acceptance blockers
 
