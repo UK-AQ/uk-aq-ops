@@ -1,5 +1,13 @@
+import { applyHistoryDependencyHeaders, authenticatedHistoryTags, historyCacheEnabled, historyCacheKeyUrl, HISTORY_CACHE_CONTRACT } from "../shared/uk_aq_history_cache.mjs";
 import observationHistoryV3 from "./worker_v3.mjs";
 import { resolveObservationHistoryGeneration } from "../shared/uk_aq_observation_history_generation.mjs";
+import { observationHistoryPhysicalSchemaForColumns, selectObservationVerificationStatusColumn } from "../shared/uk_aq_observation_history_schema.mjs";
+import {
+  applyObservationVerificationOverlay,
+  loadObservationVerificationAuthority,
+  loadObservationVerificationDiscovery,
+  observationVerificationManifestIdentityForConnector,
+} from "../shared/uk_aq_observation_verification_overlay.mjs";
 import { parquetMetadataAsync, parquetRead, parquetSchema } from "hyparquet";
 import { compressors } from "hyparquet-compressors";
 import {
@@ -16,7 +24,7 @@ const DEFAULT_TIMESERIES_BINDING_INDEX_SUBPREFIX = "timeseries_binding";
 const DEFAULT_CACHE_SECONDS = 300;
 const DEFAULT_IMMUTABLE_CACHE_SECONDS = 86400;
 const MAX_CACHE_SECONDS = 604800;
-const OBSERVATIONS_CACHE_GENERATION = "2";
+const OBSERVATIONS_CACHE_GENERATION = "3";
 const TIMESERIES_BINDING_CACHE_GENERATION = "3";
 const MAX_LIMIT = 20000;
 const UPSTREAM_AUTH_HEADER = "x-uk-aq-upstream-auth";
@@ -108,6 +116,12 @@ function normalizePollutant(raw) {
   }
   if (compact === "no2" || compact === "nitrogendioxide") {
     return "no2";
+  }
+  if (compact === "bc" || compact === "blackcarbon") {
+    return "bc";
+  }
+  if (compact === "uv370" || compact === "uv370nm" || compact === "uvparticulatematter370nm") {
+    return "uv370";
   }
   return null;
 }
@@ -424,6 +438,9 @@ async function fetchFilteredParquetRowsFromR2(
   const schemaColumns = parquetSchema(metadata).children.map((column) =>
     column.element.name
   );
+  if (key.startsWith("history/v2/observations/") || key.startsWith("history/v3/observations/")) {
+    observationHistoryPhysicalSchemaForColumns(schemaColumns);
+  }
   const timeseriesStatsIndex = schemaColumns.indexOf("timeseries_id");
   if (timeseriesStatsIndex < 0) {
     return { exists: true, rows: [] };
@@ -502,13 +519,7 @@ async function fetchFilteredParquetRowsFromR2(
         chunkStart,
         chunkEnd,
       );
-      const verificationStatusColumn = schemaColumns.includes("vstatus")
-        ? "vstatus"
-        : schemaColumns.includes("verification_status")
-        ? "verification_status"
-        : schemaColumns.includes("status")
-        ? "status"
-        : null;
+      const verificationStatusColumn = selectObservationVerificationStatusColumn(schemaColumns);
       const verificationStatusValues = verificationStatusColumn
         ? await readParquetColumnValues(
           arrayBuffer,
@@ -525,7 +536,7 @@ async function fetchFilteredParquetRowsFromR2(
         outRows.push({
           observed_at: observedAtValues[idx],
           value: valueValues[idx],
-          vstatus:
+          verification_status:
             idx < verificationStatusValues.length &&
               verificationStatusValues[idx] != null
             ? String(verificationStatusValues[idx])
@@ -589,11 +600,9 @@ function appendFilteredRows(rows, {
     outByObservedAt.set(observedAt, {
       observed_at: observedAt,
       value: normalizeValue(row?.value),
-      vstatus: row?.vstatus === "R" || row?.verification_status === "R"
+      verification_status: row?.verification_status === "R"
         ? "R"
-        : row?.vstatus === "P" || row?.verification_status === "P"
-        ? "P"
-        : null,
+        : row?.verification_status === "P" ? "P" : null,
     });
   }
 }
@@ -654,7 +663,7 @@ function parseObservationsRequest(url) {
     return {
       ok: false,
       status: 400,
-      error: "pollutant must be one of pm25, pm10, or no2 when provided.",
+      error: "pollutant must be one of pm25, pm10, no2, bc, or uv370 when provided.",
     };
   }
 
@@ -738,15 +747,20 @@ function aggregateDailyProvenance(rows) {
     const observedAt = toIsoOrNull(row.observed_at);
     if (!observedAt) continue;
     const dayUtc = observedAt.slice(0, 10);
-    const status = row.vstatus === "R" ? "R" : "P";
+    const status = row.verification_status === "R" ? "R" : "P";
     if (status === "P" || !daily.has(dayUtc)) daily.set(dayUtc, status);
   }
   return [...daily].sort(([left], [right]) => left.localeCompare(right))
-    .map(([day_utc, vstatus]) => ({ day_utc, vstatus }));
+    .map(([day_utc, source_validation_status]) => ({ day_utc, source_validation_status }));
 }
 
 async function handleDailyProvenanceV2(params, env) {
-  const observations = await handleRequest(params, env);
+  const verificationAuthority = await loadObservationVerificationAuthority({
+    bucket: env.UK_AQ_HISTORY_BUCKET,
+    connectorId: params.connectorId,
+    cache: caches.default,
+  });
+  const observations = await handleRequest(params, env, verificationAuthority);
   const payload = await observations.json();
   if (!observations.ok || payload.response_complete !== true || payload.has_gap === true) {
     return jsonResponse({ ok: false, error: "observation provenance is incomplete" }, { status: 502, noStore: true });
@@ -802,7 +816,7 @@ export function buildCanonicalCacheKey(requestUrl, {
   endIso,
   sinceIso,
   limit,
-}, readVersion = "v1") {
+}, readVersion = "v1", verificationIdentity = null, env = {}) {
   const cacheUrl = new URL(requestUrl);
   cacheUrl.pathname = "/v1/observations";
   cacheUrl.search = "";
@@ -811,6 +825,9 @@ export function buildCanonicalCacheKey(requestUrl, {
   cacheUrl.searchParams.set("connector_id", String(connectorId));
   cacheUrl.searchParams.set("__ukaq_observs_history_read_v", parseReadVersion(readVersion));
   cacheUrl.searchParams.set("__ukaq_observs_history_cache_gen", OBSERVATIONS_CACHE_GENERATION);
+  if (verificationIdentity) {
+    cacheUrl.searchParams.set("__ukaq_verification_identity", verificationIdentity);
+  }
   if (pollutantKey) {
     cacheUrl.searchParams.set("pollutant", pollutantKey);
   }
@@ -822,10 +839,10 @@ export function buildCanonicalCacheKey(requestUrl, {
   if (limit !== null) {
     cacheUrl.searchParams.set("limit", String(limit));
   }
-  return new Request(cacheUrl.toString(), { method: "GET" });
+  return new Request(historyCacheKeyUrl(cacheUrl.toString(), env).toString(), { method: "GET" });
 }
 
-function buildTimeseriesBindingCacheKey(requestUrl, requestParams) {
+function buildTimeseriesBindingCacheKey(requestUrl, requestParams, env = {}) {
   const cacheUrl = new URL(requestUrl);
   cacheUrl.pathname = "/v1/timeseries-binding";
   cacheUrl.search = "";
@@ -833,7 +850,7 @@ function buildTimeseriesBindingCacheKey(requestUrl, requestParams) {
   cacheUrl.searchParams.set("timeseries_id", String(requestParams.timeseriesId));
   cacheUrl.searchParams.set("__ukaq_observs_history_read_v", "v2");
   cacheUrl.searchParams.set("__ukaq_observs_history_cache_gen", TIMESERIES_BINDING_CACHE_GENERATION);
-  return new Request(cacheUrl.toString(), { method: "GET" });
+  return new Request(historyCacheKeyUrl(cacheUrl.toString(), env).toString(), { method: "GET" });
 }
 
 function extractParquetKeysFromTimeseriesIndex(
@@ -1305,7 +1322,7 @@ async function readHistoryRows({
   };
 }
 
-async function handleRequest(requestParams, env) {
+async function handleRequest(requestParams, env, verificationAuthority = null) {
   const {
     timeseriesId,
     connectorId,
@@ -1406,6 +1423,18 @@ async function handleRequest(requestParams, env) {
   }));
   // --- END DIAG ---
   const completeness = summarizeCoverageCompleteness(historyRead);
+  const authority = verificationAuthority ||
+    await loadObservationVerificationAuthority({
+      bucket: env.UK_AQ_HISTORY_BUCKET,
+      connectorId,
+      cache: caches.default,
+    });
+  const effectiveRows = applyObservationVerificationOverlay({
+    rows: historyRead.rows,
+    authority,
+    timeseriesId,
+    timestampField: "observed_at",
+  });
 
   return jsonResponse({
     ok: true,
@@ -1422,12 +1451,12 @@ async function handleRequest(requestParams, env) {
     end_utc: endIso,
     since_utc: sinceIso,
     cache_scope: cacheScope,
-    row_count: historyRead.rows.length,
+    row_count: effectiveRows.length,
     response_complete: completeness.response_complete,
     has_gap: completeness.has_gap,
     coverage_state: completeness.coverage_state,
     partial_reasons: completeness.partial_reasons,
-    rows: historyRead.rows,
+    rows: effectiveRows,
     coverage: {
       read_version: readVersion,
       index_version: historyRead.timeseries_index?.index_version || readVersion,
@@ -1556,6 +1585,8 @@ export default {
     }
 
     const requestUrl = new URL(request.url);
+    // Authenticated WHO provenance is always no-store; preserve its compatibility
+    // route before enforcing the owned hostname for cached history/binding reads.
     if (requestUrl.pathname === DAILY_PROVENANCE_PATH) {
       const requestParams = parseDailyProvenanceRequest(requestUrl);
       if (!requestParams.ok) {
@@ -1564,6 +1595,9 @@ export default {
         });
       }
       return handleDailyProvenanceV2(requestParams, env);
+    }
+    if (historyCacheEnabled(env) && requestUrl.hostname !== HISTORY_CACHE_CONTRACT.reader_hostname) {
+      return jsonResponse({ ok: false, error: "history_custom_domain_required" }, { status: 503, noStore: true });
     }
     if (requestUrl.pathname === "/v1/timeseries-binding") {
       const requestParams = parseTimeseriesBindingRequest(requestUrl);
@@ -1574,7 +1608,7 @@ export default {
           noStore: true,
         });
       }
-      const cacheKey = buildTimeseriesBindingCacheKey(request.url, requestParams);
+      const cacheKey = buildTimeseriesBindingCacheKey(request.url, requestParams, env);
       const cached = await caches.default.match(cacheKey);
       if (cached) return withCacheMarker(cached, "HIT");
       const response = await handleTimeseriesBindingRequest(requestParams, env);
@@ -1594,16 +1628,41 @@ export default {
     }
 
     const readVersion = resolveR2HistoryVersion(env, { context: "R2 observations history API reads" });
-    const cacheKey = buildCanonicalCacheKey(request.url, requestParams, readVersion);
+    const verificationDiscovery = await loadObservationVerificationDiscovery({
+      bucket: env.UK_AQ_HISTORY_BUCKET,
+      cache: caches.default,
+    });
+    const verificationManifestIdentity = observationVerificationManifestIdentityForConnector({
+      discovery: verificationDiscovery,
+      connectorId: requestParams.connectorId,
+    });
+    const cacheKey = buildCanonicalCacheKey(
+      request.url,
+      requestParams,
+      readVersion,
+      verificationManifestIdentity?.sha256 || null,
+      env,
+    );
     const cached = await caches.default.match(cacheKey);
-    if (cached) {
+    if (cached && (!historyCacheEnabled(env) || authenticatedHistoryTags(cached.headers, env))) {
       return withCacheMarker(cached, "HIT");
     }
+
+    const verificationAuthority = await loadObservationVerificationAuthority({
+      bucket: env.UK_AQ_HISTORY_BUCKET,
+      connectorId: requestParams.connectorId,
+      discovery: verificationDiscovery,
+      cache: caches.default,
+    });
 
     const _fetchStart = Date.now();
     let response;
     try {
-      response = await handleRequest(requestParams, env);
+      response = await handleRequest(
+        requestParams,
+        env,
+        verificationAuthority,
+      );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const errorName = error instanceof Error ? error.name : "UnknownError";
@@ -1633,6 +1692,11 @@ export default {
     const eligibility = await inspectObservationsCacheEligibility(response);
     response = withObservationsCacheDiagnostics(response, eligibility);
     if (response.ok && eligibility.cache_eligible) {
+      const payload = await response.clone().json().catch(() => null);
+      const headers = applyHistoryDependencyHeaders(new Headers(response.headers), env, [payload?.timeseries_id]);
+      response = new Response(response.body, { status: response.status, headers });
+    }
+    if (response.ok && eligibility.cache_eligible && !response.headers.get("Cache-Control")?.includes("no-store")) {
       ctx.waitUntil(caches.default.put(cacheKey, response.clone()));
     }
     return withCacheMarker(response, "MISS");

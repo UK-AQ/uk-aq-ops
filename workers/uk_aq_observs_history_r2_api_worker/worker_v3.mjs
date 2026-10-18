@@ -1,3 +1,4 @@
+import { applyHistoryDependencyHeaders, authenticatedHistoryTags, historyCacheEnabled, historyCacheKeyUrl, HISTORY_CACHE_CONTRACT } from "../shared/uk_aq_history_cache.mjs";
 import { resolveObservationHistoryGeneration, getObservationHistoryGeneration } from "../shared/uk_aq_observation_history_generation.mjs";
 import {
   createR2ObservationHistoryV3Source,
@@ -5,21 +6,25 @@ import {
 import {
   OBSERVATION_HISTORY_EXACT_LEAF_LIMITS,
   ObservationHistoryExactLeafReadError,
+  readObservationHistoryExactLeafDailyMetadataV3,
   readObservationHistoryExactLeafPageV3,
 } from "../shared/uk_aq_observation_history_exact_leaf_reader_v3.mjs";
 import {
-  readObservationHistoryExactV3,
-} from "../shared/uk_aq_observation_history_reader_v3.mjs";
+  OBSERVATION_VERIFICATION_PER_OBSERVATION_MODEL,
+  loadObservationVerificationAuthority,
+  loadObservationVerificationDiscovery,
+  observationVerificationManifestIdentityForConnector,
+  resolveEffectiveObservationVerificationStatus,
+} from "../shared/uk_aq_observation_verification_overlay.mjs";
 
 const LOGICAL_HISTORY_VERSION = "v2";
 const INDEX_GENERATION = "v3";
 const PHYSICAL_LAYOUT_VERSION = "timeseries-aligned-v2";
-const WRITER_VERSION = "parquet-wasm-zstd-v3";
 const ALIGNED_ROW_CAP = 1024;
 const V3 = getObservationHistoryGeneration("v3");
 const ALIGNED_INDEX_PREFIX = `${V3.observations_timeseries_index_prefix}/_aligned`;
 const ALIGNED_DATA_PREFIX = V3.observations_prefix;
-const RESPONSE_CACHE_GENERATION = "side-by-side-v3-exact-leaf-1";
+const RESPONSE_CACHE_GENERATION = "side-by-side-v3-exact-leaf-4";
 const TIMESERIES_BINDING_CACHE_GENERATION = "3";
 const DEFAULT_MUTABLE_CACHE_SECONDS = 300;
 const DEFAULT_IMMUTABLE_CACHE_SECONDS = 86400;
@@ -28,7 +33,12 @@ const UPSTREAM_AUTH_HEADER = "x-uk-aq-upstream-auth";
 const DEFAULT_BINDING_PREFIX = V3.timeseries_binding_index_prefix;
 const DAILY_PROVENANCE_PATH = "/v1/daily-validation-provenance";
 const VALID_OBSERVATION_PATHS = new Set(["/", "/v1/observations"]);
-const MAX_PROVENANCE_RANGE_MS = 366 * 24 * 60 * 60 * 1000;
+const UTC_DAY_MS = 24 * 60 * 60 * 1000;
+const MAX_PROVENANCE_RANGE_MS = 366 * UTC_DAY_MS;
+const MAX_PROVENANCE_PARTIAL_BOUNDARY_DAYS = 2;
+const MAX_PROVENANCE_PARTIAL_PHYSICAL_PAGES = 16;
+const PROVENANCE_PAGE_BUDGET_REASON =
+  "observation_history_physical_page_budget_exceeded";
 export const EXACT_HISTORY_WORKLOAD_DIAGNOSTIC_MODE = "workload_v1";
 export const EXACT_HISTORY_CPU_DIAGNOSTIC_MODE = "cpu_v1";
 const EXACT_HISTORY_DIAGNOSTIC_MODES = new Set([
@@ -61,6 +71,8 @@ function normalizePollutant(value) {
   if (compact === "pm25" || compact === "particulatematter25") return "pm25";
   if (compact === "pm10" || compact === "particulatematter10") return "pm10";
   if (compact === "no2" || compact === "nitrogendioxide") return "no2";
+  if (compact === "bc" || compact === "blackcarbon") return "bc";
+  if (compact === "uv370" || compact === "uv370nm" || compact === "uvparticulatematter370nm") return "uv370";
   return null;
 }
 
@@ -115,8 +127,6 @@ export function observationHistoryV3ReaderIndex(indexRoot) {
     alignedDataRoot: ALIGNED_DATA_PREFIX,
     indexGeneration: INDEX_GENERATION,
     historyVersion: LOGICAL_HISTORY_VERSION,
-    historySchemaVersion: 3,
-    writerVersion: WRITER_VERSION,
     physicalLayoutVersion: PHYSICAL_LAYOUT_VERSION,
     alignedRowCap: ALIGNED_ROW_CAP,
     decodeProfileId: "hyparquet-direct-column-v1",
@@ -135,7 +145,7 @@ export function parseObservationRequest(url) {
   const endIso = isoOrNull(url.searchParams.get("end_utc"));
   if (!timeseriesId) return { ok: false, status: 400, error: "timeseries_id must be a positive integer." };
   if (!connectorId) return { ok: false, status: 400, error: "connector_id must be a positive integer." };
-  if (!pollutantCode) return { ok: false, status: 400, error: "pollutant must be one of pm25, pm10, or no2." };
+  if (!pollutantCode) return { ok: false, status: 400, error: "pollutant must be one of pm25, pm10, no2, bc, or uv370." };
   if (!startIso || !endIso) return { ok: false, status: 400, error: "start_utc and end_utc must be valid ISO timestamps." };
   const startMs = Date.parse(startIso);
   const endMs = Date.parse(endIso);
@@ -192,47 +202,256 @@ export function parseDailyProvenanceRequest(url) {
   return { ok: true, timeseriesId, connectorId, pollutantCode, startIso, endIso };
 }
 
+export function dailyProvenanceUtcDayIntersections({ startUtc, endUtc }) {
+  const startIso = isoOrNull(startUtc);
+  const endIso = isoOrNull(endUtc);
+  if (!startIso || !endIso || startIso >= endIso) {
+    throw new Error("daily provenance interval is invalid");
+  }
+  const startMs = Date.parse(startIso);
+  const endMs = Date.parse(endIso);
+  const intersections = [];
+  for (
+    let dayStartMs = Math.floor(startMs / UTC_DAY_MS) * UTC_DAY_MS;
+    dayStartMs < endMs;
+    dayStartMs += UTC_DAY_MS
+  ) {
+    const dayEndMs = dayStartMs + UTC_DAY_MS;
+    const effectiveStartMs = Math.max(startMs, dayStartMs);
+    const effectiveEndMs = Math.min(endMs, dayEndMs);
+    intersections.push(Object.freeze({
+      day_utc: new Date(dayStartMs).toISOString().slice(0, 10),
+      effective_start_utc: new Date(effectiveStartMs).toISOString(),
+      effective_end_utc: new Date(effectiveEndMs).toISOString(),
+      is_complete_utc_day:
+        effectiveStartMs === dayStartMs && effectiveEndMs === dayEndMs,
+    }));
+  }
+  const partialCount = intersections.filter((day) => !day.is_complete_utc_day).length;
+  if (partialCount > MAX_PROVENANCE_PARTIAL_BOUNDARY_DAYS) {
+    throw new Error("daily provenance interval has too many partial UTC boundary days");
+  }
+  return Object.freeze(intersections);
+}
+
+function incompleteDailyProvenanceResponse(partialReasons, { hasGap = true } = {}) {
+  return jsonResponse({
+    ok: false,
+    error_code: "observation_provenance_incomplete",
+    error: "observation provenance is incomplete",
+    response_complete: false,
+    has_gap: hasGap,
+    partial_reasons: [...new Set(partialReasons)],
+  }, { status: 502, noStore: true });
+}
+
+function aurnVerificationTimeseries(authority, timeseriesId) {
+  if (!authority?.overlay_authoritative || authority.connector_id !== 1) {
+    throw new Error("authoritative connector-1 verification overlay is required");
+  }
+  const timeseries = authority.manifest?.timeseries?.find((entry) =>
+    entry.timeseries_id === timeseriesId);
+  if (!timeseries) throw new Error("verification overlay does not contain the requested timeseries");
+  if (timeseries.source_verification_model !== OBSERVATION_VERIFICATION_PER_OBSERVATION_MODEL) {
+    throw new Error("AURN daily provenance requires per-observation verification authority");
+  }
+  return timeseries;
+}
+
+export function deriveAurnPartialDayValidationStatus({ authority, timeseriesId, rows }) {
+  aurnVerificationTimeseries(authority, timeseriesId);
+  if (!Array.isArray(rows) || rows.length === 0) return null;
+  let sawRatified = false;
+  for (const row of rows) {
+    const status = resolveEffectiveObservationVerificationStatus({
+      authority,
+      timeseriesId,
+      observedAtUtc: row?.observed_at_utc,
+      legacyStatus: null,
+    });
+    if (status === "P") return "P";
+    if (status !== "R") {
+      throw new Error("verification overlay cannot classify a boundary-day observation");
+    }
+    sawRatified = true;
+  }
+  return sawRatified ? "R" : null;
+}
+
+async function readPartialDailyProvenance({
+  source,
+  index,
+  params,
+  intersection,
+  verificationAuthority,
+  pageBudget,
+}) {
+  const rows = [];
+  let physicalCursor = null;
+  while (true) {
+    if (pageBudget.pages >= MAX_PROVENANCE_PARTIAL_PHYSICAL_PAGES) {
+      return {
+        complete: false,
+        has_gap: false,
+        partial_reasons: [PROVENANCE_PAGE_BUDGET_REASON],
+      };
+    }
+    let result;
+    try {
+      result = await readObservationHistoryExactLeafPageV3({
+        source,
+        timeseriesId: params.timeseriesId,
+        connectorId: params.connectorId,
+        pollutantCode: params.pollutantCode,
+        startUtc: intersection.effective_start_utc,
+        endUtc: intersection.effective_end_utc,
+        physicalCursor,
+        index,
+      });
+    } catch (error) {
+      if (physicalCursor && error instanceof ObservationHistoryExactLeafReadError) {
+        return {
+          complete: false,
+          has_gap: true,
+          partial_reasons: ["required_physical_leaf_continuation_invalid"],
+        };
+      }
+      throw error;
+    }
+    pageBudget.pages += 1;
+    if (result.has_gap === true || result.coverage_complete !== true) {
+      return {
+        complete: false,
+        has_gap: true,
+        partial_reasons: result.coverage_partial_reasons?.length
+          ? result.coverage_partial_reasons
+          : ["required_physical_leaf_coverage_incomplete"],
+      };
+    }
+    rows.push(...result.rows);
+    if (result.response_complete === true) break;
+    const nextCursor = result.physical_page?.next_cursor;
+    if (
+      result.physical_page?.pagination_complete !== false ||
+      typeof nextCursor !== "string" ||
+      !nextCursor ||
+      nextCursor === physicalCursor
+    ) {
+      throw new Error("partial-day exact-leaf cursor progression is contradictory");
+    }
+    physicalCursor = nextCursor;
+  }
+  return {
+    complete: true,
+    status: deriveAurnPartialDayValidationStatus({
+      authority: verificationAuthority,
+      timeseriesId: params.timeseriesId,
+      rows,
+    }),
+  };
+}
+
 async function handleDailyProvenance(params, env) {
-  const result = await readObservationHistoryExactV3({
-    source: createR2ObservationHistoryV3Source({ bucket: env.UK_AQ_HISTORY_BUCKET }),
-    indexGeneration: "v3",
-    historyVersion: "v2",
-    timeseriesId: params.timeseriesId,
+  const verificationAuthority = await loadObservationVerificationAuthority({
+    bucket: env.UK_AQ_HISTORY_BUCKET,
     connectorId: params.connectorId,
-    pollutantCode: params.pollutantCode,
+    cache: caches.default,
+  });
+  if (!verificationAuthority.overlay_authoritative) {
+    return jsonResponse({
+      ok: false,
+      error_code: "verification_overlay_not_authoritative",
+      error: "verification_overlay_not_authoritative",
+    }, { status: 503, noStore: true });
+  }
+  const source = createR2ObservationHistoryV3Source({ bucket: env.UK_AQ_HISTORY_BUCKET });
+  const index = observationHistoryV3ReaderIndex(V3.observations_timeseries_index_prefix);
+  const intersections = dailyProvenanceUtcDayIntersections({
     startUtc: params.startIso,
     endUtc: params.endIso,
-    indexRoot: V3.observations_timeseries_index_prefix,
-    limits: {
-      max_index_objects: 800,
-      max_total_index_bytes: 64 * 1024 * 1024,
-      max_distinct_files: 400,
-      max_selected_segments: 800,
-      max_selected_row_groups: 800,
-      max_footer_reads: 400,
-      max_footer_bytes: 32 * 1024 * 1024,
-      max_total_range_reads: 1600,
-      max_total_bytes_requested: 64 * 1024 * 1024,
-      max_decoded_rows: 20000,
-      max_response_rows: 20000,
-    },
   });
-  if (result.response_complete !== true || result.has_gap === true) {
-    return jsonResponse({ ok: false, error: "observation provenance is incomplete" }, { status: 502, noStore: true });
-  }
   const daily = new Map();
-  for (const row of result.rows) {
-    const dayUtc = row.observed_at_utc.slice(0, 10);
-    const status = row.vstatus === "R" ? "R" : "P";
-    if (status === "P" || !daily.has(dayUtc)) daily.set(dayUtc, status);
+  const completeDays = intersections.filter((day) => day.is_complete_utc_day);
+  if (completeDays.length > 0) {
+    const result = await readObservationHistoryExactLeafDailyMetadataV3({
+      source,
+      timeseriesId: params.timeseriesId,
+      connectorId: params.connectorId,
+      pollutantCode: params.pollutantCode,
+      startUtc: completeDays[0].effective_start_utc,
+      endUtc: completeDays.at(-1).effective_end_utc,
+      index,
+    });
+    if (result.response_complete !== true || result.has_gap === true) {
+      return incompleteDailyProvenanceResponse(result.partial_reasons);
+    }
+    for (const row of result.rows) {
+      daily.set(row.day_utc, deriveAurnDailyValidationStatus({
+        authority: verificationAuthority,
+        timeseriesId: params.timeseriesId,
+        minObservedAtUtc: row.min_observed_at_utc,
+        maxObservedAtUtc: row.max_observed_at_utc,
+      }));
+    }
+  }
+
+  const pageBudget = { pages: 0 };
+  for (const intersection of intersections.filter((day) => !day.is_complete_utc_day)) {
+    const result = await readPartialDailyProvenance({
+      source,
+      index,
+      params,
+      intersection,
+      verificationAuthority,
+      pageBudget,
+    });
+    if (!result.complete) {
+      return incompleteDailyProvenanceResponse(result.partial_reasons, {
+        hasGap: result.has_gap,
+      });
+    }
+    if (result.status !== null) daily.set(intersection.day_utc, result.status);
   }
   return jsonResponse({
     ok: true, timeseries_id: params.timeseriesId, connector_id: 1,
     pollutant: params.pollutantCode, start_utc: params.startIso, end_utc: params.endIso,
     response_complete: true, has_gap: false,
     rows: [...daily].sort(([left], [right]) => left.localeCompare(right))
-      .map(([day_utc, vstatus]) => ({ day_utc, vstatus })),
+      .map(([day_utc, source_validation_status]) => ({
+        day_utc,
+        source_validation_status,
+      })),
   }, { noStore: true });
+}
+
+export function deriveAurnDailyValidationStatus({
+  authority,
+  timeseriesId,
+  minObservedAtUtc,
+  maxObservedAtUtc,
+}) {
+  const timeseries = aurnVerificationTimeseries(authority, timeseriesId);
+  const minObserved = isoOrNull(minObservedAtUtc);
+  const maxObserved = isoOrNull(maxObservedAtUtc);
+  if (!minObserved || !maxObserved || minObserved > maxObserved) {
+    throw new Error("exact-leaf daily observation bounds are invalid");
+  }
+  const atMinimum = resolveEffectiveObservationVerificationStatus({
+    authority,
+    timeseriesId,
+    observedAtUtc: minObserved,
+    legacyStatus: null,
+  });
+  if (atMinimum === "P") return "P";
+  if (atMinimum !== "R") {
+    throw new Error("verification overlay cannot classify the first daily observation");
+  }
+  return timeseries.periods.some((period) =>
+    period.status === "P" &&
+    period.from_observed_at_utc !== null &&
+    period.from_observed_at_utc > minObserved &&
+    period.from_observed_at_utc <= maxObserved
+  ) ? "P" : "R";
 }
 
 function diagnosticRequestContext(request, params) {
@@ -286,10 +505,13 @@ function cachePolicy(endIso) {
   return { scope: immutable ? "immutable" : "recent", seconds: immutable ? DEFAULT_IMMUTABLE_CACHE_SECONDS : DEFAULT_MUTABLE_CACHE_SECONDS };
 }
 
-function cacheKey(requestUrl, generation) {
-  const url = new URL(requestUrl);
+function cacheKey(requestUrl, generation, verificationIdentity = null, env = {}) {
+  const url = historyCacheKeyUrl(requestUrl, env);
   url.searchParams.set("__ukaq_observs_history_read_v", generation);
   url.searchParams.set("__ukaq_observs_history_cache_gen", generation === INDEX_GENERATION ? RESPONSE_CACHE_GENERATION : TIMESERIES_BINDING_CACHE_GENERATION);
+  if (verificationIdentity) {
+    url.searchParams.set("__ukaq_verification_identity", verificationIdentity);
+  }
   url.searchParams.sort();
   return new Request(url.toString(), { method: "GET" });
 }
@@ -335,6 +557,7 @@ function compactReaderSummary({ result, outcome, returnedRows }) {
     identity_head_reads: diagnostics.identity_head_reads,
     r2_range_reads: diagnostics.r2_range_reads,
     r2_bytes_requested: diagnostics.r2_bytes_requested,
+    physical_schemas: result.physical_schemas,
     parquet_footer_fetched: diagnostics.parquet_footer_fetched,
     parquet_footer_parsed: diagnostics.parquet_footer_parsed,
     timeseries_id_decoded: diagnostics.timeseries_id_decoded,
@@ -367,7 +590,12 @@ function compactErrorSummary(diagnostics) {
   });
 }
 
-async function handleObservations(params, env, diagnosticContext) {
+async function handleObservations(
+  params,
+  env,
+  diagnosticContext,
+  verificationAuthority,
+) {
   const indexRoot = assertGenerationConfiguration(env);
   const result = await readObservationHistoryExactLeafPageV3({
     source: createR2ObservationHistoryV3Source({ bucket: env.UK_AQ_HISTORY_BUCKET }),
@@ -382,7 +610,12 @@ async function handleObservations(params, env, diagnosticContext) {
   const rows = result.rows.map((row) => ({
     observed_at: row.observed_at_utc,
     value: row.value,
-    vstatus: row.vstatus ?? row.verification_status ?? null,
+    verification_status: resolveEffectiveObservationVerificationStatus({
+      authority: verificationAuthority,
+      timeseriesId: params.timeseriesId,
+      observedAtUtc: row.observed_at_utc,
+      legacyStatus: row.verification_status,
+    }),
   }));
   const partialReasons = result.partial_reasons;
   const complete = result.response_complete === true;
@@ -417,8 +650,12 @@ async function handleObservations(params, env, diagnosticContext) {
     index_version: INDEX_GENERATION,
     pollutant: params.pollutantCode,
     physical_layout_version: PHYSICAL_LAYOUT_VERSION,
-    writer_version: WRITER_VERSION,
     aligned_row_cap: ALIGNED_ROW_CAP,
+    physical_schemas: result.physical_schemas,
+    ...(result.physical_schema ? {
+      history_schema_version: result.physical_schema.history_schema_version,
+      writer_version: result.physical_schema.writer_version,
+    } : {}),
     timeseries_id: params.timeseriesId,
     connector_id: params.connectorId,
     start_utc: params.startIso,
@@ -458,16 +695,21 @@ export default {
     let context = null;
     try {
       assertGenerationConfiguration(env);
+      // Authenticated WHO provenance is always no-store, including compatibility
+      // requests; cached history/binding reads below still require the owned host.
       if (url.pathname === DAILY_PROVENANCE_PATH) {
         const params = parseDailyProvenanceRequest(url);
         if (!params.ok) return jsonResponse({ ok: false, error: params.error }, { status: params.status, noStore: true });
-        return handleDailyProvenance(params, env);
+        return await handleDailyProvenance(params, env);
+      }
+      if (historyCacheEnabled(env) && url.hostname !== HISTORY_CACHE_CONTRACT.reader_hostname) {
+        return jsonResponse({ ok: false, error: "history_custom_domain_required" }, { status: 503, noStore: true });
       }
       if (url.pathname === "/v1/timeseries-binding") {
         assertGenerationConfiguration(env);
         const params = parseBindingRequest(url);
         if (!params.ok) return jsonResponse({ ok: false, error: params.error }, { status: params.status, noStore: true });
-        const key = cacheKey(request.url, "v3-binding");
+        const key = cacheKey(request.url, "v3-binding", null, env);
         const cached = await caches.default.match(key);
         if (cached) return withCacheHeaders(cached, "HIT", TIMESERIES_BINDING_CACHE_GENERATION);
         const response = await handleBinding(params, env);
@@ -491,14 +733,56 @@ export default {
             physical_cursor_supplied: Boolean(params.physicalCursor),
           }));
         }
-        return withCacheHeaders(await handleObservations(params, env, context), "BYPASS", RESPONSE_CACHE_GENERATION);
+        const verificationAuthority = await loadObservationVerificationAuthority({
+          bucket: env.UK_AQ_HISTORY_BUCKET,
+          connectorId: params.connectorId,
+          cache: caches.default,
+        });
+        return withCacheHeaders(
+          await handleObservations(
+            params,
+            env,
+            context,
+            verificationAuthority,
+          ),
+          "BYPASS",
+          RESPONSE_CACHE_GENERATION,
+        );
       }
-      const key = cacheKey(request.url, INDEX_GENERATION);
+      const verificationDiscovery = await loadObservationVerificationDiscovery({
+        bucket: env.UK_AQ_HISTORY_BUCKET,
+        cache: caches.default,
+      });
+      const verificationManifestIdentity = observationVerificationManifestIdentityForConnector({
+        discovery: verificationDiscovery,
+        connectorId: params.connectorId,
+      });
+      const key = cacheKey(
+        request.url,
+        INDEX_GENERATION,
+        verificationManifestIdentity?.sha256 || null,
+        env,
+      );
       const cached = await caches.default.match(key);
-      if (cached) return withCacheHeaders(cached, "HIT", RESPONSE_CACHE_GENERATION);
-      const response = await handleObservations(params, env, null);
+      if (cached && (!historyCacheEnabled(env) || authenticatedHistoryTags(cached.headers, env))) return withCacheHeaders(cached, "HIT", RESPONSE_CACHE_GENERATION);
+      const verificationAuthority = await loadObservationVerificationAuthority({
+        bucket: env.UK_AQ_HISTORY_BUCKET,
+        connectorId: params.connectorId,
+        discovery: verificationDiscovery,
+        cache: caches.default,
+      });
+      let response = await handleObservations(
+        params,
+        env,
+        null,
+        verificationAuthority,
+      );
       const payload = await response.clone().json().catch(() => null);
-      if (response.ok && payload?.response_complete === true && payload?.has_gap !== true) {
+      if (response.ok) {
+        const headers = applyHistoryDependencyHeaders(new Headers(response.headers), env, [payload?.timeseries_id]);
+        response = new Response(response.body, { status: response.status, headers });
+      }
+      if (!response.headers.get("Cache-Control")?.includes("no-store") && response.ok && payload?.response_complete === true && payload?.has_gap !== true) {
         ctx?.waitUntil?.(caches.default.put(key, response.clone()));
       }
       return withCacheHeaders(response, "MISS", RESPONSE_CACHE_GENERATION);
