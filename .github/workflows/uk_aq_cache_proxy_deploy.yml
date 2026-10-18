@@ -6,6 +6,8 @@ on:
       - main
     paths:
       - "workers/uk_aq_cache_proxy/**"
+      - "workers/shared/uk_aq_history_cache.mjs"
+      - "config/uk_aq_history_cache.json"
       - ".github/workflows/uk_aq_cache_proxy_deploy.yml"
   workflow_dispatch:
     inputs:
@@ -14,6 +16,11 @@ on:
         required: false
         default: ""
         type: string
+      activate_compressed_chart_history:
+        description: "Opt in to the TEST compressed-chart service binding after its private Worker exists"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -24,6 +31,7 @@ jobs:
     env:
       UK_AQ_CACHE_WORKER_NAME: ${{ vars.UK_AQ_CACHE_WORKER_NAME || 'uk-aq-cache-proxy' }}
       UK_AQ_STATION_HISTORY_WORKER_NAME: ${{ vars.UK_AQ_STATION_HISTORY_WORKER_NAME || '' }}
+      UK_AQ_ENV_NAME: ${{ vars.UK_AQ_ENV_NAME || '' }}
       UK_AQ_R2_HISTORY_VERSION: ${{ vars.UK_AQ_R2_HISTORY_VERSION || '' }}
       UK_AQ_MEDIA_PUBLIC_URL: ${{ vars.UK_AQ_MEDIA_PUBLIC_URL || '' }}
       STATION_HISTORY_SERVICE_OVERRIDE: ${{ inputs.station_history_service_override || '' }}
@@ -33,9 +41,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+
       - name: Validate cache deployment identity and Cloudflare credentials
         run: |
           set -euo pipefail
+          if [ "${GITHUB_REPOSITORY_OWNER}" = "TEST-uk-aq" ] && [ "${UK_AQ_ENV_NAME}" != "TEST" ]; then
+            echo "TEST history cache cut-over requires UK_AQ_ENV_NAME=TEST."; exit 1
+          fi
           if [ -z "${UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN}" ]; then
             echo "Missing secret UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN (or legacy UK_AQ_CACHE_CLOUDFLARE_API_TOKEN)."
             exit 1
@@ -112,6 +128,57 @@ jobs:
             exit 1
           fi
 
+      - name: Verify and enable optional Sleepercar compressed-chart HTTPS upstream
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.activate_compressed_chart_history }}
+        working-directory: workers/uk_aq_cache_proxy
+        env:
+          PILOT_ORIGIN: ${{ vars.UK_AQ_COMPRESSED_CHART_UPSTREAM_URL || '' }}
+          PILOT_ACCESS_ID: ${{ secrets.UK_AQ_COMPRESSED_CHART_ACCESS_CLIENT_ID || '' }}
+          PILOT_ACCESS_SECRET: ${{ secrets.UK_AQ_COMPRESSED_CHART_ACCESS_CLIENT_SECRET || '' }}
+          PILOT_UPSTREAM_SECRET: ${{ secrets.UK_AQ_EDGE_UPSTREAM_SECRET || '' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PILOT_ORIGIN}" ] || [ -z "${PILOT_ACCESS_ID}" ] ||
+             [ -z "${PILOT_ACCESS_SECRET}" ] || [ -z "${PILOT_UPSTREAM_SECRET}" ]; then
+            echo "Sleepercar origin, Access service token and TEST upstream secret must be configured."
+            exit 1
+          fi
+          node --input-type=module <<'NODE'
+          const raw = process.env.PILOT_ORIGIN || "";
+          let u;
+          try { u = new URL(raw); } catch { process.exit(1); }
+          if (u.protocol !== "https:" || !/^[a-z0-9-]+\.sleepercar\.co\.uk$/.test(u.hostname)
+            || u.port || u.pathname !== "/" || u.search || u.hash || u.username || u.password) {
+            console.error("Pilot origin must be a clean HTTPS Sleepercar TEST subdomain.");
+            process.exit(1);
+          }
+          NODE
+          # This read-only probe is run only after the private Worker, Access
+          # service policy and approved v3 sample are actually deployed.
+          http_code="$(curl --silent --show-error --max-time 20 --connect-timeout 10 \
+            --output "${RUNNER_TEMP}/uk_aq_chart_history_prototype_manifest.json" \
+            --write-out '%{http_code}' \
+            --header "CF-Access-Client-Id: ${PILOT_ACCESS_ID}" \
+            --header "CF-Access-Client-Secret: ${PILOT_ACCESS_SECRET}" \
+            --header "X-UK-AQ-Upstream-Auth: ${PILOT_UPSTREAM_SECRET}" \
+            --header "Accept: application/json" \
+            "${PILOT_ORIGIN}/v1/manifest?sample=v3-september-2026")"
+          if [ "${http_code}" != "200" ]; then
+            echo "Sleepercar Worker not yet reachable/published through Access (HTTP ${http_code})."
+            exit 1
+          fi
+          jq -e '.schema_version == 1 and .sample_id == "v3-september-2026"
+            and .source_generation == "v3" and .identity.connector_id == 1
+            and .identity.station_id == 248 and .identity.timeseries_id == 212
+            and .identity.pollutant_code == "pm25"' \
+            "${RUNNER_TEMP}/uk_aq_chart_history_prototype_manifest.json" >/dev/null || {
+            echo "Sleepercar pilot returned unexpected manifest identity."
+            exit 1
+          }
+          sed -i 's/^UK_AQ_COMPRESSED_CHART_ENABLED = "false"$/UK_AQ_COMPRESSED_CHART_ENABLED = "true"/' wrangler.deploy.toml
+          grep -Fx 'UK_AQ_COMPRESSED_CHART_ENABLED = "true"' wrangler.deploy.toml >/dev/null
+          echo "Validated Sleepercar pilot; HTTPS proxy enabled for this explicit deployment."
+
       - name: Validate required Worker secrets and vars
         run: |
           set -euo pipefail
@@ -140,10 +207,16 @@ jobs:
 
       - name: Prepare and validate Worker secrets payload
         working-directory: workers/uk_aq_cache_proxy
+        env:
+          RECENT_AQI_PROTOTYPE_OPERATOR_TOKEN: ${{ secrets.UK_AQ_RECENT_AQI_PROTOTYPE_OPERATOR_TOKEN || '' }}
+          PILOT_ORIGIN: ${{ vars.UK_AQ_COMPRESSED_CHART_UPSTREAM_URL || '' }}
+          PILOT_ACCESS_ID: ${{ secrets.UK_AQ_COMPRESSED_CHART_ACCESS_CLIENT_ID || '' }}
+          PILOT_ACCESS_SECRET: ${{ secrets.UK_AQ_COMPRESSED_CHART_ACCESS_CLIENT_SECRET || '' }}
         run: |
           set -euo pipefail
           umask 077
           secrets_json="$(jq -n \
+            --arg UK_AQ_ENV_NAME "${{ vars.UK_AQ_ENV_NAME || '' }}" \
             --arg UK_AQ_R2_HISTORY_VERSION "${UK_AQ_R2_HISTORY_VERSION}" \
             --arg SUPABASE_URL "${{ vars.SUPABASE_URL }}" \
             --arg SB_PUBLISHABLE_DEFAULT_KEY "${{ secrets.SB_PUBLISHABLE_DEFAULT_KEY }}" \
@@ -184,6 +257,7 @@ jobs:
             --arg UK_AQ_TIMESERIES_HISTORICAL_BROWSER_TTL_SECONDS "${{ vars.UK_AQ_TIMESERIES_HISTORICAL_BROWSER_TTL_SECONDS }}" \
             --arg UK_AQ_TIMESERIES_HISTORICAL_SWR_SECONDS "${{ vars.UK_AQ_TIMESERIES_HISTORICAL_SWR_SECONDS }}" \
             --arg UK_AQ_TIMESERIES_STALE_IF_ERROR_SECONDS "${{ vars.UK_AQ_TIMESERIES_STALE_IF_ERROR_SECONDS }}" \
+            --arg UK_AQ_RECENT_AQI_PROTOTYPE_ENABLED "${{ vars.UK_AQ_RECENT_AQI_PROTOTYPE_ENABLED || 'false' }}" \
             --arg UK_AQ_STATION_HISTORY_STATION_SERIES_ENABLED "${{ vars.UK_AQ_STATION_HISTORY_STATION_SERIES_ENABLED || 'false' }}" \
             --arg UK_AQ_STATION_HISTORY_AQI_HISTORY_ENABLED "${{ vars.UK_AQ_STATION_HISTORY_AQI_HISTORY_ENABLED || 'false' }}" \
             --arg UK_AQ_STATION_HISTORY_TIMESERIES_ENABLED "${{ vars.UK_AQ_STATION_HISTORY_TIMESERIES_ENABLED || 'false' }}" \
@@ -199,8 +273,21 @@ jobs:
             --arg UK_AQ_DROPBOX_ROOT "${{ vars.UK_AQ_DROPBOX_ROOT }}" \
             --arg UK_AIR_ERROR_DROPBOX_FOLDER "${{ vars.UK_AIR_ERROR_DROPBOX_FOLDER }}" \
             --arg UK_AQ_WEBSITE_DEBUG_LOG_MAX_BODY_BYTES "${{ vars.UK_AQ_WEBSITE_DEBUG_LOG_MAX_BODY_BYTES }}" \
-            '{UK_AQ_R2_HISTORY_VERSION:$UK_AQ_R2_HISTORY_VERSION, SUPABASE_URL: $SUPABASE_URL, SB_PUBLISHABLE_DEFAULT_KEY: $SB_PUBLISHABLE_DEFAULT_KEY, SB_SECRET_KEY: $SB_SECRET_KEY, OBS_AQIDB_SUPABASE_URL: $OBS_AQIDB_SUPABASE_URL, OBS_AQIDB_SECRET_KEY: $OBS_AQIDB_SECRET_KEY, UK_AQ_AQI_HISTORY_R2_API_URL: $UK_AQ_AQI_HISTORY_R2_API_URL, UK_AQ_AQI_PROXY_HOURLY_GENERATION_ENABLED: $UK_AQ_AQI_PROXY_HOURLY_GENERATION_ENABLED, UK_AQ_AQI_MUTABLE_HOURS: $UK_AQ_AQI_MUTABLE_HOURS, UK_AQ_OBSERVS_HISTORY_R2_API_URL: $UK_AQ_OBSERVS_HISTORY_R2_API_URL, UK_AQ_LATEST_SNAPSHOT_R2_API_URL: $UK_AQ_LATEST_SNAPSHOT_R2_API_URL, UK_AQ_POSTCODE_LOOKUP_R2_API_URL: $UK_AQ_POSTCODE_LOOKUP_R2_API_URL, UK_AQ_POSTCODE_SUGGEST_R2_API_URL: $UK_AQ_POSTCODE_SUGGEST_R2_API_URL, UK_AQ_CACHE_ALLOWED_ORIGINS: $UK_AQ_CACHE_ALLOWED_ORIGINS, UK_AQ_EDGE_ACCESS_TOKEN_SECRET: $UK_AQ_EDGE_ACCESS_TOKEN_SECRET, UK_AQ_CACHE_BYPASS_SECRET: $UK_AQ_CACHE_BYPASS_SECRET, UK_AQ_LOCAL_DEV_BYPASS_ENABLED: $UK_AQ_LOCAL_DEV_BYPASS_ENABLED, UK_AQ_TURNSTILE_SECRET_KEY: $UK_AQ_TURNSTILE_SECRET_KEY, UK_AQ_EDGE_SESSION_MAX_AGE_SECONDS: $UK_AQ_EDGE_SESSION_MAX_AGE_SECONDS, UK_AQ_CHART_METRICS_RPC: $UK_AQ_CHART_METRICS_RPC, UK_AQ_CHART_METRICS_RATE_LIMIT_PER_MINUTE: $UK_AQ_CHART_METRICS_RATE_LIMIT_PER_MINUTE, UK_AQ_CHART_METRICS_MAX_BODY_BYTES: $UK_AQ_CHART_METRICS_MAX_BODY_BYTES, UK_AQ_TIMESERIES_V2_ENABLED: $UK_AQ_TIMESERIES_V2_ENABLED, UK_AQ_TIMESERIES_PROXY_FIRST: $UK_AQ_TIMESERIES_PROXY_FIRST, UK_AQ_TIMESERIES_R2_FIRST: $UK_AQ_TIMESERIES_R2_FIRST, UK_AQ_TIMESERIES_ALLOW_INGEST_OVERWRITE: $UK_AQ_TIMESERIES_ALLOW_INGEST_OVERWRITE, UK_AQ_TIMESERIES_MAX_WINDOW_DAYS: $UK_AQ_TIMESERIES_MAX_WINDOW_DAYS, UK_AQ_TIMESERIES_MAX_R2_OBJECTS_PER_REQUEST: $UK_AQ_TIMESERIES_MAX_R2_OBJECTS_PER_REQUEST, UK_AQ_TIMESERIES_MAX_SUPABASE_TAIL_HOURS: $UK_AQ_TIMESERIES_MAX_SUPABASE_TAIL_HOURS, UK_AQ_TIMESERIES_INCREMENTAL_OVERLAP_MINUTES: $UK_AQ_TIMESERIES_INCREMENTAL_OVERLAP_MINUTES, UK_AQ_TIMESERIES_PARTIAL_ON_R2_ERROR: $UK_AQ_TIMESERIES_PARTIAL_ON_R2_ERROR, UK_AQ_TIMESERIES_PARTIAL_ON_INGEST_ERROR: $UK_AQ_TIMESERIES_PARTIAL_ON_INGEST_ERROR, UK_AQ_TIMESERIES_RECENT_EDGE_TTL_SECONDS: $UK_AQ_TIMESERIES_RECENT_EDGE_TTL_SECONDS, UK_AQ_TIMESERIES_RECENT_BROWSER_TTL_SECONDS: $UK_AQ_TIMESERIES_RECENT_BROWSER_TTL_SECONDS, UK_AQ_TIMESERIES_RECENT_SWR_SECONDS: $UK_AQ_TIMESERIES_RECENT_SWR_SECONDS, UK_AQ_TIMESERIES_HISTORICAL_EDGE_TTL_SECONDS: $UK_AQ_TIMESERIES_HISTORICAL_EDGE_TTL_SECONDS, UK_AQ_TIMESERIES_HISTORICAL_BROWSER_TTL_SECONDS: $UK_AQ_TIMESERIES_HISTORICAL_BROWSER_TTL_SECONDS, UK_AQ_TIMESERIES_HISTORICAL_SWR_SECONDS: $UK_AQ_TIMESERIES_HISTORICAL_SWR_SECONDS, UK_AQ_TIMESERIES_STALE_IF_ERROR_SECONDS: $UK_AQ_TIMESERIES_STALE_IF_ERROR_SECONDS, UK_AQ_STATION_HISTORY_STATION_SERIES_ENABLED: $UK_AQ_STATION_HISTORY_STATION_SERIES_ENABLED, UK_AQ_STATION_HISTORY_AQI_HISTORY_ENABLED: $UK_AQ_STATION_HISTORY_AQI_HISTORY_ENABLED, UK_AQ_STATION_HISTORY_TIMESERIES_ENABLED: $UK_AQ_STATION_HISTORY_TIMESERIES_ENABLED, UK_AQ_STATION_HISTORY_STALE_FALLBACK_ENABLED: $UK_AQ_STATION_HISTORY_STALE_FALLBACK_ENABLED, UK_AQ_STATION_HISTORY_RECENT_BUNDLE_FRESH_TTL_SECONDS: $UK_AQ_STATION_HISTORY_RECENT_BUNDLE_FRESH_TTL_SECONDS, UK_AQ_STATION_HISTORY_RECENT_BUNDLE_MAX_STALE_SECONDS: $UK_AQ_STATION_HISTORY_RECENT_BUNDLE_MAX_STALE_SECONDS, UK_AQ_STATION_HISTORY_MUTABLE_AQI_MAX_STALE_SECONDS: $UK_AQ_STATION_HISTORY_MUTABLE_AQI_MAX_STALE_SECONDS, UK_AQ_STATION_HISTORY_MUTABLE_OBSERVATION_MAX_STALE_SECONDS: $UK_AQ_STATION_HISTORY_MUTABLE_OBSERVATION_MAX_STALE_SECONDS, UK_AQ_STATION_HISTORY_IMMUTABLE_HISTORY_MAX_STALE_SECONDS: $UK_AQ_STATION_HISTORY_IMMUTABLE_HISTORY_MAX_STALE_SECONDS, DROPBOX_APP_KEY: $DROPBOX_APP_KEY, DROPBOX_APP_SECRET: $DROPBOX_APP_SECRET, DROPBOX_REFRESH_TOKEN: $DROPBOX_REFRESH_TOKEN, UK_AQ_DROPBOX_ROOT: $UK_AQ_DROPBOX_ROOT, UK_AIR_ERROR_DROPBOX_FOLDER: $UK_AIR_ERROR_DROPBOX_FOLDER, UK_AQ_WEBSITE_DEBUG_LOG_MAX_BODY_BYTES: $UK_AQ_WEBSITE_DEBUG_LOG_MAX_BODY_BYTES} | with_entries(select(.value != ""))')"
+            '{UK_AQ_ENV_NAME:$UK_AQ_ENV_NAME, UK_AQ_R2_HISTORY_VERSION:$UK_AQ_R2_HISTORY_VERSION, SUPABASE_URL: $SUPABASE_URL, SB_PUBLISHABLE_DEFAULT_KEY: $SB_PUBLISHABLE_DEFAULT_KEY, SB_SECRET_KEY: $SB_SECRET_KEY, OBS_AQIDB_SUPABASE_URL: $OBS_AQIDB_SUPABASE_URL, OBS_AQIDB_SECRET_KEY: $OBS_AQIDB_SECRET_KEY, UK_AQ_AQI_HISTORY_R2_API_URL: $UK_AQ_AQI_HISTORY_R2_API_URL, UK_AQ_AQI_PROXY_HOURLY_GENERATION_ENABLED: $UK_AQ_AQI_PROXY_HOURLY_GENERATION_ENABLED, UK_AQ_AQI_MUTABLE_HOURS: $UK_AQ_AQI_MUTABLE_HOURS, UK_AQ_OBSERVS_HISTORY_R2_API_URL: $UK_AQ_OBSERVS_HISTORY_R2_API_URL, UK_AQ_LATEST_SNAPSHOT_R2_API_URL: $UK_AQ_LATEST_SNAPSHOT_R2_API_URL, UK_AQ_POSTCODE_LOOKUP_R2_API_URL: $UK_AQ_POSTCODE_LOOKUP_R2_API_URL, UK_AQ_POSTCODE_SUGGEST_R2_API_URL: $UK_AQ_POSTCODE_SUGGEST_R2_API_URL, UK_AQ_CACHE_ALLOWED_ORIGINS: $UK_AQ_CACHE_ALLOWED_ORIGINS, UK_AQ_EDGE_ACCESS_TOKEN_SECRET: $UK_AQ_EDGE_ACCESS_TOKEN_SECRET, UK_AQ_CACHE_BYPASS_SECRET: $UK_AQ_CACHE_BYPASS_SECRET, UK_AQ_LOCAL_DEV_BYPASS_ENABLED: $UK_AQ_LOCAL_DEV_BYPASS_ENABLED, UK_AQ_TURNSTILE_SECRET_KEY: $UK_AQ_TURNSTILE_SECRET_KEY, UK_AQ_EDGE_SESSION_MAX_AGE_SECONDS: $UK_AQ_EDGE_SESSION_MAX_AGE_SECONDS, UK_AQ_CHART_METRICS_RPC: $UK_AQ_CHART_METRICS_RPC, UK_AQ_CHART_METRICS_RATE_LIMIT_PER_MINUTE: $UK_AQ_CHART_METRICS_RATE_LIMIT_PER_MINUTE, UK_AQ_CHART_METRICS_MAX_BODY_BYTES: $UK_AQ_CHART_METRICS_MAX_BODY_BYTES, UK_AQ_TIMESERIES_V2_ENABLED: $UK_AQ_TIMESERIES_V2_ENABLED, UK_AQ_TIMESERIES_PROXY_FIRST: $UK_AQ_TIMESERIES_PROXY_FIRST, UK_AQ_TIMESERIES_R2_FIRST: $UK_AQ_TIMESERIES_R2_FIRST, UK_AQ_TIMESERIES_ALLOW_INGEST_OVERWRITE: $UK_AQ_TIMESERIES_ALLOW_INGEST_OVERWRITE, UK_AQ_TIMESERIES_MAX_WINDOW_DAYS: $UK_AQ_TIMESERIES_MAX_WINDOW_DAYS, UK_AQ_TIMESERIES_MAX_R2_OBJECTS_PER_REQUEST: $UK_AQ_TIMESERIES_MAX_R2_OBJECTS_PER_REQUEST, UK_AQ_TIMESERIES_MAX_SUPABASE_TAIL_HOURS: $UK_AQ_TIMESERIES_MAX_SUPABASE_TAIL_HOURS, UK_AQ_TIMESERIES_INCREMENTAL_OVERLAP_MINUTES: $UK_AQ_TIMESERIES_INCREMENTAL_OVERLAP_MINUTES, UK_AQ_TIMESERIES_PARTIAL_ON_R2_ERROR: $UK_AQ_TIMESERIES_PARTIAL_ON_R2_ERROR, UK_AQ_TIMESERIES_PARTIAL_ON_INGEST_ERROR: $UK_AQ_TIMESERIES_PARTIAL_ON_INGEST_ERROR, UK_AQ_TIMESERIES_RECENT_EDGE_TTL_SECONDS: $UK_AQ_TIMESERIES_RECENT_EDGE_TTL_SECONDS, UK_AQ_TIMESERIES_RECENT_BROWSER_TTL_SECONDS: $UK_AQ_TIMESERIES_RECENT_BROWSER_TTL_SECONDS, UK_AQ_TIMESERIES_RECENT_SWR_SECONDS: $UK_AQ_TIMESERIES_RECENT_SWR_SECONDS, UK_AQ_TIMESERIES_HISTORICAL_EDGE_TTL_SECONDS: $UK_AQ_TIMESERIES_HISTORICAL_EDGE_TTL_SECONDS, UK_AQ_TIMESERIES_HISTORICAL_BROWSER_TTL_SECONDS: $UK_AQ_TIMESERIES_HISTORICAL_BROWSER_TTL_SECONDS, UK_AQ_TIMESERIES_HISTORICAL_SWR_SECONDS: $UK_AQ_TIMESERIES_HISTORICAL_SWR_SECONDS, UK_AQ_TIMESERIES_STALE_IF_ERROR_SECONDS: $UK_AQ_TIMESERIES_STALE_IF_ERROR_SECONDS, UK_AQ_RECENT_AQI_PROTOTYPE_ENABLED: $UK_AQ_RECENT_AQI_PROTOTYPE_ENABLED, UK_AQ_STATION_HISTORY_STATION_SERIES_ENABLED: $UK_AQ_STATION_HISTORY_STATION_SERIES_ENABLED, UK_AQ_STATION_HISTORY_AQI_HISTORY_ENABLED: $UK_AQ_STATION_HISTORY_AQI_HISTORY_ENABLED, UK_AQ_STATION_HISTORY_TIMESERIES_ENABLED: $UK_AQ_STATION_HISTORY_TIMESERIES_ENABLED, UK_AQ_STATION_HISTORY_STALE_FALLBACK_ENABLED: $UK_AQ_STATION_HISTORY_STALE_FALLBACK_ENABLED, UK_AQ_STATION_HISTORY_RECENT_BUNDLE_FRESH_TTL_SECONDS: $UK_AQ_STATION_HISTORY_RECENT_BUNDLE_FRESH_TTL_SECONDS, UK_AQ_STATION_HISTORY_RECENT_BUNDLE_MAX_STALE_SECONDS: $UK_AQ_STATION_HISTORY_RECENT_BUNDLE_MAX_STALE_SECONDS, UK_AQ_STATION_HISTORY_MUTABLE_AQI_MAX_STALE_SECONDS: $UK_AQ_STATION_HISTORY_MUTABLE_AQI_MAX_STALE_SECONDS, UK_AQ_STATION_HISTORY_MUTABLE_OBSERVATION_MAX_STALE_SECONDS: $UK_AQ_STATION_HISTORY_MUTABLE_OBSERVATION_MAX_STALE_SECONDS, UK_AQ_STATION_HISTORY_IMMUTABLE_HISTORY_MAX_STALE_SECONDS: $UK_AQ_STATION_HISTORY_IMMUTABLE_HISTORY_MAX_STALE_SECONDS, DROPBOX_APP_KEY: $DROPBOX_APP_KEY, DROPBOX_APP_SECRET: $DROPBOX_APP_SECRET, DROPBOX_REFRESH_TOKEN: $DROPBOX_REFRESH_TOKEN, UK_AQ_DROPBOX_ROOT: $UK_AQ_DROPBOX_ROOT, UK_AIR_ERROR_DROPBOX_FOLDER: $UK_AIR_ERROR_DROPBOX_FOLDER, UK_AQ_WEBSITE_DEBUG_LOG_MAX_BODY_BYTES: $UK_AQ_WEBSITE_DEBUG_LOG_MAX_BODY_BYTES} | with_entries(select(.value != ""))')"
           secrets_json="$(jq --arg value "${{ secrets.UK_AQ_EDGE_UPSTREAM_SECRET }}" '. + {UK_AQ_EDGE_UPSTREAM_SECRET: $value}' <<<"$secrets_json")"
+          if [ -n "${RECENT_AQI_PROTOTYPE_OPERATOR_TOKEN}" ]; then
+            secrets_json="$(jq --arg value "${RECENT_AQI_PROTOTYPE_OPERATOR_TOKEN}" '. + {UK_AQ_RECENT_AQI_PROTOTYPE_OPERATOR_TOKEN: $value}' <<<"$secrets_json")"
+          fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] &&
+             [ "${{ inputs.activate_compressed_chart_history }}" = "true" ]; then
+            secrets_json="$(jq \
+              --arg origin "${PILOT_ORIGIN}" \
+              --arg id "${PILOT_ACCESS_ID}" \
+              --arg secret "${PILOT_ACCESS_SECRET}" \
+              '. + {UK_AQ_COMPRESSED_CHART_UPSTREAM_URL: $origin,
+                    UK_AQ_COMPRESSED_CHART_ACCESS_CLIENT_ID: $id,
+                    UK_AQ_COMPRESSED_CHART_ACCESS_CLIENT_SECRET: $secret}' <<<"$secrets_json")"
+          fi
           SECRETS_PAYLOAD_PATH="${RUNNER_TEMP}/uk_aq_cache_proxy_secrets.json"
           jq -e '
             if (type == "object" and length > 0 and all(.[]; type == "string"))
@@ -214,7 +301,7 @@ jobs:
         working-directory: workers/uk_aq_cache_proxy
         run: |
           set -euo pipefail
-          npx --yes wrangler@4 deploy \
+          npx --yes wrangler@4.130.0 deploy \
             --dry-run \
             --config wrangler.deploy.toml \
             --name "${UK_AQ_CACHE_WORKER_NAME}" \
@@ -231,7 +318,7 @@ jobs:
             local worker_name="$1"
             local role="$2"
             local versions_json="$3"
-            if ! npx --yes wrangler@4 versions list \
+            if ! npx --yes wrangler@4.130.0 versions list \
               --config wrangler.deploy.toml \
               --name "${worker_name}" \
               --json > "${versions_json}"; then
@@ -268,7 +355,7 @@ jobs:
           jq -e 'type == "object" and length > 0 and all(.[]; type == "string")' \
             "${SECRETS_PAYLOAD_PATH}" >/dev/null
           for attempt in 1 2 3; do
-            if npx --yes wrangler@4 secret bulk \
+            if npx --yes wrangler@4.130.0 secret bulk \
               "${SECRETS_PAYLOAD_PATH}" \
               --name "${UK_AQ_CACHE_WORKER_NAME}"; then
               exit 0
@@ -286,6 +373,7 @@ jobs:
           apiToken: ${{ env.UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN }}
           accountId: ${{ env.UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID }}
           workingDirectory: workers/uk_aq_cache_proxy
+          wranglerVersion: "4.130.0"
           command: deploy --config wrangler.deploy.toml --name ${{ env.UK_AQ_CACHE_WORKER_NAME }}
 
       - name: Report deployed STATION_HISTORY target
