@@ -45,6 +45,11 @@ Required loaded environment:
 The verifier performs Git/GitHub reads, PostgreSQL SELECTs, a D1 SELECT,
 R2 GET/HEAD, local evidence reads, and HTTP GET probes only. It never starts
 Prune or backup and never changes maintenance, schedulers, data, or config.
+
+Bounded historical baseline authentication uses Node 22 node:sqlite and
+disposable SQLite scratch under TMPDIR. At least 40 GiB of free scratch
+space is required by the existing bounded store. A failed verification keeps
+its private scratch for diagnosis; only a successful verification deletes it.
 EOF
 }
 
@@ -159,12 +164,12 @@ fi
 
 if [ -n "$NODE_BIN" ]; then
   [ -x "$NODE_BIN" ] || fail "--node-bin is not executable"
-elif command -v node >/dev/null 2>&1 && node --version | grep -Eq '^v20\.'; then
+elif command -v node >/dev/null 2>&1 && node --version | grep -Eq '^v22\.'; then
   NODE_BIN="$(command -v node)"
 else
-  NODE_BIN="$(npx --yes node@20 -p 'process.execPath')" || fail "Node 20 could not be resolved"
+  NODE_BIN="$(npx --yes node@22 -p 'process.execPath')" || fail "Node 22 could not be resolved"
 fi
-"$NODE_BIN" --version | grep -Eq '^v20\.' || fail "the verifier requires Node 20"
+"$NODE_BIN" --version | grep -Eq '^v22\.' || fail "the bounded verifier requires Node 22 (node:sqlite)"
 
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/uk-aq-index-v3-steady-state.XXXXXX")"
 trap 'rm -rf "$TMP_DIR"' EXIT

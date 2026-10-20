@@ -36,7 +36,13 @@ export function assertBoundedOperatorIdentity({ plan, checkpoint, manifest, plan
   const hasExplicitIdentity = expectedMigrationRunId !== undefined && expectedPlanSha256 !== undefined;
   demand((hasReport && expectedMigrationRunId === undefined && expectedPlanSha256 === undefined) ||
     (!hasReport && hasExplicitIdentity), 'Choose exactly one complete operator migration identity source');
-  const expectedRunId = hasReport ? planReport?.result?.migration_run_id : expectedMigrationRunId;
+  // Historical exceptional-recovery audits record migration_run_id in audit
+  // rather than result. Both identities must agree when both are present.
+  const resultRunId = planReport?.result?.migration_run_id;
+  const auditRunId = planReport?.audit?.migration_run_id;
+  demand(!hasReport || resultRunId == null || auditRunId == null ||
+    resultRunId === auditRunId, 'Operator result/audit migration run identities disagree');
+  const expectedRunId = hasReport ? (resultRunId ?? auditRunId) : expectedMigrationRunId;
   const expectedPlan = hasReport ? planReport?.result?.plan_sha256 : expectedPlanSha256;
   demand(expectedRunId === plan.migration_run_id && expectedRunId === checkpoint.migration_run_id &&
     expectedRunId === manifest.payload.migration_run_id && expectedPlan === plan.plan_sha256 &&
@@ -158,6 +164,12 @@ export class BoundedBaseline {
       'Canonical parent hierarchy omits a source scope');
     const days = collectSmall(store.summaries('canonical-day'));
     const aggregate = buildObservationsManifestHierarchy({ observationsPrefix: plan.target_observations_prefix, dayManifests: days });
+    // Authenticated post-migration/pre-write parent child sets for a later
+    // steady-state write. Only the compact month/year/root descriptors survive;
+    // canonical file and publication bodies remain in the bounded disk store.
+    this.steadyStateAggregates = aggregate.objects.map((entry) => ({
+      key: entry.key, level: entry.level, children: entry.manifest.children,
+    }));
     for (const entry of aggregate.objects) {
       const bytes = Buffer.from(entry.body);
       const dependencies = entry.manifest.children.map((child) => {
@@ -175,6 +187,7 @@ export class BoundedBaseline {
       a.connector_id - b.connector_id || Buffer.compare(Buffer.from(a.pollutant_code), Buffer.from(b.pollutant_code)));
     const latest = latestArtifactFromRoots(roots, plan.v3_index_root, plan.v3_latest_key);
     validateObservationHistoryExactLeafIndexV3LatestRegistry({ artifact: latest, indexRoot: plan.v3_index_root, latestKey: plan.v3_latest_key });
+    this.steadyStateLatest = latest.payload;
     const latestSchedule = buildObservationHistoryIndexV3PublicationPlan({ objects: [latest], externalReferences:
       roots.map((entry) => ({ ...compact(entry), verified: true, durable: true, kind: 'scoped_manifest' })) });
     this.addObject(latestSchedule.entries[0], { v3: true });
