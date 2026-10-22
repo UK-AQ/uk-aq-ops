@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { resolveObservationHistoryGeneration, assertObservationHistoryGenerationPrefixes } from "../../workers/shared/uk_aq_observation_history_generation.mjs";
+import { assertHistoryBackupSource, assertHistoryBackupRemotes } from "./lib/history_backup_targets.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,6 +20,7 @@ import {
   assertSelectedBackupInventory,
   buildObservationMonthInventoryShard,
   buildObservationRunManifestInventoryShard,
+  computeVerificationSourceRootHash,
   observationMonthInventoryShardKey,
   resolveObservationsTimeseriesLatestPath,
   sha256Hex,
@@ -27,6 +29,7 @@ import {
   validateHierarchicalInventoryRoot,
   validateObservationRunManifestInventoryShard,
   validateTimeseriesBindingPackInventoryReference,
+  validateVerificationInventory,
 } from "./lib/hierarchical_backup_v2.mjs";
 import {
   buildTimeseriesBindingInventory,
@@ -48,6 +51,11 @@ import {
 import {
   requireLockedHistoryBackupMutation,
 } from "./uk_aq_run_locked_history_backup.mjs";
+import {
+  OBSERVATION_VERIFICATION_LATEST_KEY,
+  validateObservationVerificationConnectorManifest,
+  validateObservationVerificationLatest,
+} from "../../workers/shared/uk_aq_observation_verification_overlay.mjs";
 
 const DEFAULT_RCLONE_BIN =
   String(process.env.UK_AQ_R2_HISTORY_BACKUP_RCLONE_BIN || "").trim() || "rclone";
@@ -86,7 +94,7 @@ function usage() {
     "    --source-root <rclone-source-root> [options]",
     "",
     "Required:",
-    "  --source-root <root>          Example: uk_aq_r2_test:uk-aq-history-cic-test",
+    "  --source-root <root>          Exact: uk_aq_r2:<configured R2 bucket>",
     "",
     "Options:",
     `  --observations-prefix <p>    Default: ${DEFAULT_OBSERVATIONS_PREFIX}`,
@@ -223,6 +231,84 @@ function writeReport(filename, report) {
   fs.writeFileSync(output, `${JSON.stringify(report, null, 2)}\n`, "utf8");
 }
 
+function buildVerificationInventory(args, previousRoot) {
+  const latestSource = readJsonMaybe(
+    args.rclone_bin,
+    args.source_root,
+    OBSERVATION_VERIFICATION_LATEST_KEY,
+  );
+  if (!latestSource) {
+    if (previousRoot?.verification) {
+      throw new Error(
+        "Verification latest disappeared after overlay activation; refusing to treat it as deactivation",
+      );
+    }
+    return {
+      inventory: null,
+      report: {
+        active: false,
+        latest_present: false,
+        connector_manifests: 0,
+        source_root_hash: null,
+      },
+    };
+  }
+  const latest = validateObservationVerificationLatest(latestSource.parsed);
+  const latestIdentity = {
+    relative_path: OBSERVATION_VERIFICATION_LATEST_KEY,
+    sha256: sha256Hex(latestSource.text),
+    byte_size: Buffer.byteLength(latestSource.text, "utf8"),
+  };
+  const connectorManifests = latest.connectors.map((expected) => {
+    const source = readJson(args.rclone_bin, args.source_root, expected.key);
+    const actual = {
+      connector_id: expected.connector_id,
+      relative_path: expected.key,
+      sha256: sha256Hex(source.text),
+      byte_size: Buffer.byteLength(source.text, "utf8"),
+    };
+    if (
+      actual.sha256 !== expected.sha256 ||
+      actual.byte_size !== expected.byte_size
+    ) {
+      throw new Error(
+        `Verification latest identity mismatch for connector ${expected.connector_id}`,
+      );
+    }
+    const manifest = validateObservationVerificationConnectorManifest(source.parsed);
+    if (manifest.connector_id !== expected.connector_id) {
+      throw new Error("Verification connector manifest identity is contradictory");
+    }
+    return actual;
+  });
+  const inventory = validateVerificationInventory({
+    source_root_hash: computeVerificationSourceRootHash({
+      latest: latestIdentity,
+      connectorManifests,
+    }),
+    latest: latestIdentity,
+    connector_manifests: connectorManifests,
+  });
+  const previous = previousRoot?.verification || null;
+  const reused = previous && stableJson(previous) === stableJson(inventory)
+    ? previous
+    : inventory;
+  return {
+    inventory: reused,
+    report: {
+      active: true,
+      latest_present: true,
+      latest_key: latestIdentity.relative_path,
+      latest_sha256: latestIdentity.sha256,
+      latest_byte_size: latestIdentity.byte_size,
+      connector_manifests: connectorManifests.length,
+      connector_ids: connectorManifests.map((entry) => entry.connector_id),
+      source_root_hash: inventory.source_root_hash,
+      inventory_identity_reused: reused === previous,
+    },
+  };
+}
+
 function validateAggregate(raw, expectedKind, observationsPrefix, identity = {}) {
   const manifest = validateR2HistoryV2ObservationsAggregateManifest(
     raw,
@@ -332,6 +418,8 @@ function scanRunManifests(args, previousShard) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  assertHistoryBackupSource(args.source_root);
+  assertHistoryBackupRemotes({ rcloneBin: args.rclone_bin, dropbox: false });
   const generation = resolveObservationHistoryGeneration(process.env);
   requireLockedHistoryBackupMutation({
     dryRun: args.dry_run,
@@ -575,6 +663,8 @@ async function main() {
     if (args.timeseries_binding_backup_mode !== "individual") throw error;
   }
 
+  const verificationInventory = buildVerificationInventory(args, previousRoot);
+
   const root = buildHierarchicalInventoryRoot({
     observationsRootManifestKey: observationsRootKey,
     observationsRootHash: sourceRoot.content_hash,
@@ -589,6 +679,9 @@ async function main() {
     root.timeseries_binding_packs = bindingPackInventory.root_reference;
   }
   root.core = coreInventory.root_reference;
+  if (verificationInventory.inventory) {
+    root.verification = verificationInventory.inventory;
+  }
   root.observation_generation = generation.version;
   assertSelectedBackupInventory(generation, root);
   const rootWrite = writeRemoteJson(
@@ -601,6 +694,7 @@ async function main() {
 
   const report = {
     ok: true,
+    observation_generation: generation.version,
     started_at: startedAt,
     completed_at: new Date().toISOString(),
     inventory_mode: args.full_scan ? "full_scan" : "hierarchical",
@@ -650,6 +744,7 @@ async function main() {
       byte_size: latestTimeseries.byte_size,
       inventory_identity_reused: latestTimeseries === previousLatestTimeseries,
     },
+    verification: verificationInventory.report,
   };
   writeReport(args.report_out, report);
   console.log(JSON.stringify(report, null, 2));

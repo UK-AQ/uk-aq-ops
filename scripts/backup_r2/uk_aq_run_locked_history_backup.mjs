@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { resolveObservationHistoryGeneration, assertObservationHistoryGenerationPrefixes } from "../../workers/shared/uk_aq_observation_history_generation.mjs";
+import { assertHistoryBackupSource, assertHistoryBackupDestination, assertHistoryBackupRemotes } from "./lib/history_backup_targets.mjs";
 import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 
@@ -28,10 +29,18 @@ function requireValue(argv, index, flag) {
   return value;
 }
 
-export function parseLockedHistoryBackupArgs(argv) {
+function validateForcePruneMaxDays(value) {
+  if (!/^[1-9]\d*$/.test(String(value)) || !Number.isSafeInteger(Number(value))) {
+    throw new Error("--force-prune-max-days-per-run / UK_AQ_R2_HISTORY_FORCE_PRUNE_MAX_DAYS_PER_RUN must be a positive integer within the safe integer range");
+  }
+  return String(value);
+}
+
+export function parseLockedHistoryBackupArgs(argv, env = process.env) {
   const args = {
     sourceRoot: null,
     destRoot: null,
+    generation: null,
     observationsPrefix: null,
     runsPrefix: null,
     corePrefix: null,
@@ -46,6 +55,7 @@ export function parseLockedHistoryBackupArgs(argv) {
     maxDaysPerRun: "0",
     checkpointBatchUnits: "10",
     checkpointFlushSeconds: "60",
+    forcePruneMaxDaysPerRun: null,
     inventoryReportOut: null,
     backupReportOut: null,
     dryRun: false,
@@ -68,6 +78,7 @@ export function parseLockedHistoryBackupArgs(argv) {
       index += 1;
       if (flag === "--source-root") args.sourceRoot = value;
       else if (flag === "--dest-root") args.destRoot = value;
+      else if (flag === "--generation") args.generation = value;
       else if (flag === "--observations-prefix") args.observationsPrefix = value;
       else if (flag === "--runs-prefix") args.runsPrefix = value;
       else if (flag === "--core-prefix") args.corePrefix = value;
@@ -86,6 +97,9 @@ export function parseLockedHistoryBackupArgs(argv) {
       else if (flag === "--max-days-per-run") args.maxDaysPerRun = value;
       else if (flag === "--checkpoint-batch-units") args.checkpointBatchUnits = value;
       else if (flag === "--checkpoint-flush-seconds") args.checkpointFlushSeconds = value;
+      else if (flag === "--force-prune-max-days-per-run") {
+        args.forcePruneMaxDaysPerRun = value;
+      }
       else if (flag === "--inventory-report-out") args.inventoryReportOut = value;
       else if (flag === "--backup-report-out") args.backupReportOut = value;
       else if (flag === "--pack-publisher-report-out") {
@@ -109,11 +123,18 @@ export function parseLockedHistoryBackupArgs(argv) {
   ]) {
     if (!/^\d+$/.test(String(value))) throw new Error(`${flag} must be a non-negative integer`);
   }
+  if (args.forcePruneMaxDaysPerRun !== null) {
+    validateForcePruneMaxDays(args.forcePruneMaxDaysPerRun);
+  }
   if (args.historyIndexVersion !== null) resolveObservationsTimeseriesLatestPath(args.historyIndexVersion);
+  if (args.generation !== null && !["v2", "v3"].includes(args.generation)) {
+    throw new Error("--generation must be exactly v2 or v3");
+  }
   assertExperimentalPackOnlyDestination({
     mode: args.timeseriesBindingBackupMode,
     destRoot: args.destRoot,
     allowExperimentalPackOnly: args.allowExperimentalPackOnly,
+    env,
   });
   if (
     args.timeseriesBindingPacksOnly
@@ -172,20 +193,45 @@ export function runLockedHistoryBackup({
     env,
     expectedOwner: "r2_history_dropbox_backup",
   });
-  const generation = resolveObservationHistoryGeneration(env);
+  const selectedEnv = args.generation == null ? env : {
+    ...env,
+    UK_AQ_R2_HISTORY_VERSION: args.generation,
+  };
+  const generation = resolveObservationHistoryGeneration(selectedEnv);
+  const backupEnv = args.generation == null ? env : {
+    ...selectedEnv,
+    UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX: generation.observations_prefix,
+    UK_AQ_R2_HISTORY_V2_RUNS_PREFIX: generation.observations_runs_prefix,
+    UK_AQ_R2_HISTORY_V2_CORE_PREFIX: generation.core_prefix,
+    UK_AQ_R2_HISTORY_TIMESERIES_BINDING_V2_PREFIX:
+      generation.timeseries_binding_index_prefix,
+    UK_AQ_R2_HISTORY_INDEX_V2_PREFIX: generation.index_root_prefix,
+    UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX:
+      generation.backup_inventory_prefix,
+    UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX:
+      generation.backup_state_prefix,
+  };
+  if (args.generation != null && args.generation !== env.UK_AQ_R2_HISTORY_VERSION &&
+      (args.maxDaysPerRun !== "0" || args.timeseriesBindingPacksOnly)) {
+    throw new Error("Selected non-default generation backup must cover the complete required scope");
+  }
   args = {
     ...args,
-    observationsPrefix: args.observationsPrefix ?? (env.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX || generation.observations_prefix),
-    runsPrefix: args.runsPrefix ?? (env.UK_AQ_R2_HISTORY_V2_RUNS_PREFIX || generation.observations_runs_prefix),
-    timeseriesBindingPrefix: args.timeseriesBindingPrefix ?? (env.UK_AQ_R2_HISTORY_TIMESERIES_BINDING_V2_PREFIX || generation.timeseries_binding_index_prefix),
+    forcePruneMaxDaysPerRun: validateForcePruneMaxDays(
+      args.forcePruneMaxDaysPerRun
+        ?? (String(env.UK_AQ_R2_HISTORY_FORCE_PRUNE_MAX_DAYS_PER_RUN ?? "").trim() || "50"),
+    ),
+    observationsPrefix: args.observationsPrefix ?? (backupEnv.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX || generation.observations_prefix),
+    runsPrefix: args.runsPrefix ?? (backupEnv.UK_AQ_R2_HISTORY_V2_RUNS_PREFIX || generation.observations_runs_prefix),
+    timeseriesBindingPrefix: args.timeseriesBindingPrefix ?? (backupEnv.UK_AQ_R2_HISTORY_TIMESERIES_BINDING_V2_PREFIX || generation.timeseries_binding_index_prefix),
     historyIndexVersion: args.historyIndexVersion ?? generation.version,
-    corePrefix: args.corePrefix ?? (env.UK_AQ_R2_HISTORY_V2_CORE_PREFIX || generation.core_prefix),
-    inventoryRootPrefix: args.inventoryRootPrefix ?? (env.UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX || generation.backup_inventory_prefix),
-    stateRootPrefix: args.stateRootPrefix ?? (env.UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX || generation.backup_state_prefix),
+    corePrefix: args.corePrefix ?? (backupEnv.UK_AQ_R2_HISTORY_V2_CORE_PREFIX || generation.core_prefix),
+    inventoryRootPrefix: args.inventoryRootPrefix ?? (backupEnv.UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX || generation.backup_inventory_prefix),
+    stateRootPrefix: args.stateRootPrefix ?? (backupEnv.UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX || generation.backup_state_prefix),
     timeseriesBindingPackPrefix: args.timeseriesBindingPackPrefix ?? generation.timeseries_binding_pack_prefix,
   };
   assertObservationHistoryGenerationPrefixes(generation, {
-    indexPrefix: env.UK_AQ_R2_HISTORY_INDEX_V2_PREFIX || generation.index_root_prefix,
+    indexPrefix: backupEnv.UK_AQ_R2_HISTORY_INDEX_V2_PREFIX || generation.index_root_prefix,
     observationsPrefix: args.observationsPrefix, bindingPrefix: args.timeseriesBindingPrefix,
     corePrefix: args.corePrefix, inventoryPrefix: args.inventoryRootPrefix,
     statePrefix: args.stateRootPrefix, packPrefix: args.timeseriesBindingPackPrefix,
@@ -201,13 +247,14 @@ export function runLockedHistoryBackup({
     });
     runRequired(node, [
       "scripts/backup_r2/publish_timeseries_binding_backup_packs.mjs",
+      "--source-root", args.sourceRoot,
       "--binding-prefix", args.timeseriesBindingPrefix,
       "--pack-prefix", args.timeseriesBindingPackPrefix,
       ...(args.packPublisherReportOut
         ? ["--report-out", args.packPublisherReportOut]
         : []),
       args.dryRun ? "--dry-run" : "--write-r2",
-    ], { env, run });
+    ], { env: backupEnv, run });
     reportStageComplete("timeseries-binding packs", packStartedAtMs, { log, now });
   }
   const inventoryStartedAtMs = reportStageStarted("building backup inventory", {
@@ -226,7 +273,8 @@ export function runLockedHistoryBackup({
     "--history-index-version", args.historyIndexVersion,
     "--inventory-root-prefix", args.inventoryRootPrefix,
     "--report-out", args.inventoryReportOut,
-  ], { env, run });
+    ...(args.dryRun ? ["--dry-run"] : []),
+  ], { env: backupEnv, run });
   reportStageComplete("backup inventory", inventoryStartedAtMs, { log, now });
   const syncStartedAtMs = reportStageStarted("syncing history to Dropbox", {
     log,
@@ -245,15 +293,17 @@ export function runLockedHistoryBackup({
     "--max-days-per-run", args.maxDaysPerRun,
     "--checkpoint-batch-units", args.checkpointBatchUnits,
     "--checkpoint-flush-seconds", args.checkpointFlushSeconds,
+    "--force-prune-max-days-per-run", args.forcePruneMaxDaysPerRun,
     "--report-out", args.backupReportOut,
     ...(args.dryRun ? ["--dry-run"] : []),
     ...(args.forcePruneRecheck ? ["--force-prune-recheck"] : []),
     ...(args.allowExperimentalPackOnly ? ["--allow-experimental-pack-only"] : []),
     ...(args.timeseriesBindingPacksOnly ? ["--timeseries-binding-packs-only"] : []),
-  ], { env, run });
+  ], { env: backupEnv, run });
   reportStageComplete("Dropbox sync", syncStartedAtMs, { log, now });
   return {
     ok: true,
+    generation: generation.version,
     observations_global_operation_lock: {
       owner: lock.owner,
       run_id: lock.run_id,
@@ -267,8 +317,12 @@ export function runLockedHistoryBackup({
 }
 
 export function main({ argv = process.argv.slice(2), env = process.env } = {}) {
+  const args = parseLockedHistoryBackupArgs(argv, env);
+  assertHistoryBackupSource(args.sourceRoot, env);
+  assertHistoryBackupDestination(args.destRoot, env);
+  assertHistoryBackupRemotes({ env, rcloneBin: env.UK_AQ_R2_HISTORY_BACKUP_RCLONE_BIN || "rclone" });
   const result = runLockedHistoryBackup({
-    args: parseLockedHistoryBackupArgs(argv),
+    args,
     env,
   });
   process.stdout.write(`${JSON.stringify(result)}\n`);

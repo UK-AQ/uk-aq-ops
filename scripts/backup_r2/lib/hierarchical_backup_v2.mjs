@@ -1,4 +1,5 @@
 import { assertObservationHistoryGeneration, assertObservationHistoryGenerationKey } from "../../../workers/shared/uk_aq_observation_history_generation.mjs";
+import { observationVerificationConnectorManifestKey } from "../../../workers/shared/uk_aq_observation_verification_overlay.mjs";
 import { createHash } from "node:crypto";
 
 export const HIERARCHICAL_INVENTORY_SCHEMA_VERSION = 1;
@@ -23,6 +24,8 @@ export const OBSERVATIONS_TIMESERIES_LATEST_PATHS = Object.freeze({
 });
 export const OBSERVATIONS_TIMESERIES_LATEST_PATH =
   OBSERVATIONS_TIMESERIES_LATEST_PATHS.v2;
+export const VERIFICATION_LATEST_PATH =
+  "history/_index_v3/verification/latest.json";
 
 export function resolveObservationsTimeseriesLatestPath(indexVersion) {
   const authority = String(indexVersion || "");
@@ -324,6 +327,160 @@ export function validateLatestTimeseriesInventoryUnit(raw) {
   };
 }
 
+function validateVerificationFileIdentity(raw, label) {
+  const value = assertObject(raw, label);
+  const byteSize = Number(value.byte_size);
+  if (!Number.isSafeInteger(byteSize) || byteSize <= 0) {
+    throw new Error(`${label} byte_size is invalid`);
+  }
+  return {
+    ...(value.connector_id === undefined ? {} : {
+      connector_id: Number(value.connector_id),
+    }),
+    relative_path: normalizeRelativePath(value.relative_path, `${label} path`),
+    sha256: assertSha256(value.sha256, `${label} SHA-256`),
+    byte_size: byteSize,
+  };
+}
+
+export function computeVerificationSourceRootHash({
+  latest,
+  connectorManifests,
+}) {
+  return sha256Hex(stableJson({
+    latest,
+    connector_manifests: connectorManifests,
+  }));
+}
+
+export function validateVerificationInventory(raw) {
+  if (raw === undefined || raw === null) return null;
+  const value = assertObject(raw, "verification inventory");
+  const latest = validateVerificationFileIdentity(
+    value.latest,
+    "verification latest inventory",
+  );
+  if (latest.relative_path !== VERIFICATION_LATEST_PATH) {
+    throw new Error("Verification latest inventory path mismatch");
+  }
+  const connectorManifests = Array.isArray(value.connector_manifests)
+    ? value.connector_manifests.map((entry) => {
+      const identity = validateVerificationFileIdentity(
+        entry,
+        "verification connector manifest inventory",
+      );
+      if (!Number.isSafeInteger(identity.connector_id) || identity.connector_id <= 0) {
+        throw new Error("Verification connector manifest connector_id is invalid");
+      }
+      const expected = observationVerificationConnectorManifestKey(
+        identity.connector_id,
+        identity.sha256,
+      );
+      if (identity.relative_path !== expected) {
+        throw new Error("Verification connector manifest inventory path mismatch");
+      }
+      return identity;
+    }).sort((left, right) => left.connector_id - right.connector_id)
+    : null;
+  if (!connectorManifests) {
+    throw new Error("Verification connector manifest inventory must be an array");
+  }
+  const seen = new Set();
+  for (const entry of connectorManifests) {
+    if (seen.has(entry.connector_id)) {
+      throw new Error("Verification connector manifest inventory contains duplicates");
+    }
+    seen.add(entry.connector_id);
+  }
+  const sourceRootHash = assertSha256(
+      value.source_root_hash,
+      "verification source_root_hash",
+    );
+  const expectedSourceRootHash = computeVerificationSourceRootHash({
+    latest,
+    connectorManifests,
+  });
+  if (sourceRootHash !== expectedSourceRootHash) {
+    throw new Error("Verification source_root_hash does not match current latest authority set");
+  }
+  return {
+    source_root_hash: sourceRootHash,
+    latest,
+    connector_manifests: connectorManifests,
+  };
+}
+
+export function validateVerificationState(raw) {
+  if (raw === undefined || raw === null) return null;
+  const value = assertObject(raw, "verification backup state");
+  const processedSourceRootHash = value.processed_source_root_hash
+    ? assertSha256(
+      value.processed_source_root_hash,
+      "verification processed_source_root_hash",
+    )
+    : null;
+  const latest = value.latest
+    ? {
+      ...validateVerificationFileIdentity(
+        value.latest,
+        "verification latest state",
+      ),
+      copied_at: String(value.latest.copied_at || "").trim() || null,
+      verified: value.latest.verified === true,
+    }
+    : null;
+  if (latest && latest.relative_path !== VERIFICATION_LATEST_PATH) {
+    throw new Error("Verification latest state path mismatch");
+  }
+  const connectorManifests = Array.isArray(value.connector_manifests)
+    ? value.connector_manifests.map((entry) => {
+      const identity = validateVerificationFileIdentity(
+        entry,
+        "verification connector manifest state",
+      );
+      if (
+        identity.relative_path !== observationVerificationConnectorManifestKey(
+          identity.connector_id,
+          identity.sha256,
+        )
+      ) throw new Error("Verification connector manifest state path mismatch");
+      return {
+        ...identity,
+        copied_at: String(entry.copied_at || "").trim() || null,
+        verified: entry.verified === true,
+      };
+    }).sort((left, right) => left.connector_id - right.connector_id)
+    : [];
+  return {
+    processed_source_root_hash: processedSourceRootHash,
+    latest,
+    connector_manifests: connectorManifests,
+  };
+}
+
+export function verificationStateIsComplete(stateRaw, inventoryRaw) {
+  const state = validateVerificationState(stateRaw);
+  const inventory = validateVerificationInventory(inventoryRaw);
+  if (!state || !inventory) return false;
+  if (
+    state.latest?.verified !== true ||
+    state.latest.relative_path !== inventory.latest.relative_path ||
+    state.latest.sha256 !== inventory.latest.sha256 ||
+    state.latest.byte_size !== inventory.latest.byte_size
+  ) return false;
+  const stateByConnector = new Map(state.connector_manifests.map((entry) => [
+    entry.connector_id,
+    entry,
+  ]));
+  return inventory.connector_manifests.every((expected) => {
+    const actual = stateByConnector.get(expected.connector_id);
+    return actual?.verified === true &&
+      actual.relative_path === expected.relative_path &&
+      actual.sha256 === expected.sha256 &&
+      actual.byte_size === expected.byte_size;
+  });
+}
+
 export function validateTimeseriesBindingPackInventoryReference(raw) {
   if (raw === undefined || raw === null) return null;
   const value = assertObject(raw, "timeseries binding pack inventory reference");
@@ -532,6 +689,9 @@ export function validateHierarchicalInventoryRoot(
       years,
     },
     global_units: globalUnits,
+    ...(value.verification === undefined
+      ? {}
+      : { verification: validateVerificationInventory(value.verification) }),
     ...(value.timeseries_binding_packs === undefined
       || !validateTimeseriesBindingPacks
       ? {}
@@ -917,6 +1077,9 @@ export function validateHierarchicalStateRoot(
         value.global_units?.observations_timeseries_latest,
       ),
     },
+    ...(value.verification === undefined
+      ? {}
+      : { verification: validateVerificationState(value.verification) }),
   };
 }
 

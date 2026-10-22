@@ -11,6 +11,11 @@ on:
         required: false
         default: ""
         type: string
+      history_generation:
+        description: "One invocation observation generation (blank = configured default)"
+        required: false
+        default: ""
+        type: string
       dry_run:
         description: "Run without writing Dropbox copy/checkpoint/prune changes"
         required: false
@@ -22,10 +27,15 @@ on:
         default: ""
         type: string
       force_prune_recheck:
-        description: "Audit all current observation days for stale Dropbox Parquet"
+        description: "Force prune recheck"
         required: false
         default: false
         type: boolean
+      force_prune_max_days_per_run:
+        description: "Override positive forced-prune-recheck audit day limit (default 50)"
+        required: false
+        default: ""
+        type: string
       observation_parquet_copy_mode:
         description: "Observation Parquet transfer mode"
         required: false
@@ -37,7 +47,7 @@ on:
       timeseries_binding_backup_mode:
         description: "Timeseries binding Dropbox backup representation"
         required: false
-        default: "individual"
+        default: "pack"
         type: choice
         options:
           - individual
@@ -71,16 +81,19 @@ jobs:
       UK_AQ_R2_HISTORY_VERSION: ${{ vars.UK_AQ_R2_HISTORY_VERSION || '' }}
 
       UK_AQ_R2_HISTORY_BACKUP_MAX_DAYS_PER_RUN: ${{ vars.UK_AQ_R2_HISTORY_BACKUP_MAX_DAYS_PER_RUN || '0' }}
+      UK_AQ_R2_HISTORY_FORCE_PRUNE_MAX_DAYS_PER_RUN: ${{ vars.UK_AQ_R2_HISTORY_FORCE_PRUNE_MAX_DAYS_PER_RUN || '50' }}
       UK_AQ_R2_HISTORY_CHECKPOINT_BATCH_UNITS: ${{ vars.UK_AQ_R2_HISTORY_CHECKPOINT_BATCH_UNITS || '10' }}
       UK_AQ_R2_HISTORY_CHECKPOINT_FLUSH_SECONDS: ${{ vars.UK_AQ_R2_HISTORY_CHECKPOINT_FLUSH_SECONDS || '60' }}
-      UK_AQ_DROPBOX_ROOT: ${{ vars.UK_AQ_DROPBOX_ROOT || 'TEST' }}
-      UK_AQ_R2_HISTORY_DROPBOX_DIR: ${{ vars.UK_AQ_R2_HISTORY_DROPBOX_DIR || 'R2_history_backup' }}
+      UK_AQ_DROPBOX_ROOT: ${{ vars.UK_AQ_DROPBOX_ROOT || '' }}
+      UK_AQ_R2_HISTORY_DROPBOX_DIR: ${{ vars.UK_AQ_R2_HISTORY_DROPBOX_DIR || '' }}
 
       INPUT_DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+      INPUT_HISTORY_GENERATION: ${{ github.event.inputs.history_generation || '' }}
       INPUT_MAX_DAYS_PER_RUN: ${{ github.event.inputs.max_days_per_run || '' }}
       INPUT_FORCE_PRUNE_RECHECK: ${{ github.event.inputs.force_prune_recheck || 'false' }}
+      INPUT_FORCE_PRUNE_MAX_DAYS_PER_RUN: ${{ github.event.inputs.force_prune_max_days_per_run || '' }}
       INPUT_OBSERVATION_PARQUET_COPY_MODE: ${{ github.event.inputs.observation_parquet_copy_mode || 'full' }}
-      INPUT_TIMESERIES_BINDING_BACKUP_MODE: ${{ github.event.inputs.timeseries_binding_backup_mode || 'individual' }}
+      INPUT_TIMESERIES_BINDING_BACKUP_MODE: ${{ github.event.inputs.timeseries_binding_backup_mode || 'pack' }}
 
     steps:
       - name: Checkout
@@ -101,6 +114,7 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.OBS_AQIDB_SECRET_KEY }}
           DAILY_TASK_KEY: ops.r2_history_dropbox_backup
           DAILY_TASK_HEALTH_REPORT_STAGE: started
+          DAILY_TASK_HEALTH_STRICT: "true"
         run: node scripts/report_daily_task_health.mjs
 
       - name: Install rclone
@@ -139,6 +153,13 @@ jobs:
           case "${UK_AQ_R2_HISTORY_BACKUP_MAX_DAYS_PER_RUN}" in
             ''|*[!0-9]*)
               echo "UK_AQ_R2_HISTORY_BACKUP_MAX_DAYS_PER_RUN must be a non-negative integer." >&2
+              exit 1
+              ;;
+          esac
+
+          case "${UK_AQ_R2_HISTORY_FORCE_PRUNE_MAX_DAYS_PER_RUN}" in
+            ''|*[!0-9]*|0*)
+              echo "UK_AQ_R2_HISTORY_FORCE_PRUNE_MAX_DAYS_PER_RUN must be a positive integer." >&2
               exit 1
               ;;
           esac
@@ -214,6 +235,13 @@ jobs:
               exit 1
               ;;
           esac
+          case "${INPUT_HISTORY_GENERATION:-}" in
+            ''|v2|v3) ;;
+            *)
+              echo "history_generation must be blank, v2 or v3" >&2
+              exit 1
+              ;;
+          esac
 
           max_days="${INPUT_MAX_DAYS_PER_RUN:-}"
           if [ -z "${max_days}" ]; then
@@ -225,8 +253,25 @@ jobs:
               exit 1
               ;;
           esac
+          if [ -n "${INPUT_HISTORY_GENERATION:-}" ] &&
+             [ "${INPUT_HISTORY_GENERATION}" != "${UK_AQ_R2_HISTORY_VERSION}" ] &&
+             [ "${max_days}" != "0" ]; then
+            echo "Non-default history generation backup requires max_days_per_run=0" >&2
+            exit 1
+          fi
 
-          selected_mode="${INPUT_TIMESERIES_BINDING_BACKUP_MODE:-individual}"
+          force_prune_max_days="${INPUT_FORCE_PRUNE_MAX_DAYS_PER_RUN:-}"
+          if [ -z "${force_prune_max_days}" ]; then
+            force_prune_max_days="${UK_AQ_R2_HISTORY_FORCE_PRUNE_MAX_DAYS_PER_RUN}"
+          fi
+          case "${force_prune_max_days}" in
+            ''|*[!0-9]*|0*)
+              echo "force_prune_max_days_per_run must be a positive integer" >&2
+              exit 1
+              ;;
+          esac
+
+          selected_mode="${INPUT_TIMESERIES_BINDING_BACKUP_MODE:-pack}"
           case "${selected_mode}" in
             individual|pack) ;;
             *)
@@ -270,11 +315,17 @@ jobs:
             --timeseries-binding-backup-mode "${selected_mode}"
             --observation-parquet-copy-mode "${observation_parquet_copy_mode}"
             --max-days-per-run "${max_days}"
+            --force-prune-max-days-per-run "${force_prune_max_days}"
             --checkpoint-batch-units "${UK_AQ_R2_HISTORY_CHECKPOINT_BATCH_UNITS}"
             --checkpoint-flush-seconds "${UK_AQ_R2_HISTORY_CHECKPOINT_FLUSH_SECONDS}"
             --inventory-report-out "tmp/r2_backup_inventory_report.json"
             --backup-report-out "tmp/r2_history_dropbox_backup_report.json"
+            --pack-publisher-report-out "tmp/r2_binding_pack_publisher_report.json"
           )
+
+          if [ -n "${INPUT_HISTORY_GENERATION:-}" ]; then
+            cmd+=(--generation "${INPUT_HISTORY_GENERATION}")
+          fi
 
           if [ "${selected_mode}" = "pack" ]; then
             cmd+=(--allow-experimental-pack-only)
@@ -290,6 +341,24 @@ jobs:
           echo "Running: ${cmd[*]}"
           "${cmd[@]}"
 
+          selected_generation="${INPUT_HISTORY_GENERATION:-${UK_AQ_R2_HISTORY_VERSION}}"
+          jq -e --arg generation "${selected_generation}" \
+            '.observation_generation == $generation' \
+            tmp/r2_backup_inventory_report.json >/dev/null
+          jq -e --arg generation "${selected_generation}" \
+            --arg source_root "uk_aq_r2:${CFLARE_R2_BUCKET}" \
+            '.observation_generation == $generation and
+             .source_root == $source_root and
+             .state_root_key == ("_ops/checkpoints/r2_history_backup_state_v2/observation_generation=" + $generation + "/root.json")' \
+            tmp/r2_history_dropbox_backup_report.json >/dev/null
+          if [ -n "${INPUT_HISTORY_GENERATION:-}" ] &&
+             [ "${INPUT_HISTORY_GENERATION}" != "${UK_AQ_R2_HISTORY_VERSION}" ] &&
+             [ "${INPUT_DRY_RUN}" != "true" ]; then
+            jq -e '.ok == true and .complete == true and .dry_run == false and
+                   (.observations.source_root_hash == .observations.processed_source_root_hash)' \
+              tmp/r2_history_dropbox_backup_report.json >/dev/null
+          fi
+
       - name: Upload backup report artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -297,6 +366,7 @@ jobs:
           name: uk-aq-r2-history-dropbox-backup-report
           path: |
             tmp/r2_backup_inventory_report.json
+            tmp/r2_binding_pack_publisher_report.json
             tmp/r2_history_dropbox_backup_report.json
           if-no-files-found: ignore
 
@@ -318,5 +388,6 @@ jobs:
           DAILY_TASK_HEALTH_REPORT_STAGE: final
           DAILY_TASK_HEALTH_RUN_ID: ${{ steps.daily_task_health_started.outputs.health_run_id }}
           DAILY_TASK_HEALTH_SUPPLEMENTAL_SUMMARY_FILE: tmp/r2_history_dropbox_backup_task_summary.json
+          DAILY_TASK_HEALTH_STRICT: "true"
           JOB_STATUS: ${{ job.status }}
         run: node scripts/report_daily_task_health.mjs

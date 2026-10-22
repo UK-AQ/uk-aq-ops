@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { resolveObservationHistoryGeneration, assertObservationHistoryGenerationPrefixes, assertObservationHistoryGenerationKey } from "../../workers/shared/uk_aq_observation_history_generation.mjs";
+import { assertHistoryBackupSource, assertHistoryBackupDestination, assertHistoryBackupRemotes } from "./lib/history_backup_targets.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -19,6 +20,7 @@ import {
 import {
   buildObservationRunManifestStateShard,
   completeObservationMonthState,
+  computeVerificationSourceRootHash,
   emptyHierarchicalStateRoot,
   markLatestTimeseriesProcessed,
   markObservationDayCopied,
@@ -42,6 +44,9 @@ import {
   validateObservationMonthState,
   validateObservationRunManifestInventoryShard,
   validateObservationRunManifestStateShard,
+  validateVerificationInventory,
+  validateVerificationState,
+  verificationStateIsComplete,
 } from "./lib/hierarchical_backup_v2.mjs";
 import {
   syncTimeseriesBindingsToDropbox,
@@ -60,6 +65,12 @@ import {
   pruneStaleParquetForUnit,
 } from "./lib/stale_parquet_prune.mjs";
 import {
+  observationPruneAuditMonthShardKey,
+  recordObservationPruneAuditOutcome,
+  selectObservationPruneAuditBatch,
+  validateObservationPruneAuditMonthState,
+} from "./lib/observation_prune_audit.mjs";
+import {
   DEFAULT_OBSERVATION_PARQUET_COPY_MODE,
   authenticateObservationDayParquetFiles,
   authenticatePrecedingObservationDayState,
@@ -71,6 +82,9 @@ import {
 import {
   requireLockedHistoryBackupMutation,
 } from "./uk_aq_run_locked_history_backup.mjs";
+import {
+  validateObservationVerificationLatest,
+} from "../../workers/shared/uk_aq_observation_verification_overlay.mjs";
 
 const DEFAULT_RCLONE_BIN =
   String(process.env.UK_AQ_R2_HISTORY_BACKUP_RCLONE_BIN || "").trim() || "rclone";
@@ -97,6 +111,11 @@ const DEFAULT_CHECKPOINT_BATCH_UNITS = parsePositiveInt(
 const DEFAULT_CHECKPOINT_FLUSH_SECONDS = parsePositiveInt(
   process.env.UK_AQ_R2_HISTORY_CHECKPOINT_FLUSH_SECONDS,
   60,
+);
+const DEFAULT_FORCE_PRUNE_MAX_DAYS = parseConfiguredPositiveInt(
+  process.env.UK_AQ_R2_HISTORY_FORCE_PRUNE_MAX_DAYS_PER_RUN,
+  50,
+  "UK_AQ_R2_HISTORY_FORCE_PRUNE_MAX_DAYS_PER_RUN",
 );
 
 const DROPBOX_WRITE_RETRY = {
@@ -133,6 +152,16 @@ function parsePositiveInt(raw, fallback) {
   return integer > 0 ? integer : fallback;
 }
 
+function parseConfiguredPositiveInt(raw, fallback, name) {
+  const text = String(raw ?? "").trim();
+  if (!text) return fallback;
+  const value = Number(text);
+  if (!/^[1-9]\d*$/.test(text) || !Number.isSafeInteger(value)) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+  return value;
+}
+
 function usage() {
   console.log([
     "Usage:",
@@ -141,22 +170,23 @@ function usage() {
     "    --dest-root <rclone-destination-root> [options]",
     "",
     "Required:",
-    "  --source-root <root>          Example: uk_aq_r2_test:uk-aq-history-cic-test",
-    "  --dest-root <root>            Example: uk_aq_dropbox:TEST/R2_history_backup",
+    "  --source-root <root>          Exact: uk_aq_r2:<configured R2 bucket>",
+    "  --dest-root <root>            Exact configured Dropbox backup root",
     "",
     "Options:",
     `  --inventory-root-prefix <p>  Default: ${DEFAULT_INVENTORY_ROOT_PREFIX}`,
     `  --state-root-prefix <p>      Default: ${DEFAULT_STATE_ROOT_PREFIX}`,
     `  --timeseries-binding-backup-mode <individual|dual|pack> Default: ${DEFAULT_TIMESERIES_BINDING_BACKUP_MODE}`,
     `  --observation-parquet-copy-mode <full|reuse_matching> Default: ${DEFAULT_OBSERVATION_PARQUET_COPY_MODE}`,
-    "  --allow-experimental-pack-only Required for pack mode; isolated TEST destination only",
+    "  --allow-experimental-pack-only Required for pack mode; configured destination only",
     "  --timeseries-binding-packs-only Proving path: sync no other backup domain",
     `  --max-days-per-run <N>       Default: ${DEFAULT_MAX_DAYS}; 0 = unlimited`,
     `  --checkpoint-batch-units <N> Default: ${DEFAULT_CHECKPOINT_BATCH_UNITS}`,
     `  --checkpoint-flush-seconds <N> Default: ${DEFAULT_CHECKPOINT_FLUSH_SECONDS}`,
+    `  --force-prune-max-days-per-run <N> Default: ${DEFAULT_FORCE_PRUNE_MAX_DAYS}`,
     `  --rclone-bin <name>          Default: ${DEFAULT_RCLONE_BIN}`,
     "  --no-prune-stale-parquet     Disable post-copy stale observation Parquet pruning",
-    "  --force-prune-recheck        Audit all current observation days for stale Dropbox Parquet",
+    "  --force-prune-recheck        Audit a bounded rolling batch of current observation days",
     "  --dry-run                    Plan/copy/prune dry-run only",
     "  --report-out <file>          Write JSON report",
     "  -h, --help",
@@ -177,6 +207,7 @@ function parseArgs(argv) {
     max_days_per_run: DEFAULT_MAX_DAYS,
     checkpoint_batch_units: DEFAULT_CHECKPOINT_BATCH_UNITS,
     checkpoint_flush_seconds: DEFAULT_CHECKPOINT_FLUSH_SECONDS,
+    force_prune_max_days_per_run: DEFAULT_FORCE_PRUNE_MAX_DAYS,
     rclone_bin: DEFAULT_RCLONE_BIN,
     prune_stale_parquet: true,
     force_prune_recheck: false,
@@ -257,6 +288,21 @@ function parseArgs(argv) {
         throw new Error("--checkpoint-flush-seconds must be a positive integer");
       }
       args.checkpoint_flush_seconds = value;
+      index += 1;
+      continue;
+    }
+    if (arg === "--force-prune-max-days-per-run") {
+      const value = parseConfiguredPositiveInt(
+        argv[index + 1],
+        Number.NaN,
+        "--force-prune-max-days-per-run",
+      );
+      if (!Number.isSafeInteger(value)) {
+        throw new Error(
+          "--force-prune-max-days-per-run must be a positive integer",
+        );
+      }
+      args.force_prune_max_days_per_run = value;
       index += 1;
       continue;
     }
@@ -486,6 +532,170 @@ function copyAndVerifyJsonFile({
     verified: true,
     dry_run: false,
   };
+}
+
+function syncVerificationDomain({ args, inventoryRoot, stateRoot }) {
+  const inventory = validateVerificationInventory(inventoryRoot.verification);
+  const previousState = validateVerificationState(stateRoot.verification);
+  const report = {
+    active: Boolean(inventory),
+    source_root_hash: inventory?.source_root_hash || null,
+    processed_source_root_hash: previousState?.processed_source_root_hash || null,
+    connector_manifests_inventoried: inventory?.connector_manifests.length || 0,
+    connector_manifests_copied: 0,
+    connector_manifests_reused: 0,
+    connector_manifest_bytes_copied: 0,
+    changed_connector_ids: [],
+    latest_key: inventory?.latest.relative_path || null,
+    latest_copied: false,
+    latest_reused: false,
+    complete: !inventory,
+    error: null,
+  };
+  if (!inventory) {
+    if (previousState) {
+      throw new Error(
+        "Verification backup state exists but current inventory omits verification authority",
+      );
+    }
+    return { report, state_root_dirty: false };
+  }
+
+  const latestSource = readJsonRequired(
+    args.rclone_bin,
+    args.source_root,
+    inventory.latest.relative_path,
+  );
+  const latest = validateObservationVerificationLatest(latestSource.parsed);
+  const expectedVerificationRoot = computeVerificationSourceRootHash({
+    latest: inventory.latest,
+    connectorManifests: inventory.connector_manifests,
+  });
+  if (
+    expectedVerificationRoot !== inventory.source_root_hash ||
+    sha256Hex(latestSource.text) !== inventory.latest.sha256 ||
+    Buffer.byteLength(latestSource.text, "utf8") !== inventory.latest.byte_size ||
+    stableJson(latest.connectors) !== stableJson(
+      inventory.connector_manifests.map((entry) => ({
+        connector_id: entry.connector_id,
+        key: entry.relative_path,
+        byte_size: entry.byte_size,
+        sha256: entry.sha256,
+      })),
+    )
+  ) {
+    throw new Error("Verification inventory does not match current latest authority");
+  }
+
+  const previousByConnector = new Map(
+    (previousState?.connector_manifests || []).map((entry) => [
+      entry.connector_id,
+      entry,
+    ]),
+  );
+  const nextConnectorStates = [];
+  try {
+    // Canonical connector manifests are always planned and verified before
+    // the compact latest authority can be copied.
+    for (const expected of inventory.connector_manifests) {
+      const prior = previousByConnector.get(expected.connector_id);
+      const destinationIdentity = readRemoteFileIdentity(
+        args.rclone_bin,
+        args.dest_root,
+        expected.relative_path,
+      );
+      if (
+        prior?.verified === true && destinationIdentity.verified === true &&
+        prior.relative_path === expected.relative_path &&
+        prior.sha256 === expected.sha256 &&
+        prior.byte_size === expected.byte_size &&
+        destinationIdentity.sha256 === expected.sha256 &&
+        destinationIdentity.size === expected.byte_size
+      ) {
+        nextConnectorStates.push({ ...prior });
+        report.connector_manifests_reused += 1;
+        continue;
+      }
+      const copy = copyAndVerifyJsonFile({
+        rcloneBin: args.rclone_bin,
+        sourceRoot: args.source_root,
+        destRoot: args.dest_root,
+        relativePath: expected.relative_path,
+        dryRun: args.dry_run,
+      });
+      if (
+        copy.source_hash !== expected.sha256 ||
+        copy.source_size !== expected.byte_size
+      ) throw new Error(`Verification source identity mismatch: ${expected.relative_path}`);
+      if (!args.dry_run && !copy.verified) {
+        throw new Error(`Verification destination check failed: ${expected.relative_path}`);
+      }
+      nextConnectorStates.push({
+        ...expected,
+        copied_at: args.dry_run ? null : new Date().toISOString(),
+        verified: !args.dry_run,
+      });
+      report.connector_manifests_copied += args.dry_run ? 0 : 1;
+      report.connector_manifest_bytes_copied += args.dry_run
+        ? 0
+        : expected.byte_size;
+      report.changed_connector_ids.push(expected.connector_id);
+    }
+
+    if (args.dry_run) return { report, state_root_dirty: false };
+
+    const nextState = {
+      processed_source_root_hash: null,
+      connector_manifests: nextConnectorStates,
+      latest: previousState?.latest || null,
+    };
+    const latestDestinationIdentity = readRemoteFileIdentity(
+      args.rclone_bin,
+      args.dest_root,
+      inventory.latest.relative_path,
+    );
+    const latestMatches = nextState.latest?.verified === true &&
+      latestDestinationIdentity.verified === true &&
+      nextState.latest.relative_path === inventory.latest.relative_path &&
+      nextState.latest.sha256 === inventory.latest.sha256 &&
+      nextState.latest.byte_size === inventory.latest.byte_size &&
+      latestDestinationIdentity.sha256 === inventory.latest.sha256 &&
+      latestDestinationIdentity.size === inventory.latest.byte_size;
+    if (latestMatches) {
+      report.latest_reused = true;
+    } else {
+      const copy = copyAndVerifyJsonFile({
+        rcloneBin: args.rclone_bin,
+        sourceRoot: args.source_root,
+        destRoot: args.dest_root,
+        relativePath: inventory.latest.relative_path,
+        dryRun: false,
+      });
+      if (
+        copy.source_hash !== inventory.latest.sha256 ||
+        copy.source_size !== inventory.latest.byte_size ||
+        !copy.verified
+      ) throw new Error("Verification latest copy or identity verification failed");
+      nextState.latest = {
+        ...inventory.latest,
+        copied_at: new Date().toISOString(),
+        verified: true,
+      };
+      report.latest_copied = true;
+    }
+    if (!verificationStateIsComplete(nextState, inventory)) {
+      throw new Error("Verification backup state is incomplete after copy");
+    }
+    nextState.processed_source_root_hash = inventory.source_root_hash;
+    stateRoot.verification = nextState;
+    report.processed_source_root_hash = nextState.processed_source_root_hash;
+    report.complete = true;
+    return { report, state_root_dirty: true };
+  } catch (error) {
+    report.error = error instanceof Error ? error.message : String(error);
+    report.complete = false;
+    return { report, state_root_dirty: false };
+  }
 }
 
 function readRemoteFileIdentity(rcloneBin, root, relativePath) {
@@ -868,6 +1078,134 @@ function allYearsComplete(stateRoot, inventoryRoot) {
   );
 }
 
+function createObservationPruneAuditStore(args, report) {
+  const months = new Map();
+  const normalCopyRefreshedDays = new Set();
+  let dirtyUnits = 0;
+  let lastFlushAt = Date.now();
+
+  const getMonth = (year, month) => {
+    const cacheKey = `${year}-${month}`;
+    if (months.has(cacheKey)) return months.get(cacheKey);
+    const relativePath = observationPruneAuditMonthShardKey(year, month);
+    const existing = readJsonMaybe(
+      args.rclone_bin,
+      args.dest_root,
+      relativePath,
+      DROPBOX_READ_RETRY,
+    );
+    const entry = {
+      relative_path: relativePath,
+      state: validateObservationPruneAuditMonthState(
+        existing?.parsed || null,
+        year,
+        month,
+      ),
+      dirty: false,
+    };
+    months.set(cacheKey, entry);
+    return entry;
+  };
+
+  const recordSuccess = (day, auditedAt, source) => {
+    if (args.dry_run) return false;
+    const [year, month] = day.day_utc.split("-");
+    const entry = getMonth(year, month);
+    entry.state = recordObservationPruneAuditOutcome({
+      state: entry.state,
+      day,
+      successful: true,
+      dryRun: false,
+      auditedAt,
+    });
+    entry.dirty = true;
+    dirtyUnits += 1;
+    report.prune.audit_checkpoint_updates_recorded += 1;
+    if (source === "normal_copy") {
+      report.prune.normal_copy_audit_checkpoints_refreshed += 1;
+      normalCopyRefreshedDays.add(day.day_utc);
+    }
+    return true;
+  };
+
+  const flush = ({ force = false } = {}) => {
+    const dirtyEntries = Array.from(months.values())
+      .filter((entry) => entry.dirty);
+    if (dirtyEntries.length === 0 || args.dry_run) return false;
+    const elapsedMs = Date.now() - lastFlushAt;
+    const due = force
+      || dirtyUnits >= args.checkpoint_batch_units
+      || elapsedMs >= args.checkpoint_flush_seconds * 1_000;
+    if (!due) return false;
+    for (const entry of dirtyEntries) {
+      const write = uploadJson({
+        rcloneBin: args.rclone_bin,
+        root: args.dest_root,
+        relativePath: entry.relative_path,
+        payload: entry.state,
+        dryRun: false,
+      });
+      if (write.written) report.prune.audit_state_shards_written += 1;
+      entry.dirty = false;
+    }
+    report.prune.audit_checkpoint_flush_count += 1;
+    dirtyUnits = 0;
+    lastFlushAt = Date.now();
+    return true;
+  };
+
+  return {
+    getMonth,
+    recordSuccess,
+    flush,
+    checkpoints: () => Array.from(months.values())
+      .flatMap((entry) => entry.state.days),
+    normalCopyRefreshedDays: () => Array.from(normalCopyRefreshedDays),
+  };
+}
+
+function collectObservationPruneAuditPopulation(args, inventoryRoot, store) {
+  const inventoryDays = [];
+  const acceptedCopyDays = [];
+  for (const inventoryYear of inventoryRoot.observations.years) {
+    for (const inventoryMonth of inventoryYear.months) {
+      const inventoryShard = validateObservationMonthInventoryShard(
+        readJsonRequired(
+          args.rclone_bin,
+          args.source_root,
+          inventoryMonth.inventory_shard_key,
+        ).parsed,
+      );
+      assertSelectedObservationInventoryShard(
+        resolveObservationHistoryGeneration(process.env),
+        inventoryShard,
+      );
+      if (inventoryShard.source_month_hash !== inventoryMonth.content_hash) {
+        throw new Error(
+          `Inventory month shard hash mismatch during forced prune recheck: `
+          + `${inventoryYear.year}-${inventoryMonth.month}`,
+        );
+      }
+      inventoryDays.push(...inventoryShard.days);
+
+      const monthStateResult = readJsonMaybe(
+        args.rclone_bin,
+        args.dest_root,
+        stateMonthKey(args, inventoryYear.year, inventoryMonth.month),
+        DROPBOX_READ_RETRY,
+      );
+      const monthState = validateObservationMonthState(
+        monthStateResult?.parsed || null,
+        inventoryYear.year,
+        inventoryMonth.month,
+      );
+      acceptedCopyDays.push(...monthState.days);
+      store.getMonth(inventoryYear.year, inventoryMonth.month);
+    }
+  }
+  return { inventoryDays, acceptedCopyDays };
+}
+
 export function recordForcedObservationPruneFailure({
   report,
   failures,
@@ -907,60 +1245,113 @@ export function recordForcedObservationPruneFailure({
   report.prune.forced_failed_days = failures.length;
 }
 
-function runForcedObservationPruneRecheck(args, inventoryRoot, report) {
+function runForcedObservationPruneRecheck(
+  args,
+  inventoryRoot,
+  report,
+  pruneAuditStore,
+) {
   if (!args.force_prune_recheck) return;
   const failures = [];
-  for (const inventoryYear of inventoryRoot.observations.years) {
-    for (const inventoryMonth of inventoryYear.months) {
-      const inventoryShard = validateObservationMonthInventoryShard(
-        readJsonRequired(
-          args.rclone_bin,
-          args.source_root,
-          inventoryMonth.inventory_shard_key,
-        ).parsed,
+  const population = collectObservationPruneAuditPopulation(
+    args,
+    inventoryRoot,
+    pruneAuditStore,
+  );
+  const selection = selectObservationPruneAuditBatch({
+    ...population,
+    auditCheckpoints: pruneAuditStore.checkpoints(),
+    alreadyAuditedThisInvocationDays:
+      pruneAuditStore.normalCopyRefreshedDays(),
+    maxDays: args.force_prune_max_days_per_run,
+  });
+  report.prune.current_days_considered = selection.total_current_days_considered;
+  report.prune.eligible_days = selection.eligible_days_count;
+  report.prune.excluded_current_source_identity_not_accepted =
+    selection.excluded_source_identity_not_accepted_count;
+  report.prune.never_successfully_audited_eligible_before =
+    selection.never_successfully_audited_eligible_count;
+  report.prune.oldest_successful_audit_at_before =
+    selection.oldest_successful_audit_at;
+  report.prune.normal_copy_refreshed_days_excluded_from_forced_selection =
+    selection.already_audited_this_invocation_excluded_count;
+  report.prune.selected_days = selection.selected_days
+    .map((day) => day.day_utc);
+
+  for (const day of selection.selected_days) {
+    try {
+      const result = pruneStaleParquetForUnit({
+        rcloneBin: args.rclone_bin,
+        manifestRootPath: joinTargetPath(args.source_root, day.relative_path),
+        destUnitPath: joinTargetPath(args.dest_root, day.relative_path),
+        unitRelativePath: day.relative_path,
+        dryRun: args.dry_run,
+        manifestReadListRetryOptions: null,
+        destinationReadListRetryOptions: DROPBOX_READ_RETRY,
+        deleteRetryOptions: DROPBOX_WRITE_RETRY,
+      });
+      report.prune.forced_days_audited += 1;
+      report.prune.deleted_count += Number(result.prune_deleted_count || 0);
+      report.prune.forced_deleted_count += Number(
+        result.prune_deleted_count || 0,
       );
-      assertSelectedObservationInventoryShard(resolveObservationHistoryGeneration(process.env), inventoryShard);
-      if (inventoryShard.source_month_hash !== inventoryMonth.content_hash) {
-        failures.push({
-          day_utc: `${inventoryYear.year}-${inventoryMonth.month}`,
-          error: "inventory month shard hash mismatch during forced prune recheck",
-        });
-        continue;
+      report.prune.dry_run_delete_count += Number(
+        result.prune_dry_run_delete_count || 0,
+      );
+      let checkpointUpdateRecorded = false;
+      if (args.dry_run) {
+        report.prune.forced_dry_run_days += 1;
+      } else {
+        checkpointUpdateRecorded = pruneAuditStore.recordSuccess(
+          day,
+          new Date().toISOString(),
+          "forced_recheck",
+        );
+        report.prune.forced_successfully_audited_days += 1;
+        pruneAuditStore.flush();
       }
-      for (const day of inventoryShard.days) {
-        try {
-          const result = pruneStaleParquetForUnit({
-            rcloneBin: args.rclone_bin,
-            manifestRootPath: joinTargetPath(args.source_root, day.relative_path),
-            destUnitPath: joinTargetPath(args.dest_root, day.relative_path),
-            unitRelativePath: day.relative_path,
-            dryRun: args.dry_run,
-            manifestReadListRetryOptions: null,
-            destinationReadListRetryOptions: DROPBOX_READ_RETRY,
-            deleteRetryOptions: DROPBOX_WRITE_RETRY,
-          });
-          report.prune.forced_days_audited += 1;
-          report.prune.deleted_count += Number(result.prune_deleted_count || 0);
-          report.prune.dry_run_delete_count += Number(
-            result.prune_dry_run_delete_count || 0,
-          );
-        } catch (error) {
-          recordForcedObservationPruneFailure({
-            report,
-            failures,
-            dayUtc: day.day_utc,
-            error,
-          });
-        }
-      }
+      report.prune.forced_results.push({
+        day_utc: day.day_utc,
+        manifest_hash: day.manifest_hash,
+        unit_relative_path: day.relative_path,
+        dry_run: args.dry_run,
+        prune_deleted_count: Number(result.prune_deleted_count || 0),
+        prune_dry_run_delete_count: Number(
+          result.prune_dry_run_delete_count || 0,
+        ),
+        audit_checkpoint_update_recorded: checkpointUpdateRecorded,
+      });
+    } catch (error) {
+      recordForcedObservationPruneFailure({
+        report,
+        failures,
+        dayUtc: day.day_utc,
+        error,
+      });
     }
   }
+  pruneAuditStore.flush({ force: true });
+
+  const after = selectObservationPruneAuditBatch({
+    ...population,
+    auditCheckpoints: pruneAuditStore.checkpoints(),
+    alreadyAuditedThisInvocationDays:
+      pruneAuditStore.normalCopyRefreshedDays(),
+    maxDays: args.force_prune_max_days_per_run,
+  });
+  report.prune.never_successfully_audited_eligible_after =
+    after.never_successfully_audited_eligible_count;
+  report.prune.oldest_successful_audit_at_after =
+    after.oldest_successful_audit_at;
   report.prune.forced_failures = failures;
   report.prune.forced_failed_days = failures.length;
 }
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  assertHistoryBackupSource(args.source_root);
+  assertHistoryBackupDestination(args.dest_root);
+  assertHistoryBackupRemotes({ rcloneBin: args.rclone_bin, dropbox: true });
   requireLockedHistoryBackupMutation({
     dryRun: args.dry_run,
     env: process.env,
@@ -1021,6 +1412,7 @@ async function main() {
 
   const report = {
     ok: true,
+    observation_generation: generation.version,
     started_at: startedAt,
     completed_at: null,
     dry_run: args.dry_run,
@@ -1035,6 +1427,7 @@ async function main() {
     state_root_key: stateRootKey(args),
     fresh_start: existingStateResult === null,
     max_days_per_run: args.max_days_per_run,
+    force_prune_max_days_per_run: args.force_prune_max_days_per_run,
     checkpoint_batch_units: args.checkpoint_batch_units,
     checkpoint_flush_seconds: args.checkpoint_flush_seconds,
     observations: {
@@ -1098,19 +1491,54 @@ async function main() {
       incomplete: true,
       error: null,
     },
+    verification: {
+      active: false,
+      source_root_hash: null,
+      processed_source_root_hash: null,
+      connector_manifests_inventoried: 0,
+      connector_manifests_copied: 0,
+      connector_manifests_reused: 0,
+      connector_manifest_bytes_copied: 0,
+      changed_connector_ids: [],
+      latest_key: null,
+      latest_copied: false,
+      latest_reused: false,
+      complete: true,
+      error: null,
+    },
     prune: {
       enabled: args.prune_stale_parquet,
       force_recheck: args.force_prune_recheck,
+      force_prune_max_days_per_run: args.force_prune_max_days_per_run,
+      current_days_considered: 0,
+      eligible_days: 0,
+      excluded_current_source_identity_not_accepted: 0,
+      never_successfully_audited_eligible_before: 0,
+      never_successfully_audited_eligible_after: 0,
+      selected_days: [],
+      oldest_successful_audit_at_before: null,
+      oldest_successful_audit_at_after: null,
       deleted_count: 0,
+      forced_deleted_count: 0,
       dry_run_delete_count: 0,
       forced_days_audited: 0,
+      forced_successfully_audited_days: 0,
+      forced_dry_run_days: 0,
       forced_failed_days: 0,
       forced_failures: [],
+      forced_results: [],
+      audit_checkpoint_updates_recorded: 0,
+      normal_copy_audit_checkpoints_refreshed: 0,
+      normal_copy_refreshed_days_excluded_from_forced_selection: 0,
+      audit_state_shards_written: 0,
+      audit_checkpoint_flush_count: 0,
+      dry_run_checkpoint_updates_suppressed: args.dry_run,
       manifest_backed_divergence_count: 0,
       manifest_backed_divergent_days: [],
     },
   };
 
+  const pruneAuditStore = createObservationPruneAuditStore(args, report);
   let copiedDayBudget = args.max_days_per_run;
   let stateRootDirty = existingStateResult === null;
 
@@ -1304,20 +1732,26 @@ async function main() {
           if (args.dry_run) {
             report.observations.days_dry_run += 1;
           } else {
+            const copiedAt = new Date().toISOString();
             monthState = markObservationDayCopied(
               monthState,
               day,
-              new Date().toISOString(),
+              copiedAt,
             );
             monthStateDirty = true;
             dirtyUnits += 1;
             report.observations.days_copied += 1;
+            if (result.verified && result.prune) {
+              pruneAuditStore.recordSuccess(day, copiedAt, "normal_copy");
+            }
           }
           report.observations.day_list.push(day.day_utc);
           if (args.max_days_per_run > 0) copiedDayBudget -= 1;
           flushMonthState();
+          pruneAuditStore.flush();
         } catch (error) {
           flushMonthState({ force: true });
+          pruneAuditStore.flush({ force: true });
           if (stateRootDirty && !args.dry_run) {
             uploadJson({
               rcloneBin: args.rclone_bin,
@@ -1372,6 +1806,7 @@ async function main() {
         });
         stateRootDirty = true;
       }
+      pruneAuditStore.flush({ force: true });
 
       if (
         monthState.processed_source_month_hash
@@ -1672,6 +2107,14 @@ async function main() {
     verified: processedLatestState.verified,
   };
 
+  const verificationSync = syncVerificationDomain({
+    args,
+    inventoryRoot,
+    stateRoot,
+  });
+  report.verification = verificationSync.report;
+  stateRootDirty = stateRootDirty || verificationSync.state_root_dirty;
+
   if (!args.dry_run && allYearsComplete(stateRoot, inventoryRoot)) {
     copyAndVerifyJsonFile({
       rcloneBin: args.rclone_bin,
@@ -1700,7 +2143,22 @@ async function main() {
     });
   }
 
-  runForcedObservationPruneRecheck(args, inventoryRoot, report);
+  try {
+    runForcedObservationPruneRecheck(
+      args,
+      inventoryRoot,
+      report,
+      pruneAuditStore,
+    );
+  } catch (error) {
+    const failures = [...report.prune.forced_failures, {
+      day_utc: null,
+      classification: "forced_prune_checkpoint_or_selection_failure",
+      error: error instanceof Error ? error.message : String(error),
+    }];
+    report.prune.forced_failures = failures;
+    report.prune.forced_failed_days = failures.length;
+  }
 
   report.observations.processed_source_root_hash =
     stateRoot.observations.processed_source_root_hash;
@@ -1711,9 +2169,11 @@ async function main() {
     && report.timeseries_binding_packs.complete
     && report.core.complete
     && report.run_manifests.complete
-    && !report.latest_timeseries.incomplete;
+    && !report.latest_timeseries.incomplete
+    && report.verification.complete;
   report.ok = report.prune.forced_failed_days === 0
-    && report.latest_timeseries.error === null;
+    && report.latest_timeseries.error === null
+    && report.verification.error === null;
   writeReport(args.report_out, report);
   console.log(JSON.stringify(report, null, 2));
   if (!report.ok) {
