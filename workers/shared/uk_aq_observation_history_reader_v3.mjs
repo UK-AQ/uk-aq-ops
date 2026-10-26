@@ -8,8 +8,11 @@ import { compressors } from "hyparquet-compressors";
 
 import {
   OBSERVATION_HISTORY_COLUMNS_V3,
+  OBSERVATION_HISTORY_COLUMNS_V4,
   OBSERVATION_HISTORY_SCHEMA_VERSION_V3,
+  OBSERVATION_HISTORY_SCHEMA_VERSION_V4,
   OBSERVATION_HISTORY_WRITER_VERSION_V3,
+  OBSERVATION_HISTORY_WRITER_VERSION_V4,
   selectObservationVerificationStatusColumn,
 } from "./uk_aq_observation_history_schema.mjs";
 import { normalizeObservationPropertyCode } from "./uk_aq_observation_property_code.mjs";
@@ -124,9 +127,15 @@ function normalizePhysicalIdentity(raw = DEFAULT_PHYSICAL_IDENTITY) {
       ? {}
       : { parquet_created_by: String(raw.parquet_created_by) }),
   };
+  const supportedSchemaWriter = (
+    identity.history_schema_version === OBSERVATION_HISTORY_SCHEMA_VERSION_V3 &&
+    identity.writer_version === OBSERVATION_HISTORY_WRITER_VERSION_V3
+  ) || (
+    identity.history_schema_version === OBSERVATION_HISTORY_SCHEMA_VERSION_V4 &&
+    identity.writer_version === OBSERVATION_HISTORY_WRITER_VERSION_V4
+  );
   if (
-    identity.history_schema_version !== OBSERVATION_HISTORY_SCHEMA_VERSION_V3 ||
-    !identity.writer_version ||
+    !supportedSchemaWriter ||
     !identity.physical_layout_version ||
     ![
       "created_by",
@@ -788,8 +797,12 @@ function validateFooterMetadata(metadata, file, physicalIdentity) {
   const columns = parquetSchema(metadata).children.map((column) =>
     String(column.element.name)
   );
-  if (columns.length !== OBSERVATION_HISTORY_COLUMNS_V3.length ||
-      columns.some((column, index) => column !== OBSERVATION_HISTORY_COLUMNS_V3[index])) {
+  const expectedColumns = physicalIdentity.history_schema_version ===
+      OBSERVATION_HISTORY_SCHEMA_VERSION_V4
+    ? OBSERVATION_HISTORY_COLUMNS_V4
+    : OBSERVATION_HISTORY_COLUMNS_V3;
+  if (columns.length !== expectedColumns.length ||
+      columns.some((column, index) => column !== expectedColumns[index])) {
     throw new Error(`V3 Parquet footer schema mismatch: ${file.key}`);
   }
   const rowCount = safeMetadataInteger(metadata.num_rows, "footer.num_rows");
@@ -1464,7 +1477,7 @@ export async function readObservationHistoryExactV3({
             columns: [
               ...OBSERVATION_HISTORY_V3_PROJECTED_COLUMNS,
               physicalStatusColumn,
-            ],
+            ].filter(Boolean),
             rowStart: segment.row_start,
             rowEnd: segment.row_start + segment.row_count,
             useOffsetIndex: false,
@@ -1478,7 +1491,9 @@ export async function readObservationHistoryExactV3({
               timeseries_id: row.timeseries_id,
               observed_at_utc: row.observed_at_utc,
               value: row.value,
-              verification_status: row[physicalStatusColumn],
+              verification_status: physicalStatusColumn
+                ? row[physicalStatusColumn]
+                : null,
             })),
             segment,
             normalizedTimeseriesId,

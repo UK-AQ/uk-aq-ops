@@ -23,7 +23,16 @@ jobs:
     # once Prune Daily has returned to normal daily steady state.
     timeout-minutes: 190
     env:
-      UKAQ_ENV_NAME: ${{ vars.UKAQ_ENV_NAME || 'TEST' }}
+      # Optional JSONgen handover only; canonical Prune behaviour is unchanged.
+      UK_AQ_ENV_NAME: ${{ vars.UK_AQ_ENV_NAME }}
+      UK_AQ_GITHUB_REPO: ${{ vars.UK_AQ_GITHUB_REPO }}
+      UK_AQ_JSONGEN_PRUNE_PENDING_SOURCE_ENABLED: ${{ vars.UK_AQ_JSONGEN_PRUNE_PENDING_SOURCE_ENABLED || 'false' }}
+      UK_AQ_JSONGEN_PRUNE_SIGNER_URL: ${{ vars.UK_AQ_JSONGEN_PRUNE_SIGNER_URL || '' }}
+      UK_AQ_JSONGEN_R2_ENDPOINT: ${{ vars.UK_AQ_JSONGEN_R2_ENDPOINT || '' }}
+      UK_AQ_JSONGEN_R2_BUCKET: ${{ vars.UK_AQ_JSONGEN_R2_BUCKET || '' }}
+      UK_AQ_JSONGEN_PRUNE_WRITER_TOKEN: ${{ secrets.UK_AQ_JSONGEN_PRUNE_WRITER_TOKEN }}
+      UK_AQ_JSONGEN_SIGNER_ACCESS_CLIENT_ID: ${{ secrets.UK_AQ_JSONGEN_SIGNER_ACCESS_CLIENT_ID }}
+      UK_AQ_JSONGEN_SIGNER_ACCESS_CLIENT_SECRET: ${{ secrets.UK_AQ_JSONGEN_SIGNER_ACCESS_CLIENT_SECRET }}
       UK_AQ_SERVICE_EGRESS_METRICS_ENABLED: ${{ vars.UK_AQ_SERVICE_EGRESS_METRICS_ENABLED || 'false' }}
       SUPABASE_URL: ${{ vars.SUPABASE_URL }}
       OBS_AQIDB_SUPABASE_URL: ${{ vars.OBS_AQIDB_SUPABASE_URL }}
@@ -77,12 +86,12 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: "24.22.1"
 
       - name: Install dependencies
         run: npm ci --ignore-scripts
@@ -91,6 +100,7 @@ jobs:
         run: |
           set -euo pipefail
           required_values=(
+            UK_AQ_ENV_NAME
             SUPABASE_URL
             OBS_AQIDB_SUPABASE_URL
             SB_SECRET_KEY
@@ -106,6 +116,9 @@ jobs:
               CFLARE_R2_SECRET_ACCESS_KEY
             )
           fi
+          if [ "${UK_AQ_JSONGEN_PRUNE_PENDING_SOURCE_ENABLED}" = "true" ]; then
+            required_values+=(UK_AQ_JSONGEN_R2_ENDPOINT UK_AQ_JSONGEN_R2_BUCKET)
+          fi
           missing=0
           for key in "${required_values[@]}"; do
             if [ -z "${!key:-}" ]; then
@@ -113,6 +126,18 @@ jobs:
               missing=1
             fi
           done
+          # Canonical runtime identity must be configured explicitly (no fallback).
+          case "${UK_AQ_ENV_NAME:-}" in
+            TEST|LIVE) ;;
+            "") ;; # Missing value is already reported by required_values.
+            *)
+              echo "Invalid UK_AQ_ENV_NAME: expected TEST or LIVE (uppercase)" >&2
+              missing=1
+              ;;
+          esac
+          if [ "${missing}" -ne 0 ]; then
+            exit 1
+          fi
           node --input-type=module -e '
             import { resolvePruneHistoryGeneration } from "./workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
             resolvePruneHistoryGeneration(process.env);
@@ -124,7 +149,7 @@ jobs:
 
       - name: Upload Prune Daily report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: uk-aq-prune-daily-report
           path: tmp/uk_aq_prune_daily_report.json

@@ -34,6 +34,8 @@ import {
   buildHistoryV2PollutantManifestKey,
 } from "./uk_aq_r2_history_canonical.mjs";
 import {
+  observationsGlobalOperationLockIdentity,
+  requireObservationsGlobalOperationLockContext,
   runCanonicalDayFinalizer,
   runCanonicalGlobalIndexFinalizer,
   withConnectorDayHistoryLock,
@@ -55,13 +57,19 @@ export const DEFAULT_OBSERVATION_HISTORY_V3_STEADY_STATE_LATEST_KEY =
 export const DEFAULT_OBSERVATION_HISTORY_EXACT_V3_PUBLICATION_CONCURRENCY = 8;
 export const MAX_OBSERVATION_HISTORY_EXACT_V3_PUBLICATION_CONCURRENCY =
   MAX_OBSERVATION_HISTORY_INDEX_V3_PUBLICATION_CONCURRENCY;
+export const MAX_PRUNE_V3_RUN_LOCAL_REFERENCE_EVIDENCE_ENTRIES = 16_384;
 
 export const OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES = Object.freeze({
   pruneDaily: "prune_daily",
   integrity: "integrity",
   sosHistoricalReplacement: "sos_historical_replacement",
   supportedBackfill: "supported_backfill",
+  selectedScopeReconciliation: "selected_scope_reconciliation",
 });
+
+const SELECTED_SCOPE_REMOVAL_AUTHORITY = Symbol(
+  "uk_aq_observation_history_selected_scope_removal_authority",
+);
 
 const ALLOWED_SOURCES = new Set(
   Object.values(OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES),
@@ -83,6 +91,58 @@ function normalizeSource(value) {
     throw new Error(`Unsupported observation-history v3 writer source: ${source || "unset"}`);
   }
   return source;
+}
+
+function normalizeObservationScope(scope, fieldName) {
+  const dayUtc = String(scope?.day_utc || "").trim();
+  const parsedDay = new Date(`${dayUtc}T00:00:00.000Z`);
+  const connectorId = Number(scope?.connector_id);
+  const pollutantCode = String(scope?.pollutant_code || "").trim().toLowerCase();
+  if (
+    !/^\d{4}-\d{2}-\d{2}$/.test(dayUtc) ||
+    Number.isNaN(parsedDay.getTime()) ||
+    parsedDay.toISOString().slice(0, 10) !== dayUtc
+  ) {
+    throw new TypeError(`${fieldName}.day_utc must be a canonical UTC day`);
+  }
+  if (!Number.isSafeInteger(connectorId) || connectorId <= 0) {
+    throw new TypeError(`${fieldName}.connector_id must be a positive safe integer`);
+  }
+  if (!/^[a-z0-9_]+$/.test(pollutantCode)) {
+    throw new TypeError(`${fieldName}.pollutant_code is invalid`);
+  }
+  return Object.freeze({
+    day_utc: dayUtc,
+    connector_id: connectorId,
+    pollutant_code: pollutantCode,
+  });
+}
+
+function normalizeRemovedScopes(removedScopes) {
+  if (removedScopes === undefined || removedScopes === null) {
+    return Object.freeze([]);
+  }
+  if (!Array.isArray(removedScopes)) {
+    throw new TypeError("removedScopes must be an array");
+  }
+  const seen = new Set();
+  const normalized = removedScopes.map((scope, index) => {
+    const value = normalizeObservationScope(scope, `removedScopes[${index}]`);
+    const identity = scopeIdentity(value);
+    if (seen.has(identity)) {
+      throw new Error(
+        `V3 steady-state writer received duplicate removal scope: ${identity.replaceAll("\u0000", "/")}`,
+      );
+    }
+    seen.add(identity);
+    return value;
+  });
+  normalized.sort((left, right) =>
+    bytewiseCompare(left.day_utc, right.day_utc) ||
+    left.connector_id - right.connector_id ||
+    bytewiseCompare(left.pollutant_code, right.pollutant_code)
+  );
+  return Object.freeze(normalized);
 }
 
 function normalizePrefix(value, fieldName) {
@@ -269,8 +329,165 @@ function assertEvidence(actual, expected, label) {
   });
 }
 
-async function verifiedExternalReference(reference, getObject) {
-  const object = await getObject({ key: reference.key });
+function isPhaseBHistoryBudgetError(error) {
+  return error?.name === "PhaseBHistoryBudgetExhaustedError" ||
+    error?.code === "PHASE_B_HISTORY_BUDGET_EXHAUSTED";
+}
+
+function isPruneGlobalLockContext(context) {
+  if (
+    context?.valid !== true || context.owner !== "prune_daily" ||
+    !String(context.run_id || "").trim() || !String(context.nonce || "").trim()
+  ) {
+    return false;
+  }
+  const identity = observationsGlobalOperationLockIdentity();
+  return context.logical_identity === identity.logical_identity &&
+    Number(context.class_id) === identity.class_id &&
+    Number(context.object_id) === identity.object_id;
+}
+
+/**
+ * Compact evidence for exact scoped roots, bound to one supervised Prune run.
+ * The outer lock supervisor terminates the worker if the retained lock session
+ * is lost, so this process-local object cannot survive a lock handoff/restart.
+ */
+export function createPruneDailyObservationHistoryV3RunLocalEvidenceCache({
+  lockContext,
+} = {}) {
+  if (!isPruneGlobalLockContext(lockContext)) return null;
+
+  const entries = new Map();
+  let eligibleKeys = new Set();
+  let active = true;
+  let pendingInvalidations = 0;
+  const lockIdentity = Object.freeze({
+    owner: lockContext.owner,
+    run_id: lockContext.run_id,
+    nonce: lockContext.nonce,
+    logical_identity: lockContext.logical_identity,
+    class_id: Number(lockContext.class_id),
+    object_id: Number(lockContext.object_id),
+  });
+
+  const cache = {
+    matches(context) {
+      return active && isPruneGlobalLockContext(context) &&
+        context.owner === lockIdentity.owner &&
+        context.run_id === lockIdentity.run_id &&
+        context.nonce === lockIdentity.nonce &&
+        context.logical_identity === lockIdentity.logical_identity &&
+        Number(context.class_id) === lockIdentity.class_id &&
+        Number(context.object_id) === lockIdentity.object_id;
+    },
+    getVerified(reference) {
+      if (!active) return null;
+      const key = typeof reference?.key === "string" ? reference.key : "";
+      const existing = entries.get(key);
+      if (!existing) return null;
+      if (
+        !eligibleKeys.has(key) ||
+        existing.key !== key ||
+        existing.byte_size !== reference?.byte_size ||
+        existing.sha256 !== reference?.sha256
+      ) {
+        entries.delete(key);
+        eligibleKeys.delete(key);
+        pendingInvalidations += 1;
+        return null;
+      }
+      return existing;
+    },
+    remember(reference, evidence) {
+      if (!active) return false;
+      const exact = assertEvidence(evidence, reference, "Prune run-local v3 dependency");
+      const prior = entries.get(exact.key);
+      if (prior && (
+        prior.byte_size !== exact.byte_size || prior.sha256 !== exact.sha256
+      )) {
+        entries.delete(exact.key);
+        eligibleKeys.delete(exact.key);
+        pendingInvalidations += 1;
+      }
+      if (!entries.has(exact.key) &&
+          entries.size >= MAX_PRUNE_V3_RUN_LOCAL_REFERENCE_EVIDENCE_ENTRIES) {
+        return false;
+      }
+      entries.set(exact.key, exact);
+      return true;
+    },
+    invalidateKey(keyValue) {
+      if (!active) return false;
+      const key = typeof keyValue === "string" ? keyValue : "";
+      if (!key || !entries.has(key)) return false;
+      entries.delete(key);
+      eligibleKeys.delete(key);
+      pendingInvalidations += 1;
+      return true;
+    },
+    recordFinalizedDependencies(references) {
+      if (!active || !Array.isArray(references)) return;
+      const currentByKey = new Map(references.map((reference) => [reference.key, reference]));
+      const nextEligibleKeys = new Set();
+      for (const [key, evidence] of entries) {
+        const current = currentByKey.get(key);
+        if (
+          !current || current.byte_size !== evidence.byte_size ||
+          current.sha256 !== evidence.sha256
+        ) {
+          entries.delete(key);
+          if (eligibleKeys.has(key)) pendingInvalidations += 1;
+          continue;
+        }
+        nextEligibleKeys.add(key);
+      }
+      eligibleKeys = nextEligibleKeys;
+    },
+    takeInvalidationCount() {
+      const count = pendingInvalidations;
+      pendingInvalidations = 0;
+      return count;
+    },
+    entryCount() {
+      return active ? entries.size : 0;
+    },
+    clear() {
+      active = false;
+      entries.clear();
+      eligibleKeys.clear();
+      pendingInvalidations = 0;
+    },
+  };
+  return Object.freeze(cache);
+}
+
+async function verifiedExternalReference(reference, getObject, {
+  onGetStarted = null,
+  onGetFinished = null,
+} = {}) {
+  let requestCounted = false;
+  const markGetStarted = () => {
+    if (requestCounted) return;
+    requestCounted = true;
+    onGetStarted?.();
+  };
+  let object;
+  try {
+    object = await getObject({
+      key: reference.key,
+      onR2GetAdmitted: markGetStarted,
+    });
+    // Test/custom adapters may not consume the admission callback. A returned
+    // object still proves that an origin GET was issued.
+    markGetStarted();
+  } catch (error) {
+    // Phase B invokes this callback only after its request-level budget check.
+    // A budget rejection is therefore not counted as an R2 GET.
+    if (!requestCounted && !isPhaseBHistoryBudgetError(error)) markGetStarted();
+    throw error;
+  } finally {
+    if (requestCounted) onGetFinished?.();
+  }
   if (!object || object.exists === false || object.body === null || object.body === undefined) {
     throw new Error(`V3 external publication reference is missing: ${reference.key}`);
   }
@@ -294,6 +511,106 @@ async function verifiedExternalReference(reference, getObject) {
     sha256: reference.sha256,
     verified: true,
     durable: true,
+  });
+}
+
+async function verifyExternalReferencesBounded({
+  references,
+  getObject,
+  evidenceCache = null,
+  reuseEvidence = true,
+  freshKeys = new Set(),
+  onFailureBatch = null,
+}) {
+  const concurrency = Math.min(
+    DEFAULT_OBSERVATION_HISTORY_EXACT_V3_PUBLICATION_CONCURRENCY,
+    8,
+  );
+  const metrics = {
+    dependency_count: references.length,
+    actual_r2_get_count: 0,
+    accepted_evidence_reuse_count: 0,
+    maximum_active_verification_requests: 0,
+    _active_verification_requests: 0,
+  };
+  const evidenceByKey = new Map();
+  const failures = [];
+  let failureFromBatchHandler = null;
+  let batchHandlerFailed = false;
+
+  for (let offset = 0; offset < references.length; offset += concurrency) {
+    const batch = references.slice(offset, offset + concurrency);
+    const batchFailures = [];
+    const batchResults = await Promise.all(batch.map(async (reference, batchIndex) => {
+      const position = offset + batchIndex;
+      try {
+        if (freshKeys.has(reference.key)) {
+          evidenceCache?.invalidateKey(reference.key);
+        }
+        if (reuseEvidence && evidenceCache && !freshKeys.has(reference.key)) {
+          const cached = evidenceCache.getVerified(reference);
+          if (cached) {
+            metrics.accepted_evidence_reuse_count += 1;
+            return { position, reference, evidence: cached };
+          }
+        }
+        let active = false;
+        const evidence = await verifiedExternalReference(reference, getObject, {
+          onGetStarted: () => {
+            active = true;
+            metrics.actual_r2_get_count += 1;
+            const currentActive = ++metrics._active_verification_requests;
+            metrics.maximum_active_verification_requests = Math.max(
+              metrics.maximum_active_verification_requests,
+              currentActive,
+            );
+          },
+          onGetFinished: () => {
+            if (!active) return;
+            metrics._active_verification_requests -= 1;
+            active = false;
+          },
+        });
+        evidenceCache?.remember(reference, evidence);
+        return { position, reference, evidence };
+      } catch (error) {
+        return { position, reference, failed: true, error };
+      }
+    }));
+
+    batchResults.sort((left, right) => left.position - right.position);
+    for (const result of batchResults) {
+      if (result.failed === true) {
+        batchFailures.push({
+          position: result.position,
+          reference: result.reference,
+          error: result.error,
+        });
+      } else {
+        evidenceByKey.set(result.reference.key, result.evidence);
+      }
+    }
+    if (batchFailures.length === 0) continue;
+    if (typeof onFailureBatch === "function") {
+      let handled;
+      try {
+        handled = await onFailureBatch(Object.freeze(batchFailures));
+      } catch (error) {
+        failureFromBatchHandler = error;
+        batchHandlerFailed = true;
+      }
+      if (handled === true) continue;
+    }
+    failures.push(...batchFailures);
+    break;
+  }
+  delete metrics._active_verification_requests;
+  return Object.freeze({
+    evidence_by_key: evidenceByKey,
+    metrics: Object.freeze(metrics),
+    failures: Object.freeze(failures),
+    has_failure: batchHandlerFailed || failures.length > 0,
+    failure: batchHandlerFailed ? failureFromBatchHandler : failures[0]?.error,
   });
 }
 
@@ -404,15 +721,22 @@ export function buildObservationHistoryV3SteadyStatePartition({
 }
 
 function normalizePartitionInputs(partitions) {
-  if (!Array.isArray(partitions) || partitions.length === 0) {
-    throw new TypeError("V3 steady-state writer requires a non-empty partitions array");
+  if (partitions === undefined || partitions === null) return [];
+  if (!Array.isArray(partitions)) {
+    throw new TypeError("V3 steady-state writer partitions must be an array");
   }
   return partitions.map((partition, index) => {
     if (Array.isArray(partition)) {
+      if (partition.length === 0) {
+        throw new TypeError(`V3 steady-state writer partition ${index} must be non-empty`);
+      }
       return { rows: partition, scope: null, backed_up_at_utc: undefined };
     }
     if (!partition || typeof partition !== "object" || !Array.isArray(partition.rows)) {
       throw new TypeError(`V3 steady-state writer partition ${index} requires rows`);
+    }
+    if (partition.rows.length === 0) {
+      throw new TypeError(`V3 steady-state writer partition ${index} must be non-empty`);
     }
     return {
       rows: partition.rows,
@@ -510,7 +834,19 @@ function validatePreparedPartitions(prepared) {
   return prepared;
 }
 
-function groupPreparedByConnectorDay(prepared) {
+function assertReplacementRemovalDisjoint(prepared, removedScopes) {
+  const replacements = new Set(prepared.map((partition) => scopeIdentity(partition.scope)));
+  for (const scope of removedScopes) {
+    const identity = scopeIdentity(scope);
+    if (replacements.has(identity)) {
+      throw new Error(
+        `V3 steady-state writer scope cannot be both replaced and removed: ${identity.replaceAll("\u0000", "/")}`,
+      );
+    }
+  }
+}
+
+function groupPreparedByConnectorDay(prepared, removedScopes = []) {
   const groups = new Map();
   for (const partition of prepared) {
     const identity = connectorDayIdentity(partition.scope);
@@ -518,8 +854,20 @@ function groupPreparedByConnectorDay(prepared) {
       day_utc: partition.scope.day_utc,
       connector_id: partition.scope.connector_id,
       partitions: [],
+      removed_scopes: [],
     };
     existing.partitions.push(partition);
+    groups.set(identity, existing);
+  }
+  for (const scope of removedScopes) {
+    const identity = connectorDayIdentity(scope);
+    const existing = groups.get(identity) || {
+      day_utc: scope.day_utc,
+      connector_id: scope.connector_id,
+      partitions: [],
+      removed_scopes: [],
+    };
+    existing.removed_scopes.push(scope);
     groups.set(identity, existing);
   }
   return [...groups.values()].sort((left, right) =>
@@ -569,21 +917,15 @@ function validateConnectorCanonicalResult({
       "Connector-scoped canonical finalizer",
     );
   });
-  const connectorManifest = assertDurableEvidence(
-    result.connector_manifest,
-    "Canonical connector manifest",
-  );
-  const expectedConnectorManifestKey = buildHistoryV2ConnectorManifestKey(
-    observationsPrefix,
-    group.day_utc,
-    group.connector_id,
-  );
-  if (connectorManifest.key !== expectedConnectorManifestKey) {
-    throw new Error(`Canonical connector manifest key disagrees: ${group.day_utc}/${group.connector_id}`);
-  }
   const changedPollutants = [...group.partitions]
     .map((partition) => partition.scope.pollutant_code)
     .sort(bytewiseCompare);
+  const requestedRemovalScopes = [...group.removed_scopes].sort((left, right) =>
+    bytewiseCompare(left.pollutant_code, right.pollutant_code)
+  );
+  const requestedRemovalPollutants = requestedRemovalScopes.map(
+    (scope) => scope.pollutant_code,
+  );
   const reportedPollutantCodes = (values, fieldName) => {
     if (!Array.isArray(values)) {
       throw new TypeError(`Canonical connector finalizer ${fieldName} must be an array`);
@@ -619,16 +961,34 @@ function validateConnectorCanonicalResult({
   );
   const completeConnectorSnapshot =
     source === OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.pruneDaily;
+  const selectedScopeReconciliation =
+    source === OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.selectedScopeReconciliation;
+  if (
+    selectedScopeReconciliation &&
+    result.current_day_authority_checked !== true
+  ) {
+    throw new Error(
+      `Canonical connector finalizer did not verify current day authority: ${group.day_utc}/${group.connector_id}`,
+    );
+  }
   const changedPollutantSet = new Set(changedPollutants);
+  const requestedRemovalSet = new Set(requestedRemovalPollutants);
+  const mergedPollutants = [...new Set([...currentPollutants, ...changedPollutants])]
+    .sort(bytewiseCompare);
   const expectedFinalPollutants = completeConnectorSnapshot
     ? [...changedPollutants]
-    : [...new Set([...currentPollutants, ...changedPollutants])]
-      .sort(bytewiseCompare);
+    : selectedScopeReconciliation
+      ? mergedPollutants.filter((pollutantCode) =>
+        !requestedRemovalSet.has(pollutantCode)
+      )
+      : mergedPollutants;
   const expectedRemovedPollutants = completeConnectorSnapshot
     ? currentPollutants.filter((pollutantCode) =>
       !changedPollutantSet.has(pollutantCode)
     )
-    : [];
+    : selectedScopeReconciliation
+      ? requestedRemovalPollutants
+      : [];
   if (!sameArray(reportedChanged, changedPollutants)) {
     throw new Error(
       `Canonical connector finalizer changed-pollutant evidence disagrees: ${group.day_utc}/${group.connector_id}`,
@@ -638,7 +998,9 @@ function validateConnectorCanonicalResult({
     throw new Error(
       completeConnectorSnapshot
         ? `Canonical connector finalizer did not publish the complete Prune pollutant set: ${group.day_utc}/${group.connector_id}`
-        : `Canonical connector finalizer did not preserve the current pollutant union: ${group.day_utc}/${group.connector_id}`,
+        : selectedScopeReconciliation
+          ? `Canonical connector finalizer did not apply the selected-scope delta: ${group.day_utc}/${group.connector_id}`
+          : `Canonical connector finalizer did not preserve the current pollutant union: ${group.day_utc}/${group.connector_id}`,
     );
   }
   if (!sameArray(removedPollutants, expectedRemovedPollutants)) {
@@ -647,11 +1009,9 @@ function validateConnectorCanonicalResult({
     );
   }
   const removedScopes = Array.isArray(result.removed_scopes)
-    ? result.removed_scopes.map((scope) => ({
-      day_utc: String(scope?.day_utc || ""),
-      connector_id: Number(scope?.connector_id),
-      pollutant_code: String(scope?.pollutant_code || "").trim().toLowerCase(),
-    }))
+    ? result.removed_scopes.map((scope, index) =>
+      normalizeObservationScope(scope, `result.removed_scopes[${index}]`)
+    )
     : null;
   const expectedRemovedScopes = expectedRemovedPollutants.map((pollutantCode) => ({
     day_utc: group.day_utc,
@@ -666,13 +1026,78 @@ function validateConnectorCanonicalResult({
       `Canonical connector finalizer removed-scope evidence disagrees: ${group.day_utc}/${group.connector_id}`,
     );
   }
+  const expectedRemovalResults = selectedScopeReconciliation
+    ? requestedRemovalScopes.map((scope) => Object.freeze({
+      ...scope,
+      requested_removal: true,
+      previously_authoritative: currentPollutants.includes(scope.pollutant_code),
+      final_scope_present: false,
+    }))
+    : [];
+  const removalResults = Array.isArray(result.removal_results)
+    ? result.removal_results.map((entry, index) => {
+      const scope = normalizeObservationScope(
+        entry,
+        `result.removal_results[${index}]`,
+      );
+      return Object.freeze({
+        ...scope,
+        requested_removal: entry.requested_removal === true,
+        previously_authoritative: entry.previously_authoritative === true,
+        final_scope_present: entry.final_scope_present === true,
+      });
+    })
+    : [];
+  if (JSON.stringify(removalResults) !== JSON.stringify(expectedRemovalResults)) {
+    throw new Error(
+      `Canonical connector finalizer removal evidence disagrees: ${group.day_utc}/${group.connector_id}`,
+    );
+  }
+  const connectorAuthorityPresent = finalPollutants.length > 0;
+  if (
+    result.connector_authority_present !== undefined &&
+    result.connector_authority_present !== connectorAuthorityPresent
+  ) {
+    throw new Error(
+      `Canonical connector finalizer presence evidence disagrees: ${group.day_utc}/${group.connector_id}`,
+    );
+  }
+  let connectorManifest = null;
+  if (connectorAuthorityPresent) {
+    connectorManifest = assertDurableEvidence(
+      result.connector_manifest,
+      "Canonical connector manifest",
+    );
+    const expectedConnectorManifestKey = buildHistoryV2ConnectorManifestKey(
+      observationsPrefix,
+      group.day_utc,
+      group.connector_id,
+    );
+    if (connectorManifest.key !== expectedConnectorManifestKey) {
+      throw new Error(`Canonical connector manifest key disagrees: ${group.day_utc}/${group.connector_id}`);
+    }
+    if (!result.connector_manifest_payload) {
+      throw new Error(
+        `Canonical connector manifest payload is missing: ${group.day_utc}/${group.connector_id}`,
+      );
+    }
+  } else if (
+    result.connector_manifest !== null || result.connector_manifest_payload !== null
+  ) {
+    throw new Error(
+      `Canonical connector finalizer must not publish an empty connector manifest: ${group.day_utc}/${group.connector_id}`,
+    );
+  }
   return Object.freeze({
     day_utc: group.day_utc,
     connector_id: group.connector_id,
     current_child_validation_mode:
       result.current_child_validation_mode ?? null,
+    current_day_authority_checked:
+      result.current_day_authority_checked === true,
     connector_manifest: connectorManifest,
     connector_manifest_payload: result.connector_manifest_payload ?? null,
+    connector_authority_present: connectorAuthorityPresent,
     current_pollutant_codes: Object.freeze(currentPollutants),
     changed_pollutant_codes: Object.freeze(reportedChanged),
     final_pollutant_codes: Object.freeze(finalPollutants),
@@ -680,6 +1105,7 @@ function validateConnectorCanonicalResult({
     removed_scopes: Object.freeze(removedScopes.map((scope) =>
       Object.freeze({ ...scope })
     )),
+    removal_results: Object.freeze(removalResults),
     pollutant_manifests: Object.freeze(pollutantManifests),
     connector_scope_verified: true,
     parent_state_reread_under_lock: true,
@@ -688,10 +1114,14 @@ function validateConnectorCanonicalResult({
 
 function validateDayCanonicalResult({
   dayUtc,
-  changedConnectorIds,
+  changedConnectors,
   result,
   observationsPrefix,
 }) {
+  const changedConnectorIds = changedConnectors.map((entry) => entry.connector_id);
+  const absentChangedConnectorIds = changedConnectors
+    .filter((entry) => entry.canonical.connector_authority_present === false)
+    .map((entry) => entry.connector_id);
   if (
     result?.canonical_day_authority_verified !== true ||
     result?.parent_state_reread_under_lock !== true ||
@@ -717,10 +1147,12 @@ function validateDayCanonicalResult({
     result.final_connector_ids,
     "final_connector_ids",
   );
+  const absentChangedSet = new Set(absentChangedConnectorIds);
   const expectedFinal = [...new Set([...current, ...changedConnectorIds])]
+    .filter((connectorId) => !absentChangedSet.has(connectorId))
     .sort((left, right) => left - right);
   if (!sameArray(finalIds, expectedFinal)) {
-    throw new Error(`Canonical day finalizer did not preserve the current connector set: ${dayUtc}`);
+    throw new Error(`Canonical day finalizer did not apply the changed connector set: ${dayUtc}`);
   }
   const dayManifest = assertDurableEvidence(result.day_manifest, "Canonical day manifest");
   if (dayManifest.key !== buildHistoryV2DayManifestKey(observationsPrefix, dayUtc)) {
@@ -729,6 +1161,7 @@ function validateDayCanonicalResult({
   return Object.freeze({
     day_utc: dayUtc,
     changed_connector_ids: Object.freeze([...changedConnectorIds]),
+    absent_changed_connector_ids: Object.freeze([...absentChangedConnectorIds]),
     current_connector_ids: Object.freeze(current),
     final_connector_ids: Object.freeze(finalIds),
     day_manifest: dayManifest,
@@ -851,6 +1284,7 @@ export async function runObservationHistoryV3ConnectorPublication({
   client,
   source,
   partitions,
+  removedScopes,
   writerLimits = ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3,
   targetWriterGitSha,
   backedUpAtUtc,
@@ -876,6 +1310,7 @@ export async function runObservationHistoryV3ConnectorPublication({
   prepareCompleteDayReplacement = null,
   exactV3PublicationConcurrency =
     DEFAULT_OBSERVATION_HISTORY_EXACT_V3_PUBLICATION_CONCURRENCY,
+  selectedScopeRemovalAuthority = null,
 }) {
   assertObservationHistoryGenerationPrefixes(getObservationHistoryGeneration("v3"), { observationsPrefix, indexRoot, latestKey });
   if (!client?.query) throw new Error("V3 steady-state writer requires PostgreSQL lock client");
@@ -894,6 +1329,28 @@ export async function runObservationHistoryV3ConnectorPublication({
   }
   assertObservationHistoryGenerationPrefixes(getObservationHistoryGeneration("v3"), { observationsPrefix, indexRoot });
   const normalizedSource = normalizeSource(source);
+  const normalizedRemovedScopes = normalizeRemovedScopes(removedScopes);
+  const selectedScopeReconciliation = normalizedSource ===
+    OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.selectedScopeReconciliation;
+  if (
+    selectedScopeReconciliation &&
+    selectedScopeRemovalAuthority !== SELECTED_SCOPE_REMOVAL_AUTHORITY
+  ) {
+    throw new Error(
+      "Selected-scope reconciliation is available only through its fixed-authority adapter",
+    );
+  }
+  if (!selectedScopeReconciliation && normalizedRemovedScopes.length > 0) {
+    throw new Error(
+      `Observation-history source ${normalizedSource} is not authorised for selected-scope removal`,
+    );
+  }
+  const normalizedPartitionInputs = normalizePartitionInputs(partitions);
+  if (normalizedPartitionInputs.length === 0 && normalizedRemovedScopes.length === 0) {
+    throw new TypeError(
+      "V3 steady-state writer requires at least one non-empty replacement partition or explicit removal scope",
+    );
+  }
   const sosReplacement =
     normalizedSource === OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.sosHistoricalReplacement;
   if (sosReplacement && typeof prepareCompleteDayReplacement !== "function") {
@@ -908,7 +1365,7 @@ export async function runObservationHistoryV3ConnectorPublication({
   }
   const prepared = prepareRunPartitions({
     source,
-    partitions,
+    partitions: normalizedPartitionInputs,
     writerLimits,
     targetWriterGitSha,
     backedUpAtUtc,
@@ -916,11 +1373,15 @@ export async function runObservationHistoryV3ConnectorPublication({
     indexRoot,
     diagnosticLog,
   });
+  assertReplacementRemovalDisjoint(prepared, normalizedRemovedScopes);
   const canonicalObservationsPrefix = normalizePrefix(
     observationsPrefix,
     "observationsPrefix",
   );
-  const connectorGroups = groupPreparedByConnectorDay(prepared);
+  const connectorGroups = groupPreparedByConnectorDay(
+    prepared,
+    normalizedRemovedScopes,
+  );
   prepared.length = 0;
   const connectorResults = [];
   const completeDayReplacementResults = [];
@@ -1009,6 +1470,7 @@ export async function runObservationHistoryV3ConnectorPublication({
           day_utc: group.day_utc,
           connector_id: group.connector_id,
           partitions: Object.freeze(partitionResults),
+          removed_scopes: Object.freeze([...group.removed_scopes]),
         });
         canonical = validateConnectorCanonicalResult({
           group,
@@ -1052,44 +1514,53 @@ export async function runObservationHistoryV3ConnectorPublication({
       let exactProgress = null;
       let lastLoggedProgress = 0;
       try {
-        exact = await publishConnectorExactV3Scopes({
-          partitions: partitionResults,
-          canonical,
-          getObject,
-          putIfChanged,
-          recordDurableEvidence,
-          finalizeV3Publication,
-          publicationConcurrency: exactV3PublicationConcurrency,
-          onProgress: (progress) => {
-            exactProgress = progress;
-            if (
-              progress?.status === "running" &&
-              progress.completed_object_count > 0 &&
-              progress.completed_object_count % 100 === 0 &&
-              progress.completed_object_count !== lastLoggedProgress
-            ) {
-              lastLoggedProgress = progress.completed_object_count;
-              emitV3PublicationDiagnostic(
-                diagnosticLog,
-                "exact_v3_connector_publication_progress",
-                {
-                  ...exactFields,
-                  completed: progress.completed_object_count,
-                  total: progress.total_object_count,
-                  active: progress.active_publication_count,
-                  ready: progress.ready_object_count,
-                  blocked: progress.blocked_object_count,
-                  maximum_active_publications:
-                    progress.maximum_active_publications,
-                  reused_object_count: progress.reused_object_count,
-                  newly_written_object_count:
-                    progress.newly_written_object_count,
-                  elapsed_ms: progress.elapsed_ms,
-                },
-              );
-            }
-          },
-        });
+        exact = partitionResults.length === 0
+          ? Object.freeze({
+            publication: Object.freeze({
+              ok: true,
+              status: "no_replacement_scopes",
+              objects: Object.freeze([]),
+            }),
+            scoped_roots: Object.freeze([]),
+          })
+          : await publishConnectorExactV3Scopes({
+            partitions: partitionResults,
+            canonical,
+            getObject,
+            putIfChanged,
+            recordDurableEvidence,
+            finalizeV3Publication,
+            publicationConcurrency: exactV3PublicationConcurrency,
+            onProgress: (progress) => {
+              exactProgress = progress;
+              if (
+                progress?.status === "running" &&
+                progress.completed_object_count > 0 &&
+                progress.completed_object_count % 100 === 0 &&
+                progress.completed_object_count !== lastLoggedProgress
+              ) {
+                lastLoggedProgress = progress.completed_object_count;
+                emitV3PublicationDiagnostic(
+                  diagnosticLog,
+                  "exact_v3_connector_publication_progress",
+                  {
+                    ...exactFields,
+                    completed: progress.completed_object_count,
+                    total: progress.total_object_count,
+                    active: progress.active_publication_count,
+                    ready: progress.ready_object_count,
+                    blocked: progress.blocked_object_count,
+                    maximum_active_publications:
+                      progress.maximum_active_publications,
+                    reused_object_count: progress.reused_object_count,
+                    newly_written_object_count:
+                      progress.newly_written_object_count,
+                    elapsed_ms: progress.elapsed_ms,
+                  },
+                );
+              }
+            },
+          });
       } catch (error) {
         emitV3PublicationDiagnostic(diagnosticLog, "exact_v3_connector_publication_failed", {
           ...exactFields,
@@ -1120,6 +1591,7 @@ export async function runObservationHistoryV3ConnectorPublication({
           })
         )),
         canonical,
+        removal_results: canonical.removal_results,
         v3_exact_publication: exact.publication,
       });
     });
@@ -1174,9 +1646,17 @@ function collectVerifiedConnectorPublications({ source, connectorPublications })
         Number(result.connector_id) <= 0 ||
         result?.canonical?.connector_scope_verified !== true ||
         result?.canonical?.parent_state_reread_under_lock !== true ||
+        (normalizedSource ===
+          OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.selectedScopeReconciliation &&
+          result?.canonical?.current_day_authority_checked !== true) ||
         result?.v3_exact_publication?.ok !== true ||
         !Array.isArray(result?.partitions) ||
-        result.partitions.length === 0 ||
+        (normalizedSource ===
+          OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.selectedScopeReconciliation &&
+          !Array.isArray(result?.canonical?.removal_results)) ||
+        (result.partitions.length === 0 &&
+          (!Array.isArray(result?.canonical?.removal_results) ||
+            result.canonical.removal_results.length === 0)) ||
         seenConnectorDays.has(identity)
       ) {
         throw new Error("V3 run finalization received contradictory connector publication evidence");
@@ -1223,9 +1703,20 @@ function buildRunFinalizationEvidence(connectorPublication) {
           connector_manifest: result.canonical.connector_manifest,
           connector_manifest_payload:
             result.canonical.connector_manifest_payload,
+          connector_authority_present:
+            result.canonical.connector_authority_present,
+          current_day_authority_checked:
+            result.canonical.current_day_authority_checked,
+          current_pollutant_codes:
+            result.canonical.current_pollutant_codes,
+          changed_pollutant_codes:
+            result.canonical.changed_pollutant_codes,
+          final_pollutant_codes:
+            result.canonical.final_pollutant_codes,
           removed_pollutant_codes:
             result.canonical.removed_pollutant_codes,
           removed_scopes: result.canonical.removed_scopes,
+          removal_results: result.canonical.removal_results ?? Object.freeze([]),
           connector_scope_verified:
             result.canonical.connector_scope_verified,
           parent_state_reread_under_lock:
@@ -1305,6 +1796,9 @@ export async function runObservationHistoryV3RunFinalization({
   beforePublicationStage,
   lockTimeoutMs,
   recoverLatestScopedReference = null,
+  selectedScopeRemovalAuthority = null,
+  runLocalReferenceEvidenceCache = null,
+  globalOperationLockContext = null,
 }) {
   assertObservationHistoryGenerationPrefixes(getObservationHistoryGeneration("v3"), { observationsPrefix, indexRoot, latestKey });
   if (!client?.query) throw new Error("V3 run finalization requires PostgreSQL lock client");
@@ -1328,6 +1822,20 @@ export async function runObservationHistoryV3RunFinalization({
     connectorPublications,
   });
   const normalizedSource = publicationEvidence.source;
+  const runEvidenceCache = normalizedSource ===
+      OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.pruneDaily &&
+      runLocalReferenceEvidenceCache?.matches?.(globalOperationLockContext) === true
+    ? runLocalReferenceEvidenceCache
+    : null;
+  if (
+    normalizedSource ===
+      OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.selectedScopeReconciliation &&
+    selectedScopeRemovalAuthority !== SELECTED_SCOPE_REMOVAL_AUTHORITY
+  ) {
+    throw new Error(
+      "Selected-scope reconciliation finalization is available only through its fixed-authority adapter",
+    );
+  }
   const connectorResults = publicationEvidence.connector_results;
   const completeDayReplacementResults =
     publicationEvidence.complete_day_replacement_results;
@@ -1348,6 +1856,34 @@ export async function runObservationHistoryV3RunFinalization({
   };
   const runStartedAtMs = Date.now();
   const dayResults = [];
+  const finalizationMetrics = {
+    latest_global_dependency_count: 0,
+    latest_global_dependency_r2_get_count: 0,
+    accepted_same_run_evidence_reuse_count: 0,
+    recovered_scoped_reference_count: 0,
+    evidence_invalidation_count: runEvidenceCache?.takeInvalidationCount?.() || 0,
+    maximum_active_verification_requests: 0,
+  };
+  const absorbVerificationMetrics = (metrics = {}) => {
+    finalizationMetrics.latest_global_dependency_count = metrics.dependency_count || 0;
+    finalizationMetrics.latest_global_dependency_r2_get_count += metrics.actual_r2_get_count || 0;
+    finalizationMetrics.accepted_same_run_evidence_reuse_count =
+      finalizationMetrics.accepted_same_run_evidence_reuse_count +
+      (metrics.accepted_evidence_reuse_count || 0);
+    finalizationMetrics.maximum_active_verification_requests =
+      Math.max(
+        finalizationMetrics.maximum_active_verification_requests,
+        metrics.maximum_active_verification_requests || 0,
+      );
+  };
+  const collectEvidenceInvalidations = () => {
+    finalizationMetrics.evidence_invalidation_count +=
+      runEvidenceCache?.takeInvalidationCount?.() || 0;
+    return finalizationMetrics.evidence_invalidation_count;
+  };
+  const failureOutcome = (error) => isPhaseBHistoryBudgetError(error)
+    ? "budget_stop"
+    : "failed_closed";
   try {
     assertV3PublicationStageBudget(
       beforePublicationStage,
@@ -1395,7 +1931,7 @@ export async function runObservationHistoryV3RunFinalization({
             });
             return validateDayCanonicalResult({
               dayUtc,
-              changedConnectorIds,
+              changedConnectors,
               result: finalized,
               observationsPrefix: canonicalObservationsPrefix,
             });
@@ -1512,14 +2048,29 @@ export async function runObservationHistoryV3RunFinalization({
           ).flatMap((day) =>
             Array.isArray(day?.scoped_roots) ? day.scoped_roots : []
           );
+          const existingLatestScopeIdentities = new Set(
+            existingLatestRoots.map((root) => scopeIdentity(root)),
+          );
           const replacementScopedManifests = partitionResults.map(
             (partition) => partition.scoped_root.artifact,
           );
-          const removedScopes = obsoletePruneLatestScopes({
+          const pruneRemovedScopes = obsoletePruneLatestScopes({
             source: normalizedSource,
             existingLatest,
             connectorResults,
           });
+          const explicitRemovedScopes = normalizedSource ===
+              OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.selectedScopeReconciliation
+            ? connectorResults.flatMap((entry) => entry.canonical.removed_scopes)
+            : [];
+          const removedScopes = Object.freeze([
+            ...pruneRemovedScopes,
+            ...explicitRemovedScopes,
+          ].sort((left, right) =>
+            bytewiseCompare(left.day_utc, right.day_utc) ||
+            left.connector_id - right.connector_id ||
+            bytewiseCompare(left.pollutant_code, right.pollutant_code)
+          ));
           let updatedLatest = updateObservationHistoryExactLeafIndexV3Latest({
             existingLatest,
             replacementScopedManifests,
@@ -1533,95 +2084,126 @@ export async function runObservationHistoryV3RunFinalization({
               partition.scoped_root.evidence,
             ]),
           );
+          const latestReferencesByKey = new Map();
+          for (const reference of updatedLatest.dependencies) {
+            const prior = latestReferencesByKey.get(reference.key);
+            if (prior && (
+              prior.byte_size !== reference.byte_size ||
+              prior.sha256 !== reference.sha256
+            )) {
+              throw new Error(
+                `Exact-v3 latest dependency identity is ambiguous: ${reference.key}`,
+              );
+            }
+            if (!prior) latestReferencesByKey.set(reference.key, reference);
+          }
+          const latestReferences = [...latestReferencesByKey.values()];
+          finalizationMetrics.latest_global_dependency_count = latestReferences.length;
           const latestExternalByKey = new Map();
           const recoveredScopedManifests = [];
-          for (const reference of updatedLatest.dependencies) {
+          for (const reference of latestReferences) {
             const exact = changedScopedEvidenceByKey.get(reference.key);
             if (exact) {
               assertEvidence(exact, reference, "V3 latest scoped prerequisite");
             }
-            try {
-              latestExternalByKey.set(
-                reference.key,
-                await verifiedExternalReference(reference, getObject),
-              );
-            } catch (error) {
-              if (
-                exact ||
-                normalizedSource !==
-                  OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.pruneDaily ||
-                error?.code !== "V3_EXTERNAL_REFERENCE_IDENTITY_CHANGED" ||
-                typeof recoverLatestScopedReference !== "function"
-              ) {
-                throw error;
-              }
-              const recovered = await recoverLatestScopedReference({
-                source: normalizedSource,
-                reference,
-                latest_scope: (() => {
-                  const matches = existingLatestRoots.filter((root) =>
-                    root.key === reference.key
-                  );
-                  if (matches.length !== 1) {
-                    throw new Error(
-                      `Prune latest-global recovery scope evidence is ambiguous: ${reference.key}`,
-                    );
-                  }
-                  return matches[0];
-                })(),
-                live_reference: error.actual_reference,
-                live_body: error.actual_body,
-                observations_prefix: canonicalObservationsPrefix,
-                index_root: indexRoot,
-              });
-              const artifact = recovered?.artifact;
-              if (
-                !artifact || artifact.key !== reference.key ||
-                artifact.sha256 === reference.sha256
-              ) {
-                throw new Error(
-                  `Prune latest-global recovery returned invalid replacement: ${reference.key}`,
-                );
-              }
-              const evidence = assertEvidence(
-                recovered?.evidence,
-                artifact,
-                "Prune latest-global recovered scoped prerequisite",
-              );
-              recoveredScopedManifests.push(artifact);
-              latestExternalByKey.set(reference.key, evidence);
-              emitV3PublicationDiagnostic(
-                diagnosticLog,
-                "latest_global_exact_v3_scoped_reference_recovered",
-                {
-                  day_utc: artifact.payload.day_utc,
-                  connector_id: artifact.payload.connector_id,
-                  pollutant_code: artifact.payload.pollutant_code,
-                  key: artifact.key,
-                  stale_latest_global_sha256: reference.sha256,
-                  canonically_proven_current_sha256: artifact.sha256,
-                  recovery_mode: "canonical_authority_same_key_recovery",
-                  ...(Number.isSafeInteger(recovered.verification_object_count)
-                    ? {
-                        verification_object_count:
-                          recovered.verification_object_count,
-                      }
-                    : {}),
-                  ...(Number.isSafeInteger(recovered.verification_concurrency)
-                    ? {
-                        verification_concurrency:
-                          recovered.verification_concurrency,
-                      }
-                    : {}),
-                  ...(Number.isSafeInteger(recovered.verification_duration_ms)
-                    ? {
-                        verification_duration_ms:
-                          recovered.verification_duration_ms,
-                      }
-                    : {}),
-                },
+          }
+          const recoverLatestScopedReferenceFailure = async ({ reference, error }) => {
+            const exact = changedScopedEvidenceByKey.get(reference.key);
+            if (
+              exact ||
+              normalizedSource !==
+                OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.pruneDaily ||
+              error?.code !== "V3_EXTERNAL_REFERENCE_IDENTITY_CHANGED" ||
+              typeof recoverLatestScopedReference !== "function"
+            ) {
+              throw error;
+            }
+            if (!error.actual_reference || !error.actual_body) throw error;
+            const matches = existingLatestRoots.filter((root) =>
+              root.key === reference.key
+            );
+            if (matches.length !== 1) {
+              throw new Error(
+                `Prune latest-global recovery scope evidence is ambiguous: ${reference.key}`,
               );
             }
+            const recovered = await recoverLatestScopedReference({
+              source: normalizedSource,
+              reference,
+              latest_scope: matches[0],
+              live_reference: error.actual_reference,
+              live_body: error.actual_body,
+              observations_prefix: canonicalObservationsPrefix,
+              index_root: indexRoot,
+            });
+            const artifact = recovered?.artifact;
+            if (
+              !artifact || artifact.key !== reference.key ||
+              artifact.sha256 === reference.sha256
+            ) {
+              throw new Error(
+                `Prune latest-global recovery returned invalid replacement: ${reference.key}`,
+              );
+            }
+            const evidence = assertEvidence(
+              recovered?.evidence,
+              artifact,
+              "Prune latest-global recovered scoped prerequisite",
+            );
+            runEvidenceCache?.invalidateKey(reference.key);
+            recoveredScopedManifests.push(artifact);
+            latestExternalByKey.set(reference.key, evidence);
+            finalizationMetrics.recovered_scoped_reference_count += 1;
+            emitV3PublicationDiagnostic(
+              diagnosticLog,
+              "latest_global_exact_v3_scoped_reference_recovered",
+              {
+                day_utc: artifact.payload.day_utc,
+                connector_id: artifact.payload.connector_id,
+                pollutant_code: artifact.payload.pollutant_code,
+                key: artifact.key,
+                stale_latest_global_sha256: reference.sha256,
+                canonically_proven_current_sha256: artifact.sha256,
+                recovery_mode: "canonical_authority_same_key_recovery",
+                ...(Number.isSafeInteger(recovered.verification_object_count)
+                  ? {
+                      verification_object_count:
+                        recovered.verification_object_count,
+                    }
+                  : {}),
+                ...(Number.isSafeInteger(recovered.verification_concurrency)
+                  ? {
+                      verification_concurrency:
+                        recovered.verification_concurrency,
+                    }
+                  : {}),
+                ...(Number.isSafeInteger(recovered.verification_duration_ms)
+                  ? {
+                      verification_duration_ms:
+                        recovered.verification_duration_ms,
+                    }
+                  : {}),
+              },
+            );
+          };
+          const initialVerification = await verifyExternalReferencesBounded({
+            references: latestReferences,
+            getObject,
+            evidenceCache: runEvidenceCache,
+            freshKeys: new Set(changedScopedEvidenceByKey.keys()),
+            onFailureBatch: async (batchFailures) => {
+              for (const failure of batchFailures) {
+                await recoverLatestScopedReferenceFailure(failure);
+              }
+              return true;
+            },
+          });
+          absorbVerificationMetrics(initialVerification.metrics);
+          for (const [key, evidence] of initialVerification.evidence_by_key) {
+            latestExternalByKey.set(key, evidence);
+          }
+          if (initialVerification.has_failure) {
+            throw initialVerification.failure;
           }
           if (recoveredScopedManifests.length > 0) {
             const replacementsByKey = new Map(
@@ -1638,10 +2220,34 @@ export async function runObservationHistoryV3RunFinalization({
               latestKey,
             });
             latestExternalByKey.clear();
-            for (const reference of updatedLatest.dependencies) {
-              latestExternalByKey.set(
-                reference.key,
-                await verifiedExternalReference(reference, getObject),
+            const strictReverification = await verifyExternalReferencesBounded({
+              references: [...new Map(
+                updatedLatest.dependencies.map((reference) => [reference.key, reference]),
+              ).values()],
+              getObject,
+              evidenceCache: null,
+              reuseEvidence: false,
+              freshKeys: new Set(updatedLatest.dependencies.map((reference) => reference.key)),
+            });
+            absorbVerificationMetrics(strictReverification.metrics);
+            if (strictReverification.has_failure) {
+              throw strictReverification.failure;
+            }
+            for (const [key, evidence] of strictReverification.evidence_by_key) {
+              latestExternalByKey.set(key, evidence);
+            }
+          }
+          const finalLatestScopeIdentities = new Set(
+            (Array.isArray(updatedLatest.payload?.day_summaries)
+              ? updatedLatest.payload.day_summaries
+              : []).flatMap((day) =>
+              Array.isArray(day?.scoped_roots) ? day.scoped_roots : []
+            ).map((root) => scopeIdentity(root)),
+          );
+          for (const scope of removedScopes) {
+            if (finalLatestScopeIdentities.has(scopeIdentity(scope))) {
+              throw new Error(
+                `Exact-v3 latest finalization retained a removed scope: ${scopeIdentity(scope).replaceAll("\u0000", "/")}`,
               );
             }
           }
@@ -1655,20 +2261,59 @@ export async function runObservationHistoryV3RunFinalization({
             getObject,
             recordDurableEvidence,
           });
+          const dayResultByDay = new Map(
+            dayResults.map((entry) => [entry.day_utc, entry]),
+          );
+          const removalResults = Object.freeze(
+            connectorResults.flatMap((entry) =>
+              (entry.canonical.removal_results || []).map((removal) => Object.freeze({
+                ...removal,
+                canonical_connector_result: Object.freeze({
+                  connector_authority_present:
+                    entry.canonical.connector_authority_present,
+                  connector_manifest: entry.canonical.connector_manifest,
+                  final_pollutant_codes:
+                    entry.canonical.final_pollutant_codes,
+                  connector_scope_verified:
+                    entry.canonical.connector_scope_verified,
+                }),
+                canonical_day_result: dayResultByDay.get(entry.day_utc),
+                aggregate_root_result: aggregateResult,
+                exact_v3_removal_result: Object.freeze({
+                  previously_exposed_in_latest:
+                    existingLatestScopeIdentities.has(scopeIdentity(removal)),
+                  removed_from_latest_global:
+                    existingLatestScopeIdentities.has(scopeIdentity(removal)),
+                  final_scope_present: false,
+                  latest_global: latestPublication,
+                }),
+              })),
+            ),
+          );
+          const runFinalizationOk = connectorResults.every((entry) =>
+            entry.v3_exact_publication?.ok === true
+          ) && latestPublication.ok === true;
+          if (runFinalizationOk) {
+            runEvidenceCache?.recordFinalizedDependencies?.(
+              updatedLatest.dependencies,
+            );
+          }
           emitV3PublicationDiagnostic(
             diagnosticLog,
             "latest_global_exact_v3_finalization_complete",
             {
               ...latestFields,
+              ...finalizationMetrics,
               prerequisite_reference_count: updatedLatest.dependencies.length,
               removed_scope_count: removedScopes.length,
               duration_ms: Math.max(0, Date.now() - latestStartedAtMs),
+              global_finalization_elapsed_ms: Math.max(0, Date.now() - runStartedAtMs),
+              evidence_invalidation_count: collectEvidenceInvalidations(),
+              outcome: runFinalizationOk ? "succeeded" : "failed_closed",
             },
           );
           return Object.freeze({
-            ok: connectorResults.every((entry) =>
-              entry.v3_exact_publication?.ok === true
-            ) && latestPublication.ok === true,
+            ok: runFinalizationOk,
             status: latestPublication.status,
             source: normalizedSource,
             prune_eligibility_owner:
@@ -1677,6 +2322,7 @@ export async function runObservationHistoryV3RunFinalization({
               completeDayReplacementResults,
             ),
             removed_scopes: removedScopes,
+            removal_results: removalResults,
             affected_partition_count: partitionResults.length,
             affected_connector_days: Object.freeze(connectorResults.map((entry) => ({
               day_utc: entry.day_utc,
@@ -1694,12 +2340,16 @@ export async function runObservationHistoryV3RunFinalization({
             }),
           });
         } catch (error) {
+          finalizationMetrics.evidence_invalidation_count = collectEvidenceInvalidations();
           emitV3PublicationDiagnostic(
             diagnosticLog,
             "latest_global_exact_v3_finalization_failed",
             {
               ...latestFields,
+              ...finalizationMetrics,
               duration_ms: Math.max(0, Date.now() - latestStartedAtMs),
+              global_finalization_elapsed_ms: Math.max(0, Date.now() - runStartedAtMs),
+              failure_outcome: failureOutcome(error),
               error: error instanceof Error ? error.message : String(error),
             },
           );
@@ -1707,17 +2357,26 @@ export async function runObservationHistoryV3RunFinalization({
         }
       },
     });
+    finalizationMetrics.evidence_invalidation_count = collectEvidenceInvalidations();
     emitV3PublicationDiagnostic(diagnosticLog, "run_finalization_complete", {
       ...runFields,
       duration_ms: Math.max(0, Date.now() - runStartedAtMs),
+      global_finalization_elapsed_ms: Math.max(0, Date.now() - runStartedAtMs),
+      ...finalizationMetrics,
+      outcome: finalResult?.ok === true ? "succeeded" : "failed_closed",
     });
     return finalResult;
   } catch (error) {
+    finalizationMetrics.evidence_invalidation_count = collectEvidenceInvalidations();
     emitV3PublicationDiagnostic(diagnosticLog, "run_finalization_failed", {
       ...runFields,
       duration_ms: Math.max(0, Date.now() - runStartedAtMs),
+      global_finalization_elapsed_ms: Math.max(0, Date.now() - runStartedAtMs),
+      ...finalizationMetrics,
+      failure_outcome: failureOutcome(error),
       error: error instanceof Error ? error.message : String(error),
     });
+    runEvidenceCache?.clear?.();
     throw error;
   }
 }
@@ -1780,5 +2439,19 @@ export function runSupportedBackfillObservationHistoryV3Writer(options) {
   return runObservationHistoryV3SteadyStateWriter({
     ...options,
     source: OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.supportedBackfill,
+  });
+}
+
+export function runSelectedScopeReconciliationObservationHistoryV3Writer(options = {}) {
+  requireObservationsGlobalOperationLockContext({
+    env: options.env ?? (typeof process !== "undefined" ? process.env : {}),
+    expectedOwner: options.expectedObservationsGlobalOperationLockOwner,
+    expectedRunId: options.expectedObservationsGlobalOperationLockRunId,
+  });
+  return runObservationHistoryV3SteadyStateWriter({
+    ...options,
+    source:
+      OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.selectedScopeReconciliation,
+    selectedScopeRemovalAuthority: SELECTED_SCOPE_REMOVAL_AUTHORITY,
   });
 }

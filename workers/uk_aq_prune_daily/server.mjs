@@ -6,6 +6,7 @@ import {
   fetchBackupDoneConnectorDays,
   resolvePhaseBRuntimeConfig,
   runPhaseBBackup,
+  resolvePrunePhaseBRunId,
 } from "./phase_b_history_r2.mjs";
 import { connectorDayGateKey } from "../shared/uk_aq_connector_day_gate.mjs";
 import { groupFingerprintRechecksByHour } from "./fingerprint_recheck.mjs";
@@ -18,6 +19,9 @@ const DAY_MS = 24 * HOUR_MS;
 const DEFAULT_DRY_RUN = true;
 const DEFAULT_MAX_HOURS_PER_RUN = 48;
 const DEFAULT_INGESTDB_RETENTION_DAYS = 5;
+// Keep Prune's UTC-midnight deletion cutoff at or before the start of
+// Nodes' maximum rolling 48-hour recovery window (no extra safety margin).
+const MIN_INGESTDB_RETENTION_DAYS = 2;
 const DEFAULT_PHASE_A_ENABLED = true;
 const DEFAULT_PHASE_A_RECENT_DAYS = 3;
 const DEFAULT_DELETE_BATCH_SIZE = 50_000;
@@ -196,6 +200,8 @@ function compactPruneHealthSummary(summary = {}) {
         status: summary.phase_b_history.status,
         stopped_for_budget: summary.phase_b_history.stopped_for_budget,
         error_count: summary.phase_b_history.error_count,
+        blocked_scope_count: summary.phase_b_history.blocked_scope_count,
+        blocked_scopes_preview: summary.phase_b_history.blocked_scopes_preview,
       }
       : undefined,
     late_arrival: summary.late_arrival
@@ -1623,6 +1629,13 @@ export function buildRunConfig(url) {
     1,
     3650,
   );
+  if (ingestDbRetentionDays < MIN_INGESTDB_RETENTION_DAYS) {
+    // Reject rather than silently clamp: explicit overrides must not
+    // accidentally prune or publish any part of the recovery window.
+    throw new Error(
+      `Prune Daily requires at least ${MIN_INGESTDB_RETENTION_DAYS} UTC calendar days of IngestDB retention; received ${ingestDbRetentionDays}.`,
+    );
+  }
   const deleteBatchSize = parsePositiveInt(
     params.get("deleteBatchSize") ?? process.env.DELETE_BATCH_SIZE,
     DEFAULT_DELETE_BATCH_SIZE,
@@ -2857,7 +2870,7 @@ async function runPrune(config, adapters = {}) {
 
   const phaseARecentSummary = await runPhaseARecentAdapter(config);
 
-  const phaseBRunId = randomUUID();
+  const phaseBRunId = resolvePrunePhaseBRunId();
   const phaseBHistorySummary = await runPhaseBBackupAdapter({
     dryRun: config.dryRun,
     phaseB: config.phaseB,
@@ -2914,6 +2927,16 @@ async function runPrune(config, adapters = {}) {
       phase_b_history: phaseBHistorySummary,
       late_arrival: skipped(),
     };
+    if (Number(phaseBHistorySummary.blocked_scope_count || 0) > 0) {
+      summary.status = "partial_attention_required";
+      summary.attention_required = true;
+      summary.blocked_scope_count = phaseBHistorySummary.blocked_scope_count;
+      summary.blocked_scopes_preview = phaseBHistorySummary.blocked_scopes_preview;
+      const error = new Error(`Prune Daily stopped for budget with ${summary.blocked_scope_count} historical connector/day scopes requiring attention`);
+      error.code = "UK_AQ_PRUNE_PARTIAL_ATTENTION_REQUIRED";
+      error.prune_summary = summary;
+      throw error;
+    }
     logStructured("WARNING", "ingestdb_prune_stopped_after_phase_b_budget", {
       phase_b_history_run_id: phaseBHistorySummary.run_id || phaseBRunId,
       phase_b_history_status: phaseBHistorySummary.status,
@@ -3016,12 +3039,33 @@ async function runPrune(config, adapters = {}) {
     phase_b_history: phaseBHistorySummary,
     late_arrival: lateArrivalSummary,
   };
+  if (Number(phaseBHistorySummary?.blocked_scope_count || 0) > 0) {
+    combinedSummary.status = "partial_attention_required";
+    combinedSummary.attention_required = true;
+    combinedSummary.blocked_scope_count = phaseBHistorySummary.blocked_scope_count;
+    combinedSummary.blocked_scopes_preview = phaseBHistorySummary.blocked_scopes_preview;
+    combinedSummary.alert_condition_count = toSafeInt(combinedSummary.alert_condition_count)
+      + phaseBHistorySummary.blocked_scope_count;
+  }
   if (batches.length > 1) {
     logStructured(
       "INFO",
       config.dryRun ? "ingestdb_prune_dry_run_batched_summary" : "ingestdb_prune_delete_batched_summary",
       combinedSummary,
     );
+  }
+  if (combinedSummary.attention_required) {
+    logStructured("WARNING", "ingestdb_prune_partial_attention_required", {
+      phase_b_history_run_id: phaseBHistorySummary.run_id || phaseBRunId,
+      blocked_scope_count: combinedSummary.blocked_scope_count,
+      blocked_scopes_preview: combinedSummary.blocked_scopes_preview,
+      normal_deletion_attempted: Boolean(pruneWindowSummary.deletion_attempted),
+      late_arrival_enabled: lateArrivalSummary.enabled === true,
+    });
+    const error = new Error(`Prune Daily partially completed: ${combinedSummary.blocked_scope_count} historical connector/day scopes require attention`);
+    error.code = "UK_AQ_PRUNE_PARTIAL_ATTENTION_REQUIRED";
+    error.prune_summary = combinedSummary;
+    throw error;
   }
   return combinedSummary;
 }

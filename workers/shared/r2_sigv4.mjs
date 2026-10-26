@@ -261,6 +261,9 @@ export async function fetchWithTimeout(
     ? Math.trunc(Number(timeoutMs))
     : DEFAULT_FETCH_TIMEOUT_MS;
   const controller = new AbortController();
+  const abortFromCaller = () => controller.abort(init.signal.reason);
+  if (init.signal?.aborted) abortFromCaller();
+  else init.signal?.addEventListener('abort', abortFromCaller, { once: true });
   const method = String(init.method || "GET").toUpperCase();
   let timedOut = false;
   const timer = setTimeout(() => {
@@ -293,6 +296,7 @@ export async function fetchWithTimeout(
     throw error;
   } finally {
     clearTimeout(timer);
+    init.signal?.removeEventListener('abort', abortFromCaller);
   }
 }
 
@@ -311,7 +315,7 @@ function r2RequestErrorField(error, field) {
   }
 }
 
-function isRetryableR2RequestError(error) {
+export function isRetryableR2RequestError(error) {
   const seen = new Set();
   let current = error;
   for (let depth = 0; depth < R2_REQUEST_ERROR_CAUSE_MAX_DEPTH; depth += 1) {
@@ -375,15 +379,18 @@ async function fetchR2WithRetry({
   body = undefined,
   consumeResponse = null,
   maxAttempts = R2_REQUEST_MAX_ATTEMPTS,
+  assertHeld = null,
 }) {
   const boundedMaxAttempts = Number.isSafeInteger(Number(maxAttempts))
     && Number(maxAttempts) > 0
     ? Number(maxAttempts)
     : R2_REQUEST_MAX_ATTEMPTS;
   for (let attempt = 1; attempt <= boundedMaxAttempts; attempt += 1) {
+    assertHeld?.();
     const request = buildRequest();
+    let attemptResult, attemptFailed = false;
     try {
-      const attemptResult = await fetchWithTimeout(
+      attemptResult = await fetchWithTimeout(
         request.url,
         {
           method,
@@ -408,18 +415,25 @@ async function fetchR2WithRetry({
           };
         },
       );
-      if (!attemptResult.retry) {
-        return attemptResult.value;
-      }
     } catch (error) {
+      assertHeld?.();
       if (
         !isRetryableR2RequestError(error) ||
         attempt === boundedMaxAttempts
       ) {
         throw error;
       }
+      attemptFailed = true;
     }
+    if (!attemptFailed) {
+      assertHeld?.();
+      if (!attemptResult.retry) {
+        return attemptResult.value;
+      }
+    }
+    assertHeld?.();
     await sleep(computeR2RetryDelayMs(attempt));
+    assertHeld?.();
   }
 
   throw new Error("R2 request retry loop exhausted unexpectedly.");
@@ -488,6 +502,86 @@ export async function r2PutObject({
   };
 }
 
+// Separate from r2PutObject: a conditional attempt must NEVER enter its retry
+// loop or fall through to an adapter's unconditional putObject method.
+export class R2ConditionalWriteError extends Error {
+  constructor(code, message, { status = null, cause } = {}) {
+    super(message, { cause });
+    this.name = "R2ConditionalWriteError";
+    this.code = code;
+    this.status = status;
+  }
+}
+
+export function isStrongR2Etag(value) {
+  return typeof value === "string" && /^"[^"\s\x00-\x1f\x7f]+"$/.test(value);
+}
+
+export async function r2PutObjectConditional({
+  r2, key, body, if_match = null, if_none_match = null,
+  content_type = "application/octet-stream", sha256 = null,
+}) {
+  if (!((isStrongR2Etag(if_match) && if_none_match === null)
+    || (if_match === null && if_none_match === "*"))) {
+    throw new TypeError("Conditional PUT requires one strong quoted ETag or If-None-Match: *");
+  }
+  const bufferBody = body instanceof Uint8Array ? body : Buffer.from(body);
+  const payloadHash = awsSha256Hex(bufferBody);
+  if (sha256 !== null && normalizeR2Sha256Checksum(sha256) !== payloadHash) {
+    throw new TypeError("Conditional PUT body SHA-256 mismatch");
+  }
+  if (r2?.adapter && typeof r2.adapter.putObjectConditional !== "function") {
+    throw new TypeError("R2 adapter does not implement atomic putObjectConditional");
+  }
+  let request;
+  if (!r2?.adapter) {
+    request = buildAwsSignedRequest({
+      method: "PUT", endpoint: r2.endpoint, region: r2.region,
+      accessKeyId: r2.access_key_id, secretAccessKey: r2.secret_access_key,
+      bucket: r2.bucket, objectKey: key, payloadHash,
+      headers: {
+        "content-type": content_type, "content-length": String(bufferBody.byteLength),
+        "x-amz-checksum-sha256": sha256HexToBase64(payloadHash),
+        ...(if_match !== null ? { "if-match": if_match } : { "if-none-match": "*" }),
+      },
+    });
+  }
+  let result;
+  try {
+    // Adapter contract: one attempt, {status, etag}; thrown errors are ambiguous.
+    result = r2?.adapter
+      ? await r2.adapter.putObjectConditional({ key, body: bufferBody,
+        content_type, sha256: payloadHash, if_match, if_none_match })
+      : await fetchWithTimeout(request.url,
+        { method: "PUT", headers: request.headers, body: bufferBody },
+        R2_REQUEST_TIMEOUT_MS, globalThis.fetch, async (response) => {
+          const outcome = { status: response.status, etag: response.headers.get("etag") };
+          cancelResponseBody(response);
+          return outcome;
+        });
+  } catch (cause) {
+    throw new R2ConditionalWriteError("R2_WRITE_AMBIGUOUS",
+      "Conditional PUT transport failure; inspect authoritative object before retry", { cause });
+  }
+  const status = result?.status;
+  if (status === 412) {
+    throw new R2ConditionalWriteError("R2_PRECONDITION_FAILED",
+      "Conditional PUT precondition failed; reread current state", { status });
+  }
+  // 409 includes concurrent-operation conflicts. Treat conservatively, as with
+  // timeout/service failures and malformed/missing success evidence.
+  if (status === 409 || isRetryableR2Status(status) || status >= 500
+    || !Number.isInteger(status) || status < 100 || status > 599
+    || (status >= 200 && status < 300 && !isStrongR2Etag(result.etag))) {
+    throw new R2ConditionalWriteError("R2_WRITE_AMBIGUOUS",
+      "Conditional PUT outcome unknown; inspect authoritative object before retry", { status });
+  }
+  if (status < 200 || status >= 300) {
+    throw new R2ConditionalWriteError("R2_SERVICE_FAILURE", "Conditional PUT rejected", { status });
+  }
+  return { key, bytes: bufferBody.byteLength, etag: result.etag, sha256: payloadHash };
+}
+
 export async function r2CopyObject({ r2, source_key, dest_key }) {
   const copySource = `/${r2.bucket}/${source_key.split("/").map((part) => encodeRfc3986(part)).join("/")}`;
   const { response, errorText } = await fetchR2WithRetry({
@@ -520,9 +614,11 @@ export async function r2CopyObject({ r2, source_key, dest_key }) {
   };
 }
 
-export async function r2HeadObject({ r2, key }) {
+export async function r2HeadObject({ r2, key, accept_encoding_identity = false, assertHeld = null }) {
   if (r2?.adapter?.headObject) {
+    assertHeld?.();
     const result = await r2.adapter.headObject({ key });
+    assertHeld?.();
     const sha256 = normalizeR2Sha256Checksum(
       result?.sha256 ?? result?.checksums?.sha256,
     );
@@ -540,6 +636,9 @@ export async function r2HeadObject({ r2, key }) {
       objectKey: key,
       headers: {
         "x-amz-checksum-mode": "ENABLED",
+        // R2 can weaken HEAD ETags during compression and omit Content-Length.
+        // Use identity only when the caller requests byte-exact cache validation.
+        ...(accept_encoding_identity ? { "accept-encoding": "identity" } : {}),
       },
     }),
     consumeResponse: async (response) => ({
@@ -548,6 +647,7 @@ export async function r2HeadObject({ r2, key }) {
         ? ""
         : await readResponseText(response, 2000),
     }),
+    assertHeld,
   });
 
   if (response.status === 404) {
@@ -574,7 +674,98 @@ export async function r2HeadObject({ r2, key }) {
   };
 }
 
-export async function r2GetObject({ r2, key, max_attempts = R2_REQUEST_MAX_ATTEMPTS }) {
+// One-attempt bounded GET, including response-body consumption. Existing buffered
+// callers are unchanged. Adapters must explicitly implement bounded acquisition;
+// falling back to getObject would allocate an unbounded body before admission.
+export async function r2GetObjectBounded({ r2, key, max_bytes, timeout_ms = R2_REQUEST_TIMEOUT_MS, signal,
+  accept_encoding_identity = false }) {
+  if (!Number.isSafeInteger(max_bytes) || max_bytes <= 0 ||
+      !Number.isSafeInteger(timeout_ms) || timeout_ms <= 0 || timeout_ms > R2_REQUEST_TIMEOUT_MS) {
+    throw new TypeError("Bounded R2 GET requires positive byte and timeout budgets");
+  }
+  const validate = (stored) => {
+    if (!(stored?.body instanceof Uint8Array) || stored.body.byteLength > max_bytes ||
+        stored.bytes !== stored.body.byteLength) {
+      throw new Error("Bounded R2 GET body/size mismatch or byte budget exceeded");
+    }
+    return { ...stored, key, body: Buffer.from(stored.body) };
+  };
+  if (r2?.adapter) {
+    if (typeof r2.adapter.getObjectBounded !== "function") {
+      throw new TypeError("R2 adapter must implement getObjectBounded");
+    }
+    const controller = new AbortController();
+    let timer;
+    let rejectAbort;
+    const abortFromCaller = () => {
+      controller.abort(signal.reason);
+      rejectAbort?.(signal.reason || new Error('Bounded R2 GET aborted'));
+    };
+    try {
+      const aborted = new Promise((_, reject) => { rejectAbort = reject; });
+      if (signal?.aborted) throw signal.reason || new Error('Bounded R2 GET aborted');
+      signal?.addEventListener('abort', abortFromCaller, { once: true });
+      return validate(await Promise.race([
+        r2.adapter.getObjectBounded({ key, max_bytes, signal: controller.signal,
+          ...(accept_encoding_identity ? { accept_encoding_identity: true } : {}) }),
+        aborted,
+        new Promise((_, reject) => { timer = setTimeout(() => {
+          controller.abort();
+          reject(new Error("Bounded R2 GET deadline exceeded"));
+        }, timeout_ms); }),
+      ]));
+    } finally { clearTimeout(timer); signal?.removeEventListener('abort', abortFromCaller); }
+  }
+  const request = buildAwsSignedRequest({ method: "GET", endpoint: r2.endpoint,
+    region: r2.region, accessKeyId: r2.access_key_id, secretAccessKey: r2.secret_access_key,
+    bucket: r2.bucket, objectKey: key,
+    // Opt in only for callers requiring the stored representation's validator.
+    ...(accept_encoding_identity ? { headers: { "accept-encoding": "identity" } } : {}) });
+  return await fetchWithTimeout(request.url, {
+    method: "GET", headers: request.headers, redirect: "error", signal,
+  }, timeout_ms, globalThis.fetch, async (response) => {
+    if (!response.ok) {
+      await response.body?.cancel();
+      const error = new Error(`Bounded R2 GET failed (${response.status}) key=${key}`);
+      error.status = response.status;
+      throw error;
+    }
+    const declared = response.headers.get("content-length");
+    if (declared !== null && (!/^\d+$/.test(declared) ||
+        !Number.isSafeInteger(Number(declared)) || Number(declared) > max_bytes)) {
+      await response.body?.cancel();
+      throw new Error("Bounded R2 GET content length exceeds byte budget");
+    }
+    if (!response.body) throw new Error("Bounded R2 GET response body missing");
+    const reader = response.body.getReader();
+    const chunks = [];
+    let bytes = 0;
+    try {
+      for (;;) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        bytes += chunk.value.byteLength;
+        if (bytes > max_bytes) throw new Error("Bounded R2 GET byte budget exceeded");
+        chunks.push(Buffer.from(chunk.value));
+      }
+    } catch (error) {
+      await reader.cancel().catch(() => {});
+      throw error;
+    } finally { reader.releaseLock(); }
+    if (declared !== null && Number(declared) !== bytes) {
+      throw new Error("Bounded R2 GET content length mismatch");
+    }
+    return validate({ body: Buffer.concat(chunks, bytes), bytes,
+      etag: response.headers.get("etag") || null });
+  });
+}
+
+export async function r2GetObject({
+  r2,
+  key,
+  max_attempts = R2_REQUEST_MAX_ATTEMPTS,
+  accept_encoding_identity = false,
+}) {
   if (r2?.adapter?.getObject) {
     return r2.adapter.getObject({ key });
   }
@@ -588,6 +779,8 @@ export async function r2GetObject({ r2, key, max_attempts = R2_REQUEST_MAX_ATTEM
       secretAccessKey: r2.secret_access_key,
       bucket: r2.bucket,
       objectKey: key,
+      // Cache-populating GETs must request the same representation as their HEAD.
+      ...(accept_encoding_identity ? { headers: { "accept-encoding": "identity" } } : {}),
     }),
     consumeResponse: async (response) => ({
       response,
