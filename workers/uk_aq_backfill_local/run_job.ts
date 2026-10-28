@@ -71,8 +71,20 @@ import {
   computeObservationContentHash,
   normalizeCanonicalObservationRow,
   normalizeUkAirVerificationStatus,
+  preservePersistedRatifiedStatus,
   resolveLegacyVerificationStatus,
+  selectObservationVerificationStatusColumn,
 } from "../shared/uk_aq_observation_content_hash.mjs";
+import { observationHistoryPhysicalSchemaForColumns } from "../shared/uk_aq_observation_history_schema.mjs";
+import {
+  DEFAULT_OBSERVATION_HISTORY_V3_STEADY_STATE_PREFIX,
+} from "../shared/uk_aq_observation_history_steady_state_writer_v3.mjs";
+import {
+  buildFixedV3IntegrityObservationProposal,
+} from "./fixed_v3_integrity_observation_proposal.mjs";
+import {
+  getObservationHistoryGeneration,
+} from "../shared/uk_aq_observation_history_generation.mjs";
 import {
   reconcileIntegritySourceAdapterBlockedRows,
 } from "./source_integrity/blocked_rows.ts";
@@ -874,23 +886,84 @@ const DEPRECATED_R2_HISTORY_VERSION_ENVS = [
   "UK_AQ_R2_HISTORY_BACKUP_VERSION",
 ];
 
-function resolveHistoryWriteVersionFromEnv(): "v1" | "v2" {
-  const presentDeprecated = DEPRECATED_R2_HISTORY_VERSION_ENVS.filter((name) => Deno.env.get(name) !== undefined);
+export type HistoryWriteVersion = "v1" | "v2" | "v3";
+
+export function resolveHistoryWriteVersionFromEnv(
+  getEnv: (name: string) => string | undefined = (name) => Deno.env.get(name),
+): HistoryWriteVersion {
+  const presentDeprecated = DEPRECATED_R2_HISTORY_VERSION_ENVS.filter((name) =>
+    getEnv(name) !== undefined
+  );
   if (presentDeprecated.length > 0) {
     throw new Error(
-      `R2 local backfill no longer supports ${presentDeprecated.join(", ")}. `
-        + `Use ${CANONICAL_R2_HISTORY_VERSION_ENV}=v1|v2 and delete the old split read/write/backup vars.`,
+      `R2 local backfill no longer supports ${presentDeprecated.join(", ")}. ` +
+        `Use ${CANONICAL_R2_HISTORY_VERSION_ENV}=v1|v2 and delete the old split read/write/backup vars.`,
     );
   }
-  const raw = Deno.env.get(CANONICAL_R2_HISTORY_VERSION_ENV);
+  const raw = getEnv(CANONICAL_R2_HISTORY_VERSION_ENV);
   const value = String(raw || "").trim().toLowerCase();
   if (value === "v1" || value === "v2") {
     return value;
   }
-  if (!value) {
-    throw new Error(`Missing ${CANONICAL_R2_HISTORY_VERSION_ENV}; set ${CANONICAL_R2_HISTORY_VERSION_ENV}=v1 or ${CANONICAL_R2_HISTORY_VERSION_ENV}=v2.`);
+  if (value === "v3") {
+    const integrityInvocation = parseBooleanish(
+      getEnv("UK_AQ_INTEGRITY_INVOCATION"),
+      false,
+    );
+    const outputScope = String(
+      getEnv("UK_AQ_BACKFILL_OUTPUT_SCOPE") || "",
+    ).trim().toLowerCase();
+    const proposalMode = String(
+      getEnv("UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_MODE") || "",
+    ).trim().toLowerCase();
+    const sourceEvidenceOnly = parseBooleanish(
+      getEnv("UK_AQ_BACKFILL_INTEGRITY_SOURCE_EVIDENCE_ONLY"),
+      false,
+    );
+    const workerPurpose = String(
+      getEnv("UK_AQ_INTEGRITY_WORKER_PURPOSE") || "",
+    ).trim().toLowerCase();
+    const canonicalWritesAllowed = String(
+      getEnv("UK_AQ_INTEGRITY_CANONICAL_WRITES_ALLOWED") || "",
+    ).trim().toLowerCase();
+    const finalIndexRebuild = String(
+      getEnv("UK_AQ_BACKFILL_REBUILD_R2_HISTORY_INDEX") || "",
+    ).trim().toLowerCase();
+    const effectiveMode = String(
+      getEnv("UK_AQ_INTEGRITY_EFFECTIVE_MODE") || "",
+    ).trim().toLowerCase();
+    const integrityModeValid = effectiveMode === "check_only" ||
+      effectiveMode === "repair_dry_run" || effectiveMode === "repair_apply";
+    const evidencePurposeValid = workerPurpose === "source_evidence_only" &&
+      sourceEvidenceOnly && integrityModeValid;
+    const proposalPurposeValid = workerPurpose === "repair_proposal" &&
+      !sourceEvidenceOnly &&
+      (effectiveMode === "repair_dry_run" || effectiveMode === "repair_apply");
+    if (
+      integrityInvocation && outputScope === "observations_only" &&
+      proposalMode === "prepare" &&
+      (evidencePurposeValid || proposalPurposeValid) &&
+      canonicalWritesAllowed === "false" && finalIndexRebuild === "false"
+    ) {
+      return value;
+    }
+    throw new Error(
+      `Unsupported ${CANONICAL_R2_HISTORY_VERSION_ENV}=v3 invocation; ` +
+        "v3 is restricted to fixed-v3 Integrity observations-only source " +
+        "evidence or repair proposals with canonical writes and the generic " +
+        "full-index rebuild disabled",
+    );
   }
-  throw new Error(`Invalid ${CANONICAL_R2_HISTORY_VERSION_ENV}=${JSON.stringify(String(raw))}; expected v1 or v2`);
+  if (!value) {
+    throw new Error(
+      `Missing ${CANONICAL_R2_HISTORY_VERSION_ENV}; set ${CANONICAL_R2_HISTORY_VERSION_ENV}=v1 or ${CANONICAL_R2_HISTORY_VERSION_ENV}=v2.`,
+    );
+  }
+  throw new Error(
+    `Invalid ${CANONICAL_R2_HISTORY_VERSION_ENV}=${
+      JSON.stringify(String(raw))
+    }; expected v1 or v2`,
+  );
 }
 
 const OBS_R2_HISTORY_PREFIX = normalizePrefix(
@@ -901,10 +974,15 @@ const AQI_R2_HISTORY_PREFIX = normalizePrefix(
   Deno.env.get("UK_AQ_R2_HISTORY_AQILEVELS_PREFIX") || "history/v1/aqilevels/hourly",
 ) || "history/v1/aqilevels/hourly";
 const HISTORY_R2_WRITE_VERSION = resolveHistoryWriteVersionFromEnv();
+const USES_STRUCTURED_HISTORY_LAYOUT =
+  HISTORY_R2_WRITE_VERSION === "v2" || HISTORY_R2_WRITE_VERSION === "v3";
 const OBS_R2_HISTORY_PREFIX_V2 = normalizePrefix(
   Deno.env.get("UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX") ||
     HISTORY_R2_V2_OBSERVATIONS_PREFIX,
 ) || HISTORY_R2_V2_OBSERVATIONS_PREFIX;
+const OBS_R2_HISTORY_PREFIX_V3 = normalizePrefix(
+  DEFAULT_OBSERVATION_HISTORY_V3_STEADY_STATE_PREFIX,
+) || DEFAULT_OBSERVATION_HISTORY_V3_STEADY_STATE_PREFIX;
 const AQI_R2_HISTORY_DATA_PREFIX_V2 = normalizePrefix(
   Deno.env.get("UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX") ||
     HISTORY_R2_V2_AQILEVELS_HOURLY_DATA_PREFIX,
@@ -913,18 +991,50 @@ const AQI_R2_HISTORY_DEBUG_PREFIX_V2 = normalizePrefix(
   Deno.env.get("UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DEBUG_PREFIX") ||
     HISTORY_R2_V2_AQILEVELS_HOURLY_DEBUG_PREFIX,
 ) || HISTORY_R2_V2_AQILEVELS_HOURLY_DEBUG_PREFIX;
-const CORE_R2_HISTORY_PREFIX = HISTORY_R2_WRITE_VERSION === "v2"
-  ? (normalizePrefix(
-    Deno.env.get("UK_AQ_R2_HISTORY_V2_CORE_PREFIX") || "history/v2/core",
-  ) || "history/v2/core")
-  : (normalizePrefix(
-    Deno.env.get("UK_AQ_R2_HISTORY_CORE_PREFIX") || "history/v1/core",
-  ) || "history/v1/core");
+const CORE_R2_HISTORY_PREFIX = (() => {
+  if (!USES_STRUCTURED_HISTORY_LAYOUT) {
+    return normalizePrefix(
+      Deno.env.get("UK_AQ_R2_HISTORY_CORE_PREFIX") || "history/v1/core",
+    ) || "history/v1/core";
+  }
+  const generation = getObservationHistoryGeneration(
+    HISTORY_R2_WRITE_VERSION,
+  );
+  if (HISTORY_R2_WRITE_VERSION === "v2") {
+    return normalizePrefix(
+      Deno.env.get("UK_AQ_R2_HISTORY_V2_CORE_PREFIX") ||
+        generation.core_prefix,
+    ) || generation.core_prefix;
+  }
+  return generation.core_prefix;
+})();
 const R2_HISTORY_DROPBOX_ROOT = optionalEnvAny([
   "UK_AQ_R2_HISTORY_DROPBOX_ROOT",
   "UK_AQ_BACKFILL_R2_HISTORY_DROPBOX_ROOT",
 ]);
-const OBS_R2_WRITER_GIT_SHA = (Deno.env.get("GITHUB_SHA") || "").trim() || null;
+export function resolveObservationWriterGitSha(
+  getEnv: (name: string) => string | undefined = (name) => Deno.env.get(name),
+): string | null {
+  const integrityInvocation = parseBooleanish(
+    getEnv("UK_AQ_INTEGRITY_INVOCATION"),
+    false,
+  );
+  if (integrityInvocation) {
+    const pinned = String(
+      getEnv("UK_AQ_INTEGRITY_TARGET_WRITER_GIT_SHA") || "",
+    ).trim();
+    if (!/^[0-9a-f]{40}$/.test(pinned)) {
+      throw new Error(
+        "Integrity observation writer requires " +
+          "UK_AQ_INTEGRITY_TARGET_WRITER_GIT_SHA as a full lower-case Git SHA",
+      );
+    }
+    return pinned;
+  }
+  return String(getEnv("GITHUB_SHA") || "").trim() || null;
+}
+
+const OBS_R2_WRITER_GIT_SHA = resolveObservationWriterGitSha();
 const OBS_R2_CONFIG = {
   endpoint:
     (Deno.env.get("CFLARE_R2_ENDPOINT") || Deno.env.get("R2_ENDPOINT") || "")
@@ -1304,6 +1414,30 @@ const INTEGRITY_SOURCE_EVIDENCE_ONLY = parseBooleanish(
   Deno.env.get("UK_AQ_BACKFILL_INTEGRITY_SOURCE_EVIDENCE_ONLY"),
   false,
 );
+const USE_FIXED_V3_INTEGRITY_PROPOSAL_WRITER =
+  HISTORY_R2_WRITE_VERSION === "v3" &&
+  INTEGRITY_PROPOSAL_MODE &&
+  optionalEnv("UK_AQ_INTEGRITY_WORKER_PURPOSE") === "repair_proposal" &&
+  !INTEGRITY_SOURCE_EVIDENCE_ONLY;
+if (HISTORY_R2_WRITE_VERSION === "v3") {
+  const workerPurpose = optionalEnv("UK_AQ_INTEGRITY_WORKER_PURPOSE");
+  const canonicalWritesAllowed = optionalEnv(
+    "UK_AQ_INTEGRITY_CANONICAL_WRITES_ALLOWED",
+  );
+  if (
+    !INTEGRITY_PROPOSAL_MODE ||
+    (workerPurpose !== "source_evidence_only" &&
+      workerPurpose !== "repair_proposal") ||
+    canonicalWritesAllowed !== "false" ||
+    (workerPurpose === "source_evidence_only" &&
+      !INTEGRITY_SOURCE_EVIDENCE_ONLY) ||
+    (workerPurpose === "repair_proposal" && INTEGRITY_SOURCE_EVIDENCE_ONLY)
+  ) {
+    throw new Error(
+      "v3 Integrity worker safety contract became inconsistent before execution",
+    );
+  }
+}
 const SOS_SOURCE_ACQUISITION_ROOT = optionalEnv(
   "UK_AQ_BACKFILL_SOS_SOURCE_ACQUISITION_ROOT",
 );
@@ -2196,19 +2330,25 @@ function buildAqiPartKey(
 }
 
 function activeObsHistoryPrefix(): string {
-  return HISTORY_R2_WRITE_VERSION === "v2"
-    ? OBS_R2_HISTORY_PREFIX_V2
-    : OBS_R2_HISTORY_PREFIX;
+  if (HISTORY_R2_WRITE_VERSION === "v3") return OBS_R2_HISTORY_PREFIX_V3;
+  if (HISTORY_R2_WRITE_VERSION === "v2") return OBS_R2_HISTORY_PREFIX_V2;
+  return OBS_R2_HISTORY_PREFIX;
+}
+
+function activeStructuredObsHistoryPrefix(): string {
+  if (HISTORY_R2_WRITE_VERSION === "v3") return OBS_R2_HISTORY_PREFIX_V3;
+  if (HISTORY_R2_WRITE_VERSION === "v2") return OBS_R2_HISTORY_PREFIX_V2;
+  throw new Error("structured observation history requires generation v2 or v3");
 }
 
 function activeAqiHistoryDataPrefix(): string {
-  return HISTORY_R2_WRITE_VERSION === "v2"
+  return USES_STRUCTURED_HISTORY_LAYOUT
     ? AQI_R2_HISTORY_DATA_PREFIX_V2
     : AQI_R2_HISTORY_PREFIX;
 }
 
 function activeAqiHistoryDebugPrefix(): string {
-  return HISTORY_R2_WRITE_VERSION === "v2"
+  return USES_STRUCTURED_HISTORY_LAYOUT
     ? AQI_R2_HISTORY_DEBUG_PREFIX_V2
     : AQI_R2_HISTORY_PREFIX;
 }
@@ -4033,7 +4173,18 @@ async function loadVerifiedR2ObservationRowsForConnectorDay(
         `unchanged observation parquet failed byte verification: ${file.key}`,
       );
     }
-    const partRows = await readObsHistoryRowsFromParquetBytes(livePart.body);
+    const canonicalPartRows = await readCanonicalObservationRowsFromParquet(
+      livePart.body,
+      { isSos: connectorId === SOS_CONNECTOR_ID_FALLBACK },
+    );
+    const partRows: ObsHistoryRow[] = canonicalPartRows.map((row) => ({
+      station_id: row.station_id,
+      timeseries_id: row.timeseries_id,
+      pollutant_code: row.pollutant_code as SourcePollutantCode,
+      observed_at: row.observed_at_utc,
+      value: row.value,
+      verification_status: row.verification_status,
+    }));
     if (partRows.length !== file.row_count) {
       throw new Error(
         `verified observation parquet row count mismatch: ${file.key}`,
@@ -4576,8 +4727,8 @@ async function exportObsConnectorRowsToR2(args: {
   example_missing_pollutant_rows?: MissingPollutantExampleRow[];
   pollutant_codes_written?: string[];
 }> {
-  if (HISTORY_R2_WRITE_VERSION === "v2") {
-    return await exportObsConnectorRowsToR2V2(args);
+  if (USES_STRUCTURED_HISTORY_LAYOUT) {
+    return await exportStructuredObsConnectorRows(args);
   }
 
   if (FORCE_REPLACE) {
@@ -4769,7 +4920,7 @@ type ObsV2ExportResult = {
   pollutant_codes_written: string[];
 };
 
-async function exportObsConnectorRowsToR2V2(args: {
+async function exportStructuredObsConnectorRows(args: {
   run_id: string;
   day_utc: string;
   connector_id: number;
@@ -4785,20 +4936,42 @@ async function exportObsConnectorRowsToR2V2(args: {
   example_missing_pollutant_rows: MissingPollutantExampleRow[];
   pollutant_codes_written: string[];
 }> {
+  const observationsPrefix = activeStructuredObsHistoryPrefix();
+  let rowsForWrite = args.rows;
+  if (args.connector_id === SOS_CONNECTOR_ID_FALLBACK &&
+    hasRequiredR2Config(OBS_R2_CONFIG)) {
+    const manifestKey = buildObsConnectorManifestKey(
+      args.day_utc,
+      args.connector_id,
+    );
+    const existing = await r2HeadObject({ r2: OBS_R2_CONFIG, key: manifestKey });
+    if (existing.exists) {
+      // Existing R2 contributes only an R-over-P decision for an equivalent
+      // replacement row. Replacement membership and values remain authoritative.
+      rowsForWrite = preservePersistedRatifiedStatus(
+        rowsForWrite,
+        await loadVerifiedR2ObservationRowsForConnectorDay(
+          args.day_utc,
+          args.connector_id,
+          false,
+        ),
+        { connectorId: args.connector_id },
+      );
+    }
+  }
   // Integrity prepares the complete canonical connector-day locally. Remote
   // deletion and publication are owned by the coordinator only after every
   // local object has passed structural validation.
   if (FORCE_REPLACE && !INTEGRITY_PROPOSAL_MODE) {
     await deleteR2Prefix(
       buildHistoryV2ConnectorPrefix(
-        OBS_R2_HISTORY_PREFIX_V2,
+        observationsPrefix,
         args.day_utc,
         args.connector_id,
       ),
     );
   }
 
-  const rowsForWrite = args.rows;
   const classification = classifyObservationRowsForV2PollutantPartitions(rowsForWrite);
   if (INTEGRITY_PROPOSAL_MODE) {
     assertIntegrityProposalPollutantCompleteness(classification, args);
@@ -4855,58 +5028,81 @@ async function exportObsConnectorRowsToR2V2(args: {
     } = canonicalHashResult;
     const fileEntries: ObsHistoryFileEntry[] = [];
     const liveParquetBodies: Uint8Array[] = [];
-    const rowChunks = chunkRows(canonicalPollutantRows, OBS_R2_PART_MAX_ROWS);
-    for (let partIndex = 0; partIndex < rowChunks.length; partIndex += 1) {
-      const chunk = rowChunks[partIndex];
-      if (!chunk.length) continue;
-      const parquetRows: ObsHistoryV2ParquetRow[] = chunk.map((row) => ({
-        connector_id: args.connector_id,
-        station_id: row.station_id ?? null,
-        timeseries_id: row.timeseries_id,
-        pollutant_code: pollutantCode,
-        observed_at: row.observed_at_utc,
-        value: row.value,
-        verification_status: row.verification_status,
-      }));
-      const partSummary = summarizeObservationPartRows(parquetRows);
-      const partKey = buildHistoryV2PartKey(
-        OBS_R2_HISTORY_PREFIX_V2,
-        args.day_utc,
-        args.connector_id,
+    let exactV3Proposal: ReturnType<typeof buildFixedV3IntegrityObservationProposal> | null = null;
+    const backedUpAtUtc = nowIso();
+    if (USE_FIXED_V3_INTEGRITY_PROPOSAL_WRITER) {
+      exactV3Proposal = buildFixedV3IntegrityObservationProposal({
+        rows: canonicalPollutantRows,
+        dayUtc: args.day_utc,
+        connectorId: args.connector_id,
         pollutantCode,
-        partIndex,
-      );
-      const parquetBuffer = rowsToObservationV2ParquetBuffer(parquetRows);
-      const putResult = await publishOrStageHistoryObject({
-        key: partKey,
-        body: parquetBuffer,
-        content_type: "application/octet-stream",
+        targetWriterGitSha: OBS_R2_WRITER_GIT_SHA,
+        backedUpAtUtc,
+        observationsPrefix,
+        indexRoot: getObservationHistoryGeneration("v3").observations_timeseries_index_prefix,
       });
-      const contentSha256 = sha256Hex(parquetBuffer);
-      let verifiedBytes = parquetBuffer.byteLength;
-      let verifiedEtag = putResult.etag;
-      if (!INTEGRITY_PROPOSAL_MODE) {
-        const actual = await r2GetObject({ r2: OBS_R2_CONFIG, key: partKey });
-        if (actual.bytes !== parquetBuffer.byteLength || sha256Hex(actual.body) !== contentSha256) {
-          throw new Error(`v2 observation parquet GET verification failed: ${partKey}`);
-        }
-        verifiedBytes = actual.bytes;
-        verifiedEtag = actual.etag || putResult.etag;
-        liveParquetBodies.push(actual.body);
+      for (const intent of exactV3Proposal.file_intents) {
+        await publishOrStageHistoryObject({
+          key: intent.key,
+          body: intent.body,
+          content_type: "application/octet-stream",
+        });
+        objectsWritten += 1;
       }
-      fileEntries.push({
-        key: partKey,
-        row_count: chunk.length,
-        bytes: Math.trunc(verifiedBytes),
-        etag_or_hash: verifiedEtag || contentSha256,
-        pollutant_codes: [pollutantCode],
-        min_timeseries_id: partSummary.min_timeseries_id,
-        max_timeseries_id: partSummary.max_timeseries_id,
-        min_observed_at: partSummary.min_observed_at,
-        max_observed_at: partSummary.max_observed_at,
-        timeseries_row_counts: partSummary.timeseries_row_counts,
-      });
-      objectsWritten += 1;
+    } else {
+      const rowChunks = chunkRows(canonicalPollutantRows, OBS_R2_PART_MAX_ROWS);
+      for (let partIndex = 0; partIndex < rowChunks.length; partIndex += 1) {
+        const chunk = rowChunks[partIndex];
+        if (!chunk.length) continue;
+        const parquetRows: ObsHistoryV2ParquetRow[] = chunk.map((row) => ({
+          connector_id: args.connector_id,
+          station_id: row.station_id ?? null,
+          timeseries_id: row.timeseries_id,
+          pollutant_code: pollutantCode,
+          observed_at: row.observed_at_utc,
+          value: row.value,
+          verification_status: row.verification_status,
+        }));
+        const partSummary = summarizeObservationPartRows(parquetRows);
+        const partKey = buildHistoryV2PartKey(
+          observationsPrefix,
+          args.day_utc,
+          args.connector_id,
+          pollutantCode,
+          partIndex,
+        );
+        const parquetBuffer = rowsToObservationV2ParquetBuffer(parquetRows);
+        const putResult = await publishOrStageHistoryObject({
+          key: partKey,
+          body: parquetBuffer,
+          content_type: "application/octet-stream",
+        });
+        const contentSha256 = sha256Hex(parquetBuffer);
+        let verifiedBytes = parquetBuffer.byteLength;
+        let verifiedEtag = putResult.etag;
+        if (!INTEGRITY_PROPOSAL_MODE) {
+          const actual = await r2GetObject({ r2: OBS_R2_CONFIG, key: partKey });
+          if (actual.bytes !== parquetBuffer.byteLength || sha256Hex(actual.body) !== contentSha256) {
+            throw new Error(`v2 observation parquet GET verification failed: ${partKey}`);
+          }
+          verifiedBytes = actual.bytes;
+          verifiedEtag = actual.etag || putResult.etag;
+          liveParquetBodies.push(actual.body);
+        }
+        fileEntries.push({
+          key: partKey,
+          row_count: chunk.length,
+          bytes: Math.trunc(verifiedBytes),
+          etag_or_hash: verifiedEtag || contentSha256,
+          pollutant_codes: [pollutantCode],
+          min_timeseries_id: partSummary.min_timeseries_id,
+          max_timeseries_id: partSummary.max_timeseries_id,
+          min_observed_at: partSummary.min_observed_at,
+          max_observed_at: partSummary.max_observed_at,
+          timeseries_row_counts: partSummary.timeseries_row_counts,
+        });
+        objectsWritten += 1;
+      }
     }
     if (!INTEGRITY_PROPOSAL_MODE) {
       const liveCanonicalRows = (
@@ -4931,12 +5127,12 @@ async function exportObsConnectorRowsToR2V2(args: {
       }
     }
     const manifestKey = buildHistoryV2PollutantManifestKey(
-      OBS_R2_HISTORY_PREFIX_V2,
+      observationsPrefix,
       args.day_utc,
       args.connector_id,
       pollutantCode,
     );
-    const pollutantManifest = createObservationV2PollutantManifest({
+    const pollutantManifest = exactV3Proposal?.canonical_pollutant_manifest.payload ?? createObservationV2PollutantManifest({
       dayUtc: args.day_utc,
       connectorId: args.connector_id,
       pollutantCode,
@@ -4945,12 +5141,12 @@ async function exportObsConnectorRowsToR2V2(args: {
       sourceRowCount: pollutantRows.length,
       fileEntries,
       writerGitSha: OBS_R2_WRITER_GIT_SHA,
-      backedUpAtUtc: nowIso(),
+      backedUpAtUtc,
       observationContentHash,
     });
     await publishOrStageHistoryObject({
       key: manifestKey,
-      body: encodeJsonBody(pollutantManifest),
+      body: exactV3Proposal?.canonical_pollutant_manifest.body ?? encodeJsonBody(pollutantManifest),
       content_type: "application/json",
     });
     objectsWritten += 1;
@@ -4958,7 +5154,7 @@ async function exportObsConnectorRowsToR2V2(args: {
   }
 
   const manifestKey = buildHistoryV2ConnectorManifestKey(
-    OBS_R2_HISTORY_PREFIX_V2,
+    observationsPrefix,
     args.day_utc,
     args.connector_id,
   );
@@ -7364,7 +7560,7 @@ async function fetchSosSiteTimeseriesRefsForConnector(
       candidateIdSet.has(row.timeseries_id)
     );
   }
-  if (INTEGRITY_COMPLETE_CONNECTOR_DAY && HISTORY_R2_WRITE_VERSION === "v2") {
+  if (INTEGRITY_COMPLETE_CONNECTOR_DAY && USES_STRUCTURED_HISTORY_LAYOUT) {
     throw new Error(
       "v2_integrity_sos_site_ref_bridge_snapshot_required; " +
         "live Supabase mapping lookup is not an authoritative fallback",
@@ -9912,7 +10108,12 @@ export function parseUkAirFlatFileObservationsFromStructure(args: {
       binding.targetDayNonNullRowCount += 1;
       if (!unit) binding.targetDayBlankUnitRowCount += 1;
       if (unit) units.add(unit);
-      binding.pendingRows.push({ observedAt, value, unit, status: String(cells[binding.statusIndex] || "").trim() || null });
+      binding.pendingRows.push({
+        observedAt,
+        value,
+        unit,
+        status: normalizeUkAirVerificationStatus(cells[binding.statusIndex] ?? null),
+      });
     }
   }
   for (const binding of mappedSelectedSourceLabelColumns) {
@@ -10673,7 +10874,30 @@ export function inspectIntegritySourceRowsForBlockingEvidence(
   const canonicalObservationRows: SourceObservationRow[] = [];
   let uncanonicalisableSourceRowCount = 0;
 
-  for (const row of rows) {
+  // UK-AIR can contain otherwise identical provisional and ratified evidence
+  // for the same observation. Ratified evidence is authoritative in that case.
+  const ratifiedValueIdentities = new Set((connectorId === 1 ? rows : []).filter((row) =>
+    normalizeUkAirVerificationStatus(row.status ?? null) === "R"
+  ).map((row) => JSON.stringify({
+    station_id: row.station_id,
+    timeseries_id: row.timeseries_id,
+    pollutant_code: row.pollutant_code,
+    observed_at: row.observed_at,
+    value: Number(row.value),
+  })));
+  const rowsToInspect = connectorId !== 1 ? rows : rows.filter((row) => {
+    const status = normalizeUkAirVerificationStatus(row.status ?? null);
+    const valueIdentity = JSON.stringify({
+      station_id: row.station_id,
+      timeseries_id: row.timeseries_id,
+      pollutant_code: row.pollutant_code,
+      observed_at: row.observed_at,
+      value: Number(row.value),
+    });
+    return status === "R" || !ratifiedValueIdentities.has(valueIdentity);
+  });
+
+  for (const row of rowsToInspect) {
     const canonical = normalizeSourceObservationForV2(row);
     if (!canonical) {
       uncanonicalisableSourceRowCount += 1;
@@ -11169,6 +11393,7 @@ async function readCanonicalObservationRowsFromParquet(
   const schemaColumns = parquetSchema(metadata).children.map((column) =>
     column.element.name
   );
+  observationHistoryPhysicalSchemaForColumns(schemaColumns);
   const required = [
     "connector_id",
     "station_id",
@@ -11184,14 +11409,8 @@ async function readCanonicalObservationRowsFromParquet(
     );
   }
   const rowCount = Number(metadata.num_rows || 0);
-  const columnNames = [
-    ...required,
-    ...(schemaColumns.includes("verification_status")
-      ? ["verification_status"]
-      : schemaColumns.includes("status")
-      ? ["status"]
-      : []),
-  ];
+  const statusColumn = selectObservationVerificationStatusColumn(schemaColumns);
+  const columnNames = [...required, ...(statusColumn ? [statusColumn] : [])];
   const values = await Promise.all(
     columnNames.map((column) =>
       readParquetColumnValues(file, metadata, column, 0, rowCount)
@@ -11205,13 +11424,8 @@ async function readCanonicalObservationRowsFromParquet(
     const observedAtUtc = parseHistoryIsoTimestamp(
       byName.get("observed_at_utc")?.[index],
     );
-    const statusRow = schemaColumns.includes("verification_status")
-      ? {
-        verification_status:
-          byName.get("verification_status")?.[index] ?? null,
-      }
-      : schemaColumns.includes("status")
-      ? { status: byName.get("status")?.[index] ?? null }
+    const statusRow = statusColumn
+      ? { [statusColumn]: byName.get(statusColumn)?.[index] ?? null }
       : {};
     rows.push(normalizeCanonicalObservationRow({
       connector_id: byName.get("connector_id")?.[index],
@@ -14347,7 +14561,7 @@ async function runSourceToAll(
           connectorId,
         );
         if (!FORCE_REPLACE && existingObsManifest && existingAqiManifest) {
-          if (!INTEGRITY_PROPOSAL_MODE && HISTORY_R2_WRITE_VERSION === "v2") {
+          if (!INTEGRITY_PROPOSAL_MODE && USES_STRUCTURED_HISTORY_LAYOUT) {
             const verifiedRows =
               await loadVerifiedR2ObservationRowsForConnectorDay(
                 dayUtc,
@@ -16415,7 +16629,7 @@ async function runSourceToAll(
         }
 
         if (DRY_RUN) {
-          if (!INTEGRITY_PROPOSAL_MODE && HISTORY_R2_WRITE_VERSION === "v2") {
+          if (!INTEGRITY_PROPOSAL_MODE && USES_STRUCTURED_HISTORY_LAYOUT) {
             const reconciliation = await reconcileTimeseriesFirstValueAt({
               connector_id: connectorId,
               rows: obsHistoryRows,
@@ -16531,7 +16745,7 @@ async function runSourceToAll(
         if (
           !integrityObservationProposalFinalisation &&
           !INTEGRITY_PROPOSAL_MODE &&
-          HISTORY_R2_WRITE_VERSION === "v2"
+          USES_STRUCTURED_HISTORY_LAYOUT
         ) {
           const verifiedRows =
             await loadVerifiedR2ObservationRowsForConnectorDay(

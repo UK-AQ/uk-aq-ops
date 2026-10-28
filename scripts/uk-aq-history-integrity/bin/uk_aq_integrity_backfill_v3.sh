@@ -11,9 +11,8 @@ Required:
   --from-day YYYY-MM-DD
   --to-day YYYY-MM-DD
 
-Mode flags (exactly one required):
+Mode flag (required):
   --observs-only          Run source_to_r2 with observations_only scope.
-  --aqi-only              Run r2_history_obs_to_aqilevels with aqilevels_only scope.
 
 Mode-specific requirements:
   --observs-only:
@@ -21,9 +20,6 @@ Mode-specific requirements:
     --complete-connector-day
                            Enumerate the adapter's complete selected source day.
     --connector-id N      Optional connector filter for tighter scope.
-  --aqi-only:
-    --connector-id N      Optional connector filter for partial-day scope.
-
 Optional:
   The history generation is fixed to v3; --history-version is rejected.
   --dry-run               Set UK_AQ_BACKFILL_DRY_RUN=true (default false).
@@ -34,7 +30,7 @@ Notes:
   - Loads that repository's root .env; --env TEST|LIVE is authoritative.
   - Reasserts UK_AQ_ENV_NAME and reads UK_AQ_BACKFILL_WRAPPER from the root .env.
   - Never reads the local TEST.env or LIVE.env selector files.
-  - Preserves observation-only and AQI-only modes.
+  - Supports observation-history repair only.
   - Complete connector-day Integrity repairs require an explicit selected
     pollutant set and resolve its exact active timeseries IDs from Integrity SQLite.
   - Disables the nested full R2 history index rebuild; the Integrity coordinator
@@ -284,7 +280,6 @@ resolve_integrity_wrapper_var() {
 
 ENV_NAME=""
 OBSERVS_ONLY=0
-AQI_ONLY=0
 CONNECTOR_ID_RAW=""
 TIMESERIES_IDS_RAW=""
 COMPLETE_CONNECTOR_DAY=0
@@ -305,10 +300,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --observs-only)
       OBSERVS_ONLY=1
-      shift
-      ;;
-    --aqi-only)
-      AQI_ONLY=1
       shift
       ;;
     --connector-id)
@@ -381,8 +372,8 @@ esac
 
 
 
-if (( OBSERVS_ONLY + AQI_ONLY != 1 )); then
-  echo "ERROR: pass exactly one of --observs-only or --aqi-only." >&2
+if (( OBSERVS_ONLY != 1 )); then
+  echo "ERROR: --observs-only is required." >&2
   exit 2
 fi
 
@@ -454,10 +445,15 @@ INCOMING_CORE_SNAPSHOT_DROPBOX_ROOT="$(trim "${UK_AQ_INTEGRITY_CORE_SNAPSHOT_DRO
 INCOMING_CORE_SNAPSHOT_STAGE="$(trim "${UK_AQ_INTEGRITY_CORE_SNAPSHOT_STAGE:-}")"
 INCOMING_INTEGRITY_EFFECTIVE_MODE="$(trim "${UK_AQ_INTEGRITY_EFFECTIVE_MODE:-}")"
 INCOMING_INTEGRITY_INVOCATION="$(trim "${UK_AQ_INTEGRITY_INVOCATION:-}")"
+INCOMING_TARGET_WRITER_GIT_SHA="$(trim "${UK_AQ_INTEGRITY_TARGET_WRITER_GIT_SHA:-}")"
 INCOMING_INTEGRITY_WORKER_PURPOSE="$(trim "${UK_AQ_INTEGRITY_WORKER_PURPOSE:-}")"
 INCOMING_CANONICAL_WRITES_ALLOWED="$(trim "${UK_AQ_INTEGRITY_CANONICAL_WRITES_ALLOWED:-}")"
 if [[ -z "${INCOMING_CORE_SNAPSHOT_IDENTITY_JSON}" || -z "${INCOMING_CORE_SNAPSHOT_IDENTITY_FILE}" || -z "${INCOMING_CORE_SNAPSHOT_DROPBOX_ROOT}" ]]; then
   echo "ERROR: Integrity child requires the coordinator core snapshot identity, identity file, and Dropbox root." >&2
+  exit 4
+fi
+if ! [[ "${INCOMING_TARGET_WRITER_GIT_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "ERROR: UK_AQ_INTEGRITY_TARGET_WRITER_GIT_SHA must be a full lower-case Git SHA." >&2
   exit 4
 fi
 # The shared repository .env is the only environment source for this wrapper.
@@ -483,11 +479,12 @@ export UK_AQ_INTEGRITY_CORE_SNAPSHOT_DROPBOX_ROOT="${INCOMING_CORE_SNAPSHOT_DROP
 export UK_AQ_INTEGRITY_CORE_SNAPSHOT_STAGE="${INCOMING_CORE_SNAPSHOT_STAGE:-integrity_backfill_wrapper}"
 export UK_AQ_INTEGRITY_EFFECTIVE_MODE="${INCOMING_INTEGRITY_EFFECTIVE_MODE}"
 export UK_AQ_INTEGRITY_INVOCATION="${INCOMING_INTEGRITY_INVOCATION:-true}"
+export UK_AQ_INTEGRITY_TARGET_WRITER_GIT_SHA="${INCOMING_TARGET_WRITER_GIT_SHA}"
 export UK_AQ_INTEGRITY_WORKER_PURPOSE="${INCOMING_INTEGRITY_WORKER_PURPOSE}"
 export UK_AQ_INTEGRITY_CANONICAL_WRITES_ALLOWED="${INCOMING_CANONICAL_WRITES_ALLOWED}"
 
-if [[ "$(trim "${UKAQ_ENV_NAME:-}")" != "${ENV_NAME}" ]]; then
-  echo "ERROR: UKAQ_ENV_NAME in the selected repository root .env does not match --env=${ENV_NAME}." >&2
+if [[ "$(trim "${UK_AQ_ENV_NAME:-}")" != "${ENV_NAME}" ]]; then
+  echo "ERROR: UK_AQ_ENV_NAME in the selected repository root .env does not match --env=${ENV_NAME}." >&2
   exit 4
 fi
 
@@ -559,13 +556,8 @@ if ! NODE_BIN="$(resolve_node_bin)"; then
 fi
 export UK_AQ_BACKFILL_NODE_BIN="${NODE_BIN}"
 
-if (( OBSERVS_ONLY == 1 )); then
-  export UK_AQ_BACKFILL_RUN_MODE="source_to_r2"
-  export UK_AQ_BACKFILL_OUTPUT_SCOPE="observations_only"
-else
-  export UK_AQ_BACKFILL_RUN_MODE="r2_history_obs_to_aqilevels"
-  export UK_AQ_BACKFILL_OUTPUT_SCOPE="aqilevels_only"
-fi
+export UK_AQ_BACKFILL_RUN_MODE="source_to_r2"
+export UK_AQ_BACKFILL_OUTPUT_SCOPE="observations_only"
 
 export UK_AQ_R2_HISTORY_VERSION="v3"
 export UK_AQ_R2_HISTORY_INDEX_VERSION="v3"
@@ -609,23 +601,18 @@ else
   unset UK_AQ_BACKFILL_CONNECTOR_IDS || true
 fi
 
-if (( OBSERVS_ONLY == 1 )); then
-  if (( COMPLETE_CONNECTOR_DAY == 1 )); then
-    REPAIR_POLLUTANTS="$(trim "${UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS:-}")"
-    if [[ -z "${REPAIR_POLLUTANTS}" ]]; then
-      echo "ERROR: --complete-connector-day requires UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS." >&2
-      exit 3
-    fi
-    unset UK_AQ_BACKFILL_TIMESERIES_IDS || true
-    unset UK_AQ_BACKFILL_TIMESERIES_ID || true
-    export UK_AQ_BACKFILL_INTEGRITY_COMPLETE_CONNECTOR_DAY="true"
-  else
-    export UK_AQ_BACKFILL_TIMESERIES_IDS="${TIMESERIES_IDS}"
-    unset UK_AQ_BACKFILL_INTEGRITY_COMPLETE_CONNECTOR_DAY || true
+if (( COMPLETE_CONNECTOR_DAY == 1 )); then
+  REPAIR_POLLUTANTS="$(trim "${UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS:-}")"
+  if [[ -z "${REPAIR_POLLUTANTS}" ]]; then
+    echo "ERROR: --complete-connector-day requires UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS." >&2
+    exit 3
   fi
-else
   unset UK_AQ_BACKFILL_TIMESERIES_IDS || true
   unset UK_AQ_BACKFILL_TIMESERIES_ID || true
+  export UK_AQ_BACKFILL_INTEGRITY_COMPLETE_CONNECTOR_DAY="true"
+else
+  export UK_AQ_BACKFILL_TIMESERIES_IDS="${TIMESERIES_IDS}"
+  unset UK_AQ_BACKFILL_INTEGRITY_COMPLETE_CONNECTOR_DAY || true
 fi
 
 echo "=== UK AQ SOS-light v3 Integrity Backfill ==="

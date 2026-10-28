@@ -2,13 +2,32 @@ import fs from "node:fs";
 import path from "node:path";
 
 import {
+  createBoundedProgressReporter,
+  createVerifiedGetBodyCache,
   createApplyPersistence,
   createInitialApplyProgressState,
+  VERIFIED_GET_CACHE_MAX_BYTES,
+  verifyLiveObservationPartition,
 } from "../uk_aq_apply_integrity_proposal.mjs";
 import { sha256Hex } from "../../../workers/shared/r2_sigv4.mjs";
+import {
+  getIntegrityR2ObjectWithRetry,
+} from "./integrity_r2_get_retry.mjs";
+import {
+  isObservationHistoryIntegrityIndexKey,
+  requireObservationHistoryIntegrityKey,
+} from "./observation_history_integrity_key_allowlist.mjs";
 
 export const SOS_LIGHT_V3_APPLY_PERSISTENCE_CONTRACT =
   "sos-light-v3-apply-persistence-v1";
+export const SOS_LIGHT_V3_SEMANTIC_CACHE_MAX_ENTRIES = 1024;
+export const SOS_LIGHT_V3_SEMANTIC_CACHE_MAX_BYTES =
+  VERIFIED_GET_CACHE_MAX_BYTES;
+
+const SOS_LIGHT_V3_SEMANTIC_CACHE_CAPACITY = Object.freeze({
+  max_entries: SOS_LIGHT_V3_SEMANTIC_CACHE_MAX_ENTRIES,
+  max_bytes: SOS_LIGHT_V3_SEMANTIC_CACHE_MAX_BYTES,
+});
 
 function atomicWriteJson(filePath, value) {
   const target = path.resolve(filePath);
@@ -52,6 +71,10 @@ function atomicWriteJson(filePath, value) {
   }
 }
 
+export function writeSosLightV3RunState(runStatePath, runState) {
+  atomicWriteJson(runStatePath, runState);
+}
+
 function exactBody(value, key) {
   if (Buffer.isBuffer(value)) return Buffer.from(value);
   if (value instanceof Uint8Array) {
@@ -81,6 +104,7 @@ function mutationContext(keyOrPrefix, stage = null) {
 }
 
 function publicationStage(key, supplied = null) {
+  const classification = requireObservationHistoryIntegrityKey(key, { generation: "v3" });
   const configured = String(supplied || "").trim();
   if (configured) return configured;
   if (key.endsWith(".parquet")) return "observation_parquet";
@@ -93,10 +117,10 @@ function publicationStage(key, supplied = null) {
   if (/\/day_utc=\d{4}-\d{2}-\d{2}\/manifest\.json$/.test(key)) {
     return "observation_day_manifest";
   }
-  if (key === "history/_index_v3/observations_timeseries_latest.json") {
+  if (classification.kind === "observation_latest_index") {
     return "observation_latest_index";
   }
-  if (key.startsWith("history/_index_v3/")) return "observation_index";
+  if (classification.family === "observations_timeseries") return "observation_index";
   if (key.startsWith("history/v3/observations/")) {
     return "observation_aggregate_manifest";
   }
@@ -115,22 +139,253 @@ function isSkippedPut(result) {
     String(result?.status || "") === "skipped_unchanged";
 }
 
+function topologicalOrder(objects, availableDependencyKeys = new Set()) {
+  const byKey = new Map();
+  for (const object of objects) {
+    const key = normalizedKey(object?.key);
+    if (byKey.has(key)) {
+      throw new Error(`SOS-light-v3 frozen proposal has duplicate object key: ${key}`);
+    }
+    byKey.set(key, object);
+  }
+  const remaining = new Map(byKey);
+  const ordered = [];
+  while (remaining.size) {
+    const ready = [...remaining.values()].filter((object) =>
+      (object.entry.dependencies || []).every((rawDependency) => {
+        const dependency = normalizedKey(rawDependency);
+        if (!byKey.has(dependency) && !availableDependencyKeys.has(dependency)) {
+          throw new Error(
+            `SOS-light-v3 frozen proposal dependency is unavailable: ${object.key} -> ${dependency}`,
+          );
+        }
+        return !remaining.has(dependency);
+      })
+    ).sort((left, right) => left.key.localeCompare(right.key));
+    if (!ready.length) {
+      throw new Error("SOS-light-v3 frozen proposal has a publication dependency cycle");
+    }
+    const next = ready[0];
+    ordered.push(next);
+    remaining.delete(next.key);
+  }
+  return ordered;
+}
+
+export function partitionFrozenSosLightV3PublicationGraph({ proposal, days }) {
+  const selected = new Set(days);
+  const objectsByDay = new Map(days.map((day) => [day, []]));
+  const sharedTail = [];
+  const allKeys = new Set();
+  for (const object of proposal?.objects || []) {
+    const key = normalizedKey(object?.key);
+    requireObservationHistoryIntegrityKey(key, { generation: "v3" });
+    if (allKeys.has(key)) {
+      throw new Error(`SOS-light-v3 frozen proposal has duplicate object key: ${key}`);
+    }
+    allKeys.add(key);
+    const dayMatch = key.match(
+      /^history\/v3\/observations\/day_utc=(\d{4}-\d{2}-\d{2})\//,
+    );
+    if (dayMatch) {
+      if (!selected.has(dayMatch[1])) {
+        throw new Error(`SOS-light-v3 frozen proposal writes an unselected day: ${key}`);
+      }
+      objectsByDay.get(dayMatch[1]).push(object);
+      continue;
+    }
+    if (key.startsWith("history/v3/observations/_manifests/")
+        || isObservationHistoryIntegrityIndexKey(key, { generation: "v3" })) {
+      sharedTail.push(object);
+      continue;
+    }
+    throw new Error(`SOS-light-v3 frozen proposal object has no safe apply partition: ${key}`);
+  }
+
+  const orderedByDay = new Map();
+  const completedDayKeys = new Set();
+  for (const day of days) {
+    const dayObjects = objectsByDay.get(day);
+    const dayKey = `history/v3/observations/day_utc=${day}/manifest.json`;
+    if (!dayObjects.length || !dayObjects.some((object) => object.key === dayKey)) {
+      throw new Error(`SOS-light-v3 frozen proposal has no complete day parent: ${day}`);
+    }
+    const dayKeys = new Set(dayObjects.map((object) => object.key));
+    for (const object of dayObjects) {
+      for (const dependency of object.entry.dependencies || []) {
+        if (!dayKeys.has(dependency)) {
+          throw new Error(
+            `SOS-light-v3 day object depends outside its day unit: ${object.key} -> ${dependency}`,
+          );
+        }
+      }
+    }
+    const reachable = new Set([dayKey]);
+    const pending = [dayKey];
+    const byKey = new Map(dayObjects.map((object) => [object.key, object]));
+    while (pending.length) {
+      const current = byKey.get(pending.pop());
+      for (const dependency of current?.entry.dependencies || []) {
+        if (!reachable.has(dependency)) {
+          reachable.add(dependency);
+          pending.push(dependency);
+        }
+      }
+    }
+    if (reachable.size !== dayObjects.length) {
+      throw new Error(`SOS-light-v3 day parent does not cover its complete frozen day unit: ${day}`);
+    }
+    const ordered = topologicalOrder(dayObjects);
+    if (ordered.at(-1)?.key !== dayKey) {
+      throw new Error(`SOS-light-v3 day parent is not the final day publication: ${day}`);
+    }
+    orderedByDay.set(day, ordered);
+    for (const key of dayKeys) completedDayKeys.add(key);
+  }
+  const orderedSharedTail = topologicalOrder(sharedTail, completedDayKeys);
+  return {
+    ordered_by_day: orderedByDay,
+    ordered_shared_tail: orderedSharedTail,
+    ordered_object_count: [...orderedByDay.values()]
+      .reduce((count, objects) => count + objects.length, orderedSharedTail.length),
+  };
+}
+
+function semanticPartitionIdentity(dayUtc, connectorId, pollutantCode) {
+  return `day_utc=${dayUtc}/connector_id=${connectorId}/pollutant_code=${pollutantCode}`;
+}
+
+export function validateSosLightV3SemanticCacheCapacity({
+  publicationPartitions,
+  proposal,
+  runState,
+  days,
+}) {
+  const byKey = new Map(proposal.objects.map((object) => [object.key, object]));
+  const selectedDays = new Set(days);
+  const manifestParts = new Map();
+  const selectedParquetKeys = new Set();
+  let requiredPeakEntries = 0;
+  let requiredPeakBytes = 0;
+  let peakEntriesDayUtc = null;
+  let peakEntriesTriggerObjectKey = null;
+  let peakBytesDayUtc = null;
+  let peakBytesTriggerObjectKey = null;
+  for (const identity of Object.keys(runState.source_evidence_partitions || {}).sort()) {
+    const match = identity.match(
+      /^day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)$/,
+    );
+    if (!match) {
+      throw new Error(`SOS-light-v3 source-evidence partition identity is invalid: ${identity}`);
+    }
+    const expectedIdentity = semanticPartitionIdentity(match[1], Number(match[2]), match[3]);
+    if (identity !== expectedIdentity) {
+      throw new Error(`SOS-light-v3 source-evidence partition identity is noncanonical: ${identity}`);
+    }
+    if (!selectedDays.has(match[1])) {
+      throw new Error(`SOS-light-v3 source-evidence partition is outside selected days: ${identity}`);
+    }
+    const manifestKey = `history/v3/observations/day_utc=${match[1]}`
+      + `/connector_id=${match[2]}/pollutant_code=${match[3]}/manifest.json`;
+    const manifestObject = byKey.get(manifestKey);
+    if (!manifestObject) {
+      throw new Error(`SOS-light-v3 selected semantic manifest is unavailable: ${manifestKey}`);
+    }
+    let manifest;
+    try {
+      manifest = JSON.parse(exactBody(manifestObject.body, manifestKey).toString("utf8"));
+    } catch {
+      throw new Error(`SOS-light-v3 selected semantic manifest is invalid JSON: ${manifestKey}`);
+    }
+    const partKeys = Array.isArray(manifest?.parquet_object_keys)
+      ? manifest.parquet_object_keys.map(normalizedKey)
+      : [];
+    for (const key of partKeys) {
+      const part = byKey.get(key);
+      if (!part || !key.endsWith(".parquet")) {
+        throw new Error(`SOS-light-v3 selected semantic Parquet is unavailable: ${key}`);
+      }
+      selectedParquetKeys.add(key);
+    }
+    manifestParts.set(manifestKey, partKeys);
+  }
+
+  for (const day of days) {
+    const retained = new Map();
+    let retainedBytes = 0;
+    for (const object of publicationPartitions.ordered_by_day.get(day)) {
+      if (selectedParquetKeys.has(object.key)) {
+        const bytes = exactBody(object.body, object.key).byteLength;
+        retained.set(object.key, bytes);
+        retainedBytes += bytes;
+        if (retained.size > requiredPeakEntries) {
+          requiredPeakEntries = retained.size;
+          peakEntriesDayUtc = day;
+          peakEntriesTriggerObjectKey = object.key;
+        }
+        if (retainedBytes > requiredPeakBytes) {
+          requiredPeakBytes = retainedBytes;
+          peakBytesDayUtc = day;
+          peakBytesTriggerObjectKey = object.key;
+        }
+      }
+      const partKeys = manifestParts.get(object.key);
+      if (!partKeys) continue;
+      for (const key of partKeys) {
+        if (!retained.has(key)) {
+          throw new Error(
+            `SOS-light-v3 selected semantic GET body is unavailable before manifest: ${key}`,
+          );
+        }
+        retainedBytes -= retained.get(key);
+        retained.delete(key);
+      }
+    }
+    if (retained.size) {
+      throw new Error(
+        `SOS-light-v3 selected semantic GET bodies have no consuming manifest: `
+        + [...retained.keys()].sort().join(","),
+      );
+    }
+  }
+  const capacity = Object.freeze({
+    required_peak_entries: requiredPeakEntries,
+    required_peak_bytes: requiredPeakBytes,
+    configured_max_entries: SOS_LIGHT_V3_SEMANTIC_CACHE_CAPACITY.max_entries,
+    configured_max_bytes: SOS_LIGHT_V3_SEMANTIC_CACHE_CAPACITY.max_bytes,
+    peak_entries_day_utc: peakEntriesDayUtc,
+    peak_entries_trigger_object_key: peakEntriesTriggerObjectKey,
+    peak_bytes_day_utc: peakBytesDayUtc,
+    peak_bytes_trigger_object_key: peakBytesTriggerObjectKey,
+  });
+  if (requiredPeakEntries > capacity.configured_max_entries
+      || requiredPeakBytes > capacity.configured_max_bytes) {
+    const error = new Error(
+      `SOS-light-v3 selected semantic GET bodies exceed bounded cache before verification: `
+      + `required_peak_entries=${requiredPeakEntries}/${capacity.configured_max_entries} `
+      + `required_peak_bytes=${requiredPeakBytes}/${capacity.configured_max_bytes}`,
+    );
+    error.semantic_verification_cache_capacity = capacity;
+    throw error;
+  }
+  return Object.freeze({
+    selected_parquet_keys: selectedParquetKeys,
+    semantic_verification_cache_capacity: capacity,
+  });
+}
+
 export async function runPersistedSosLightV3Apply({
   runStatePath,
   runState,
   proposal,
   r2,
-  executeWriter,
   adapters,
   persistenceIo = {},
 }) {
-  if (typeof executeWriter !== "function") {
-    throw new TypeError("SOS-light-v3 persisted apply requires executeWriter");
-  }
   for (const name of [
     "getObject",
     "putObject",
-    "putIfChanged",
+    "putAndVerifyParquet",
     "listAllObjects",
     "deleteObjects",
   ]) {
@@ -139,13 +394,49 @@ export async function runPersistedSosLightV3Apply({
     }
   }
   const days = selectedDays(runState);
-  if (!days.length || proposal?.prefixes?.length !== days.length) {
+  const dayDeletionPrefixes = (proposal?.prefixes || [])
+    .filter(({ entry }) => entry?.stage === "sos_light_complete_day");
+  const exactScopeRemovalPrefixes = (proposal?.prefixes || [])
+    .filter(({ entry }) => entry?.stage === "sos_light_exact_v3_scope_removal");
+  if (!days.length || dayDeletionPrefixes.length !== days.length) {
     throw new Error("SOS-light-v3 persisted apply requires validated selected days");
   }
+  const publicationPartitions = partitionFrozenSosLightV3PublicationGraph({
+    proposal,
+    days,
+  });
+  let semanticCachePlan;
+  try {
+    semanticCachePlan = validateSosLightV3SemanticCacheCapacity({
+      publicationPartitions,
+      proposal,
+      runState,
+      days,
+    });
+  } catch (error) {
+    const capacity = error?.semantic_verification_cache_capacity;
+    if (capacity) {
+      const message = error instanceof Error ? error.message : String(error);
+      runState.semantic_verification_cache_capacity = capacity;
+      runState.pre_apply_failure = {
+        status: "failed",
+        phase: "semantic_verification_cache_capacity",
+        error: message,
+        failed_at_utc: new Date().toISOString(),
+        semantic_verification_cache_capacity: capacity,
+      };
+      atomicWriteJson(runStatePath, runState);
+    }
+    throw error;
+  }
+  const semanticVerificationCacheCapacity =
+    semanticCachePlan.semantic_verification_cache_capacity;
+  runState.semantic_verification_cache_capacity =
+    semanticVerificationCacheCapacity;
   const counts = {
     planned_deletions: proposal.prefixes.length,
-    planned_writes: null,
-    planned_post_put_verifications: null,
+    planned_writes: proposal.objects.length,
+    planned_post_put_verifications: proposal.objects.length,
     completed_deletions: 0,
     deleted_objects: 0,
     completed_writes: 0,
@@ -155,6 +446,31 @@ export async function runPersistedSosLightV3Apply({
     completed_post_put_verifications: 0,
     failed_operations: 0,
   };
+  const applyStartedAtMs = Date.now();
+  const report = createBoundedProgressReporter({ log: adapters.progressLog });
+  const progressMessage = (phase) => JSON.stringify({
+    phase,
+    total_planned_operations: counts.planned_writes + counts.planned_deletions,
+    completed_operations: counts.completed_writes + counts.completed_deletions,
+    planned_writes: counts.planned_writes,
+    completed_writes: counts.completed_writes,
+    get_verified_writes: counts.get_verified_writes,
+    planned_post_put_verifications: counts.planned_post_put_verifications,
+    completed_post_put_verifications: counts.completed_post_put_verifications,
+    planned_deletions: counts.planned_deletions,
+    completed_deletions: counts.completed_deletions,
+    deleted_objects: counts.deleted_objects,
+    failed_operations: counts.failed_operations,
+    elapsed_seconds: Math.max(
+      0,
+      Math.round((Date.now() - applyStartedAtMs) / 1000),
+    ),
+  });
+  const reportProgress = (phase, force = false) => report({
+    message: progressMessage(phase),
+    completedObjects: counts.completed_writes + counts.completed_deletions,
+    force,
+  });
   const { progressState, perDayStatus } = createInitialApplyProgressState({
     runStatePath,
     runId: runState.run_id,
@@ -171,6 +487,9 @@ export async function runPersistedSosLightV3Apply({
     started_at_utc: startedAtUtc,
     final_proposal_graph_validation: "succeeded",
     canonical_v3_writer_invoked: false,
+    frozen_proposal_apply: true,
+    semantic_verification_cache_capacity:
+      semanticVerificationCacheCapacity,
     v3_publication_evidence: [],
     ...counts,
   };
@@ -207,9 +526,26 @@ export async function runPersistedSosLightV3Apply({
   }
 
   const publicationEvidence = [];
+  const verifiedBodyCache = createVerifiedGetBodyCache({
+    maxEntries: semanticVerificationCacheCapacity.configured_max_entries,
+    maxBytes: semanticVerificationCacheCapacity.configured_max_bytes,
+  });
   const pendingByKey = new Map();
   let nextOperationId = 1;
   let currentOperation = null;
+  let activeDayUtc = null;
+  const baseGetObject = adapters.getObject;
+  const retryLog = adapters.progressLog
+    ? (event) => adapters.progressLog(
+      `UK_AQ_INTEGRITY_PROGRESS ${JSON.stringify(event)}`,
+    )
+    : undefined;
+  const getObject = ({ phase, ...request }) => getIntegrityR2ObjectWithRetry({
+    getObject: baseGetObject,
+    ...request,
+    phase: phase || "canonical_v3_apply_r2_get",
+    ...(retryLog ? { log: retryLog } : {}),
+  });
 
   const syncPersistence = () => {
     const coordinatorWrites = Number(
@@ -292,6 +628,7 @@ export async function runPersistedSosLightV3Apply({
         key,
         suppliedStage || artifact?.publication_stage,
       ),
+      entry: artifact?.entry || null,
       put_status: null,
       uploaded: null,
       verified: false,
@@ -335,7 +672,11 @@ export async function runPersistedSosLightV3Apply({
   const trackedGetObject = async ({ key }) => {
     const normalized = normalizedKey(key);
     const operation = pendingByKey.get(normalized);
-    if (!operation) return await adapters.getObject({ r2, key: normalized });
+    if (!operation) return await getObject({
+      r2,
+      key: normalized,
+      phase: "canonical_v3_apply_dependency_read",
+    });
     persistence.appendEvent({
       event_type: "post_put_get_started",
       operation_id: operation.operation_id,
@@ -346,7 +687,11 @@ export async function runPersistedSosLightV3Apply({
       status: "started",
     });
     try {
-      const stored = await adapters.getObject({ r2, key: normalized });
+      const stored = await getObject({
+        r2,
+        key: normalized,
+        phase: `canonical_v3_apply_post_put_readback_${operation.publication_stage}`,
+      });
       const body = exactBody(stored?.body, normalized);
       if (
         stored?.exists === false ||
@@ -358,6 +703,24 @@ export async function runPersistedSosLightV3Apply({
         );
       }
       operation.verified = true;
+      const semanticBodyRequired =
+        semanticCachePlan.selected_parquet_keys.has(operation.key);
+      const cached = semanticBodyRequired
+        ? verifiedBodyCache.store({
+            key: operation.key,
+            sha256: operation.sha256,
+            body,
+          })
+        : false;
+      if (operation.entry) {
+        Object.assign(operation.entry, {
+          r2_verified: true,
+          bytes: operation.byte_size,
+          sha256: operation.sha256,
+          post_put_verification_get_count: 1,
+          verified_get_body_cached: cached,
+        });
+      }
       const evidence = Object.freeze({
         operation_id: operation.operation_id,
         object_key: operation.key,
@@ -372,6 +735,8 @@ export async function runPersistedSosLightV3Apply({
         r2_verified: true,
         post_put_verification_get_count: 1,
         final_live_sha256: operation.sha256,
+        stored_sha256_verified: operation.stored_sha256_verified === true,
+        stored_byte_size_verified: operation.stored_byte_size_verified === true,
         durable: true,
       });
       persistence.appendEvent({
@@ -391,6 +756,7 @@ export async function runPersistedSosLightV3Apply({
       counts.get_verified_writes += 1;
       if (operation.uploaded) counts.uploaded_writes += 1;
       else counts.skipped_unchanged_writes += 1;
+      reportProgress("canonical_v3_apply_progress");
       return stored;
     } catch (error) {
       appendFailure(operation, error);
@@ -400,7 +766,8 @@ export async function runPersistedSosLightV3Apply({
   const trackedPutObject = async (request, suppliedStage = null) => {
     const operation = beginPut(request, suppliedStage);
     try {
-      const result = await adapters.putObject({ ...request, r2 });
+      const { entry: _entry, ...putRequest } = request;
+      const result = await adapters.putObject({ ...putRequest, r2 });
       completePut(operation, result);
       return result;
     } catch (error) {
@@ -408,91 +775,39 @@ export async function runPersistedSosLightV3Apply({
       throw error;
     }
   };
-  const trackedPutIfChanged = async (artifact) => {
-    const operation = beginPut(artifact);
+  const trackedPutAndVerifyParquet = async (object) => {
+    const operation = beginPut({
+      key: object.key,
+      body: object.body,
+      content_type: object.entry.content_type,
+      sha256: object.entry.sha256,
+      byte_size: object.entry.bytes,
+      entry: object.entry,
+    }, "observation_parquet");
     try {
-      const instrumentedR2 = {
-        ...r2,
-        canonical_mutation_sink: async (generated) => {
-          const result = await adapters.putObject({
-            r2,
-            key: generated.key,
-            body: generated.body,
-            content_type: generated.content_type,
-            sha256: generated.sha256,
-          });
-          return {
-            ...result,
-            key: generated.key,
-            byte_size: generated.bytes,
-            sha256: generated.sha256,
-            skipped: false,
-            status: "succeeded",
-            write_r2: true,
-            verified: false,
-          };
-        },
-      };
-      const result = await adapters.putIfChanged({
-        r2: instrumentedR2,
-        key: operation.key,
-        body: operation.body,
-        content_type: operation.content_type,
-        writeR2: true,
-      });
-      completePut(operation, result);
-      return {
-        ...result,
-        verified: false,
-        post_put_get_verified: false,
-      };
-    } catch (error) {
-      appendFailure(operation, error);
-      throw error;
-    }
-  };
-  const recordDurableEvidence = async (artifact) => {
-    const key = normalizedKey(artifact?.key);
-    const evidence = [...publicationEvidence].reverse().find(
-      (entry) => entry.key === key,
-    );
-    if (
-      !evidence ||
-      evidence.byte_size !== Number(artifact?.byte_size) ||
-      evidence.sha256 !== String(artifact?.sha256 || "")
-    ) {
-      throw new Error(
-        `SOS-light-v3 durable publication evidence is incomplete: ${key}`,
-      );
-    }
-    return {
-      durable: true,
-      key,
-      byte_size: evidence.byte_size,
-      sha256: evidence.sha256,
-      evidence_kind: "r2_complete_body_readback",
-    };
-  };
-  const putAndVerifyParquet = async ({ intent }) => {
-    const operation = beginPut(intent, "observation_parquet");
-    try {
-      const result = await adapters.putObject({
+      const result = await adapters.putAndVerifyParquet({
         r2,
-        key: operation.key,
-        body: operation.body,
-        content_type: operation.content_type,
-        sha256: operation.sha256,
+        intent: {
+          key: operation.key,
+          body: operation.body,
+          content_type: operation.content_type,
+          sha256: operation.sha256,
+          byte_size: operation.byte_size,
+        },
       });
       completePut(operation, result);
+      if (result?.stored_sha256_verified !== true
+          || result?.stored_byte_size_verified !== true
+          || result?.sha256 !== operation.sha256
+          || Number(result?.byte_size) !== operation.byte_size) {
+        throw new Error(
+          `SOS-light-v3 checksum-aware Parquet verification failed: ${operation.key}`,
+        );
+      }
+      operation.stored_sha256_verified = true;
+      operation.stored_byte_size_verified = true;
       await trackedGetObject({ key: operation.key });
-      return {
-        key: operation.key,
-        byte_size: operation.byte_size,
-        sha256: operation.sha256,
-        verified: true,
-        stored_sha256_verified: true,
-        stored_byte_size_verified: true,
-      };
+      return result;
     } catch (error) {
       if (!operation.verified) appendFailure(operation, error);
       throw error;
@@ -513,6 +828,11 @@ export async function runPersistedSosLightV3Apply({
     runState.apply.current_phase = "complete_day_deletion";
     progressState.current_day_utc = dayUtc;
     progressState.current_deletion_prefix = prefix;
+    Object.assign(perDayStatus[dayUtc], {
+      status: "preparing_deletion",
+      operation_started: true,
+    });
+    reportProgress("canonical_v3_day_deletion_started", true);
     const existing = await adapters.listAllObjects({
       r2,
       prefix: `${prefix}/`,
@@ -536,9 +856,19 @@ export async function runPersistedSosLightV3Apply({
       deleted_keys_sha256: sidecar.deleted_keys_sha256,
     });
     persistence.flush();
+    Object.assign(perDayStatus[dayUtc], {
+      status: "deleting",
+      deletion_attempted: true,
+      mutation_started: true,
+    });
     checkpoint("before_complete_day_deletion");
     try {
       if (keys.length) await adapters.deleteObjects({ r2, keys });
+      Object.assign(perDayStatus[dayUtc], {
+        status: "deletion_applied",
+        deletion_applied: true,
+        deleted_object_count: keys.length,
+      });
       Object.assign(tombstone.entry, {
         status: "deleted",
         deleted_object_count: keys.length,
@@ -570,6 +900,7 @@ export async function runPersistedSosLightV3Apply({
       });
       counts.completed_deletions += 1;
       counts.deleted_objects += keys.length;
+      reportProgress("canonical_v3_day_deletion_completed", true);
       persistence.appendEvent({
         event_type: "deletion_verified",
         prefix,
@@ -597,6 +928,9 @@ export async function runPersistedSosLightV3Apply({
         deleted_keys_sidecar_bytes: sidecar.deleted_keys_sidecar_bytes,
       };
     } catch (error) {
+      perDayStatus[dayUtc].status = "failed";
+      perDayStatus[dayUtc].error =
+        error instanceof Error ? error.message : String(error);
       tombstone.entry.status = "failed";
       tombstone.entry.error =
         error instanceof Error ? error.message : String(error);
@@ -620,7 +954,68 @@ export async function runPersistedSosLightV3Apply({
     }
   };
 
+  const executePlannedExactScopeRemoval = async ({ prefix, entry }) => {
+    currentOperation = {
+      key: prefix,
+      publication_stage: "sos_light_exact_v3_scope_removal",
+    };
+    const existing = await adapters.listAllObjects({
+      r2,
+      prefix: `${prefix}/`,
+      max_keys: 10_000,
+    });
+    const keys = existing.map((object) => normalizedKey(object.key)).sort();
+    const sidecar = persistence.writeDeletedKeysSidecar({ prefix, keys });
+    Object.assign(entry, {
+      status: "deleting",
+      deletion_started_at_utc: new Date().toISOString(),
+      ...sidecar,
+    });
+    persistence.appendEvent({
+      event_type: "exact_v3_scope_deletion_started",
+      prefix,
+      ...mutationContext(prefix, "sos_light_exact_v3_scope_removal"),
+      status: "started",
+      deleted_object_count: keys.length,
+      deleted_keys_sha256: sidecar.deleted_keys_sha256,
+    });
+    persistence.flush();
+    if (keys.length) await adapters.deleteObjects({ r2, keys });
+    const remaining = await adapters.listAllObjects({
+      r2,
+      prefix: `${prefix}/`,
+      max_keys: 10_000,
+    });
+    if (remaining.length) {
+      throw new Error(`SOS-light-v3 exact scope deletion verification failed: ${prefix}`);
+    }
+    Object.assign(entry, {
+      status: "verified",
+      deletion_verified: true,
+      deleted_object_count: keys.length,
+      deletion_completed_at_utc: new Date().toISOString(),
+    });
+    counts.completed_deletions += 1;
+    counts.deleted_objects += keys.length;
+    reportProgress("canonical_v3_exact_scope_deletion_completed");
+    persistence.appendEvent({
+      event_type: "exact_v3_scope_deletion_verified",
+      prefix,
+      ...mutationContext(prefix, "sos_light_exact_v3_scope_removal"),
+      status: "verified",
+      deleted_object_count: keys.length,
+      deleted_keys_sha256: sidecar.deleted_keys_sha256,
+    });
+    persistence.flush();
+  };
+
   try {
+    // Freeze and validate the complete publication schedule before the first
+    // R2 DELETE/PUT. Apply never discovers or adds objects from live R2.
+    const orderedObjects = [
+      ...days.flatMap((day) => publicationPartitions.ordered_by_day.get(day)),
+      ...publicationPartitions.ordered_shared_tail,
+    ];
     writeCompleteRunState();
     persistence.appendEvent({
       event_type: "canonical_apply_started",
@@ -631,24 +1026,68 @@ export async function runPersistedSosLightV3Apply({
     });
     persistence.flush();
     checkpoint("fixed_v3_apply_intent_before_first_mutation");
-    runState.apply.canonical_v3_writer_invoked = true;
-    const writerResult = await executeWriter({
-      getObject: trackedGetObject,
-      putObject: trackedPutObject,
-      putIfChanged: trackedPutIfChanged,
-      putAndVerifyParquet,
-      recordDurableEvidence,
-      prepareCompleteDayReplacement,
-    });
-    if (writerResult?.ok !== true || pendingByKey.size !== 0) {
-      throw new Error(
-        pendingByKey.size
-          ? "SOS-light-v3 writer returned with unverified publications"
-          : "SOS-light-v3 canonical writer did not report success",
-      );
+    reportProgress("canonical_v3_apply_started", true);
+    const publishObject = async (object) => {
+      if (object.key.endsWith(".parquet")) {
+        await trackedPutAndVerifyParquet(object);
+        return;
+      }
+      await verifyLiveObservationPartition({
+        r2,
+        runState,
+        object,
+        adapters: { ...adapters, getObject },
+        persistence,
+        verifiedBodyCache,
+      });
+      await trackedPutObject({
+        key: object.key,
+        body: object.body,
+        content_type: object.entry.content_type,
+        entry: object.entry,
+      }, object.entry.publication_stage);
+      await trackedGetObject({ key: object.key });
+    };
+    for (const day of days) {
+      activeDayUtc = day;
+      await prepareCompleteDayReplacement({ day_utc: day });
+      Object.assign(perDayStatus[day], {
+        status: "publishing",
+        publication_started: true,
+        mutation_started: true,
+      });
+      runState.apply.current_phase = "canonical_v3_day_publication";
+      checkpoint("before_complete_day_publication");
+      for (const object of publicationPartitions.ordered_by_day.get(day)) {
+        await publishObject(object);
+      }
+      Object.assign(perDayStatus[day], {
+        status: "day_parent_verified",
+        day_parent_verified: true,
+        completed_publication_level: "day_parent_verified",
+      });
+      progressState.last_completed_day_utc = day;
+      verifiedBodyCache.clear("selected_day_complete");
+      checkpoint("after_complete_day_publication_verification");
+      activeDayUtc = null;
     }
-    counts.planned_writes = publicationEvidence.length;
-    counts.planned_post_put_verifications = publicationEvidence.length;
+    runState.apply.current_phase = "canonical_v3_shared_tail";
+    reportProgress("canonical_v3_shared_tail_started", true);
+    for (const removal of exactScopeRemovalPrefixes) {
+      await executePlannedExactScopeRemoval(removal);
+    }
+    for (const object of publicationPartitions.ordered_shared_tail) {
+      await publishObject(object);
+    }
+    if (pendingByKey.size !== 0) {
+      throw new Error("SOS-light-v3 frozen proposal returned with unverified publications");
+    }
+    const writerResult = {
+      ok: true,
+      status: "frozen_proposal_applied",
+      object_count: orderedObjects.length,
+      authority: "dropbox_baseline_plus_repair_overlay",
+    };
     runState.apply.current_phase = "canonical_v3_apply_completed";
     progressState.status = "succeeded";
     progressState.current_phase = runState.apply.current_phase;
@@ -656,11 +1095,6 @@ export async function runPersistedSosLightV3Apply({
     progressState.current_deletion_prefix = null;
     progressState.current_publication_stage = "complete";
     progressState.last_completed_day_utc = days.at(-1) || null;
-    for (const day of days) {
-      perDayStatus[day].status = "day_parent_verified";
-      perDayStatus[day].day_parent_verified = true;
-      perDayStatus[day].completed_publication_level = "day_parent_verified";
-    }
     persistence.appendEvent({
       event_type: "canonical_apply_completed",
       publication_stage: "complete",
@@ -675,9 +1109,11 @@ export async function runPersistedSosLightV3Apply({
       status: "succeeded",
       finished_at_utc: new Date().toISOString(),
       v3_publication_evidence: publicationEvidence,
+      verified_get_body_cache: verifiedBodyCache.snapshot(),
       canonical_v3_writer_result: writerResult,
     };
     writeCompleteRunState();
+    reportProgress("canonical_v3_apply_completed", true);
     return {
       ok: true,
       status: "succeeded",
@@ -687,6 +1123,13 @@ export async function runPersistedSosLightV3Apply({
     };
   } catch (error) {
     counts.failed_operations += 1;
+    reportProgress("canonical_v3_apply_failed", true);
+    verifiedBodyCache.clear("apply_failure");
+    if (activeDayUtc && perDayStatus[activeDayUtc]) {
+      perDayStatus[activeDayUtc].status = "failed";
+      perDayStatus[activeDayUtc].error =
+        error instanceof Error ? error.message : String(error);
+    }
     progressState.status = "failed";
     progressState.current_phase = "canonical_v3_apply_failed";
     runState.apply.current_phase = progressState.current_phase;
@@ -713,6 +1156,11 @@ export async function runPersistedSosLightV3Apply({
     } catch (failure) {
       checkpointError = failure instanceof Error ? failure.message : String(failure);
     }
+    const failedDayIndex = activeDayUtc ? days.indexOf(activeDayUtc) : -1;
+    const expectedLaterDays = failedDayIndex >= 0 ? days.slice(failedDayIndex + 1) : [];
+    const untouchedLaterDays = expectedLaterDays.filter(
+      (day) => perDayStatus[day]?.mutation_started !== true,
+    );
     runState.apply = {
       ...runState.apply,
       ...counts,
@@ -720,6 +1168,7 @@ export async function runPersistedSosLightV3Apply({
       error: error instanceof Error ? error.message : String(error),
       finished_at_utc: new Date().toISOString(),
       v3_publication_evidence: publicationEvidence,
+      verified_get_body_cache: verifiedBodyCache.snapshot(),
       canonical_v3_writer_result: null,
       failure_checkpoint: {
         attempted: true,
@@ -733,9 +1182,12 @@ export async function runPersistedSosLightV3Apply({
             publication_stage: currentOperation.publication_stage,
           }
         : null,
-      later_selected_days_untouched: true,
-      untouched_later_selected_days: days.filter(
-        (day) => perDayStatus[day]?.status === "not_started",
+      later_selected_days_untouched:
+        untouchedLaterDays.length === expectedLaterDays.length,
+      untouched_later_selected_days: untouchedLaterDays,
+      expected_later_selected_days: expectedLaterDays,
+      untouched_selected_days: days.filter(
+        (day) => perDayStatus[day]?.mutation_started !== true,
       ),
     };
     writeCompleteRunState();
