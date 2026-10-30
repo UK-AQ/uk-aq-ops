@@ -467,7 +467,7 @@ def _record_dashboard_supabase_response(
         if row is None:
             row = {
                 "bucket_minute": bucket_minute,
-                "env_name": str(os.getenv("UKAQ_ENV_NAME") or "TEST").strip() or "TEST",
+                "env_name": str(os.getenv("UK_AQ_ENV_NAME") or "TEST").strip() or "TEST",
                 "project_ref": identity["project_ref"],
                 "service_name": "dashboard.dev",
                 "source_type": "supabase_postgrest",
@@ -1774,7 +1774,7 @@ def _fetch_service_egress_metrics() -> Tuple[List[Dict[str, Any]], Optional[str]
                     "response_bytes_est,upstream_bytes_est,duration_ms,error_count,notes"
                 ),
                 "bucket_minute": f"gte.{_to_postgrest_ts(now - timedelta(hours=24))}",
-                "env_name": f"eq.{str(os.getenv('UKAQ_ENV_NAME') or 'TEST').strip() or 'TEST'}",
+                "env_name": f"eq.{str(os.getenv('UK_AQ_ENV_NAME') or 'TEST').strip() or 'TEST'}",
                 "order": "bucket_minute.asc",
             },
             page_size=METRICS_VIEW_PAGE_SIZE,
@@ -4495,6 +4495,24 @@ def _build_storage_coverage_payload(
 class DashboardHandler(BaseHTTPRequestHandler):
     server_version = "uk-aq-dashboard/1.0"
 
+    def parse_request(self) -> bool:
+        if not super().parse_request():
+            return False
+        if urlparse(self.path).path == '/api/media/d1-usage':
+            from uk_aq_dashboard_media_d1_usage import serve_d1_usage
+            # Authenticate all methods before the optional bearer gate, Media
+            # forwarding and compatibility/MySQL caches, including localhost.
+            serve_d1_usage(self)
+            return False
+        from uk_aq_dashboard_accounts import is_accounts_path, serve_accounts_request
+
+        if is_accounts_path(urlparse(self.path).path):
+            # Intercept every HTTP method before optional upstream bearer auth,
+            # Media facade dispatch, MySQL products or existing cache handlers.
+            serve_accounts_request(self, _postgrest_headers)
+            return False
+        return True
+
     @staticmethod
     def _is_client_disconnect_error(exc: Exception) -> bool:
         if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
@@ -4523,6 +4541,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "/ingest/": "/ingest",
                 "/ops/": "/ops",
                 "/media/": "/media",
+                "/accounts/": "/accounts",
             }
             if parsed.path in dashboard_redirects:
                 location = dashboard_redirects[parsed.path]
@@ -4533,7 +4552,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 return
-            if parsed.path in ("/", "/index.html", "/ingest", "/ops", "/media"):
+            if parsed.path in ("/", "/index.html", "/ingest", "/ops", "/media", "/accounts"):
                 self._serve_html()
                 return
             if parsed.path == "/favicon.ico":

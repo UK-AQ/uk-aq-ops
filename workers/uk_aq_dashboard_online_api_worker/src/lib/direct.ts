@@ -1,3 +1,4 @@
+import { AccountsSourceError, accountsReadStage, readAccountsJson } from "./accounts_diagnostics";
 import { assertHistoryPayload, historyResolution, type HistoryResolution } from "./history_generation";
 import { buildJsonResponse, errorEnvelope } from "./http";
 import type { WorkerEnv } from "./upstream";
@@ -361,10 +362,32 @@ async function fetchJsonObject(
   init?: RequestInit,
   errLabel?: string,
   metricEnv?: WorkerEnv,
+  maxResponseBytes = 0,
 ): Promise<JsonObject> {
   const startedAt = Date.now();
   const response = await fetch(url, init);
-  const text = await response.text();
+  let text: string;
+  if (maxResponseBytes && response.body) {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let bytes = 0;
+    text = '';
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        bytes += value.byteLength;
+        if (bytes > maxResponseBytes) {
+          await reader.cancel();
+          throw new Error('Read response exceeds allowed size');
+        }
+        text += decoder.decode(value, { stream: true });
+      }
+      text += decoder.decode();
+    } finally { reader.releaseLock(); }
+  } else {
+    text = await response.text();
+  }
   if (metricEnv) {
     recordDashboardSupabaseResponse(metricEnv, url, response, text, Date.now() - startedAt);
   }
@@ -385,6 +408,41 @@ async function fetchJsonObject(
     throw new Error(`${errLabel || "Request failed"} returned non-object JSON payload.`);
   }
   return parsed as JsonObject;
+}
+
+// Reuse the IngestDB PostgREST connection, never the ObsAQIDB Daily Tasks adapter.
+// The RPC owns validation/projection/grants; its body is not a URL or telemetry label.
+export function readAccountsSubscriptions(env: WorkerEnv, query: Record<string, unknown>): Promise<JsonObject> {
+  return accountsSubscriptionRpc(env, 'uk_aq_news_subscriptions_admin_read', { p_query: query });
+}
+
+export function writeAccountsSubscription(env: WorkerEnv, request: Record<string, unknown>): Promise<JsonObject> {
+  return accountsSubscriptionRpc(env, 'uk_aq_news_subscriptions_admin_write', { p_request: request });
+}
+
+async function accountsSubscriptionRpc(env: WorkerEnv,
+  name: 'uk_aq_news_subscriptions_admin_read' | 'uk_aq_news_subscriptions_admin_write',
+  body: Record<string, unknown>): Promise<JsonObject> {
+  const request = await accountsReadStage('SUPABASE_REQUEST_CONSTRUCTION', () => {
+    const headers = postgrestHeaders(requireServiceKey(env), defaultPublicSchema(env), true);
+    headers.set('Content-Type', 'application/json');
+    headers.set('Accept', 'application/json');
+    return new Request(`${ingestRestBase(env)}/rpc/${name}`, {
+      method: 'POST', headers, body: JSON.stringify(body), cache: 'no-store',
+      // Workers supports manual/follow, not redirect: 'error'. Never follow a redirect with credentials.
+      redirect: 'manual', signal: AbortSignal.timeout(15000),
+    });
+  });
+  const response = await accountsReadStage('SUPABASE_FETCH', () => fetch(request));
+  if (!response.ok) {
+    await response.body?.cancel().catch(() => undefined);
+    throw new AccountsSourceError('SUPABASE_HTTP_REJECTED', response.status);
+  }
+  const result = await readAccountsJson(response, 'SUPABASE');
+  if (!result || typeof result !== 'object' || Array.isArray(result)) {
+    throw new AccountsSourceError('SUPABASE_RESPONSE_VALIDATION');
+  }
+  return result as JsonObject;
 }
 
 async function fetchJsonArray(
@@ -1653,7 +1711,7 @@ async function fetchServiceEgressMetrics(env: WorkerEnv): Promise<{ rows: unknow
       {
         select: "bucket_minute,env_name,project_ref,service_name,source_type,source_name,route_name,query_name,window_label,status,request_count,response_rows,response_bytes_est,upstream_bytes_est,duration_ms,error_count,notes",
         bucket_minute: `gte.${toPostgrestTimestamp(since)}`,
-        env_name: `eq.${String(env.UKAQ_ENV_NAME || "TEST").trim() || "TEST"}`,
+        env_name: `eq.${String(env.UK_AQ_ENV_NAME || "TEST").trim() || "TEST"}`,
         order: "bucket_minute.asc",
       },
       1000,

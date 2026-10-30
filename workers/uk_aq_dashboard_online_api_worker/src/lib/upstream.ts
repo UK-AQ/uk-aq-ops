@@ -2,6 +2,13 @@ import type { HistoryResolution } from "./history_generation";
 import { errorEnvelope, withCorsAndCacheControl, withCorsAndNoStore } from "./http";
 
 export type WorkerEnv = {
+  UK_AQ_MEDIA_CLOUDFLARE_ACCOUNT_ID?: string;
+  UK_AQ_MEDIA_CFLARE_D1DB_ID?: string;
+  UK_AQ_MEDIA_D1_ANALYTICS_TOKEN?: string;
+  UK_AQ_MEDIA_D1_DAILY_READ_LIMIT?: string;
+  UK_AQ_MEDIA_D1_DAILY_WRITE_LIMIT?: string;
+  UK_AQ_MEDIA_D1_WARNING_PERCENT?: string;
+  UK_AQ_MEDIA_D1_CRITICAL_PERCENT?: string;
   historyResolution?: HistoryResolution;
   DASHBOARD_UPSTREAM_BASE_URL?: string;
   DASHBOARD_UPSTREAM_BEARER_TOKEN?: string;
@@ -10,7 +17,7 @@ export type WorkerEnv = {
   SB_SECRET_KEY?: string;
   OBS_AQIDB_SUPABASE_URL?: string;
   OBS_AQIDB_SECRET_KEY?: string;
-  UKAQ_ENV_NAME?: string;
+  UK_AQ_ENV_NAME?: string;
   UK_AQ_SERVICE_EGRESS_METRICS_ENABLED?: string;
   UK_AQ_CORE_SCHEMA?: string;
   UK_AQ_PUBLIC_SCHEMA?: string;
