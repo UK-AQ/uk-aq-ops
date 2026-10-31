@@ -83,10 +83,20 @@ async function refreshFeed(env) {
       throw new Error("Blog feed KV binding is unavailable");
     }
 
-    const response = await env.BROWSER.quickAction("content", {
-      url: FEED_URL,
-      gotoOptions: { waitUntil: "domcontentloaded", timeout: 30_000 },
-    });
+    // Vary the navigation URL per refresh while retaining the canonical RSS source.
+    const feedUrl = new URL(FEED_URL);
+    feedUrl.searchParams.set("_uk_aq_refresh", crypto.randomUUID());
+
+    let response;
+    try {
+      response = await env.BROWSER.quickAction("content", {
+        url: feedUrl.href,
+        gotoOptions: { waitUntil: "domcontentloaded", timeout: 30_000 },
+      });
+    } catch {
+      // Browser Run exceptions may include the full navigation URL.
+      throw new Error("Browser Run content action failed");
+    }
     if (!response || typeof response.text !== "function") {
       throw new Error("Browser Run returned an unexpected response");
     }
@@ -96,14 +106,21 @@ async function refreshFeed(env) {
 
     const rendered = await readBrowserRunRenderedContent(response);
     const rssSource = extractRssSource(rendered);
-    const candidate = normaliseRss(rssSource);
+    const diagnostics = {};
+    const candidate = normaliseRss(rssSource, diagnostics);
     validateNormalisedFeed(candidate);
 
     const payload = JSON.stringify(candidate);
     await env.BLOG_FEED_KV.put(KV_KEY, payload);
 
     return jsonResponse(
-      { ok: true, contract_version: candidate.contract_version, post_count: candidate.posts.length },
+      {
+        ok: true,
+        contract_version: candidate.contract_version,
+        post_count: candidate.posts.length,
+        source_last_build_date: diagnostics.lastBuildDate,
+        newest_post_description_chars: candidate.posts[0].description.length,
+      },
       200,
       { "cache-control": "no-store" },
     );
@@ -214,32 +231,74 @@ async function readBoundedText(response, maximumBytes, label) {
 
 function extractRssSource(rendered) {
   const marker = /<([a-z][\w:-]*)\b[^>]*\bid\s*=\s*(["'])webkit-xml-viewer-source-xml\2[^>]*>/i.exec(rendered);
-  if (!marker) {
-    throw new Error("Chromium XML viewer source marker was not found");
+  const sourceRegion = marker ? rendered.slice(marker.index + marker[0].length) : rendered;
+  if (marker) {
+    const rawRssStart = sourceRegion.search(/<rss\b/i);
+    if (rawRssStart >= 0) return sourceRegion.slice(rawRssStart);
   }
-
-  const sourceRegion = rendered.slice(marker.index + marker[0].length);
-  const rawRssStart = sourceRegion.search(/<rss\b/i);
-  if (rawRssStart >= 0) return sourceRegion.slice(rawRssStart);
 
   const escapedRssStart = sourceRegion.search(/&lt;rss\b/i);
   if (escapedRssStart < 0) {
-    throw new Error("Chromium XML viewer did not contain an RSS document");
+    throw new Error(`Browser Run did not contain an escaped RSS document (${describeRenderedSource(rendered)})`);
   }
   const escapedRssEnd = sourceRegion.toLowerCase().indexOf("&lt;/rss&gt;", escapedRssStart);
   if (escapedRssEnd < 0) {
-    throw new Error("Chromium XML viewer contained an incomplete escaped RSS document");
+    throw new Error("Browser Run contained an incomplete escaped RSS document");
   }
   const escaped = sourceRegion.slice(escapedRssStart, escapedRssEnd + "&lt;/rss&gt;".length);
+  if (!marker) {
+    const surroundingHtml = sourceRegion.slice(0, escapedRssStart)
+      + sourceRegion.slice(escapedRssEnd + "&lt;/rss&gt;".length);
+    // Accept one contiguous escaped document, without HTML interleaved in its source.
+    // Check challenge hints only outside it so article text cannot trigger rejection.
+    if (
+      escaped.includes("<")
+      || /&lt;rss\b/i.test(escaped.slice(1))
+      || /&lt;\/?rss\b/i.test(surroundingHtml)
+      || /cf-chl|challenge-platform|just a moment|checking your browser|too many requests|captcha/i.test(surroundingHtml)
+    ) {
+      throw new Error(`Browser Run contained an unsafe escaped RSS document (${describeRenderedSource(rendered)})`);
+    }
+  }
+  // Remove exactly the HTML escaping layer; XML entities are handled by the parser.
   return decodeHtmlSource(escaped);
 }
 
-function normaliseRss(rssSource) {
+// Report only fixed classifications and sizes, never rendered RSS/HTML, URLs or headers.
+function describeRenderedSource(rendered) {
+  const beginning = rendered.trimStart().slice(0, 256);
+  const kind = /^<\?xml\b/i.test(beginning) || /^<rss(?:\s|>)/i.test(beginning)
+    ? "xml"
+    : /^<!doctype\s+html\b/i.test(beginning) || /^<html\b/i.test(beginning)
+      ? "html"
+      : "other";
+  const flags = [
+    "kind=" + kind,
+    "chars=" + rendered.length,
+    "raw_rss=" + Number(/<rss(?:\s|>)/i.test(rendered)),
+    "escaped_rss=" + Number(/&lt;rss(?:\s|&gt;)/i.test(rendered)),
+    "html_markup=" + Number(/<!doctype\s+html\b|<html\b/i.test(rendered)),
+    "xml_viewer_hint=" + Number(/(?:webkit-)?xml-viewer/i.test(rendered)),
+    "challenge_hint=" + Number(/cf-chl|challenge-platform|just a moment|checking your browser|too many requests|captcha/i.test(rendered)),
+  ];
+  return flags.join(",");
+}
+
+function normaliseRss(rssSource, diagnostics = null) {
   const root = parseXmlDocument(rssSource);
   if (root.name !== "rss") throw new Error("Feed root is not rss");
 
   const channel = childElements(root, "channel")[0];
   if (!channel) throw new Error("RSS channel is missing");
+
+  // Diagnostic only: the RSS publication date is not part of the normalised feed.
+  if (diagnostics) {
+    const rawDate = childText(channel, "lastBuildDate").trim();
+    const timestamp = rawDate ? Date.parse(rawDate) : NaN;
+    diagnostics.lastBuildDate = Number.isFinite(timestamp)
+      ? new Date(timestamp).toISOString()
+      : null;
+  }
 
   normalisePlainText(childText(channel, "title"), LIMITS.titleLength, "channel title");
   const channelLink = childText(channel, "link").trim();

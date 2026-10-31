@@ -126,7 +126,7 @@ dry_run = false
 notes = "GDELT Web NGrams Media discovery"
 
 [jobs.uk_aq_blog_refresh]
-enabled = false
+enabled = true
 cron_expr = "20 6 * * *"
 target_type = "github_workflow"
 github_repo = "UK-AQ/uk-aq.github.io"
@@ -141,7 +141,7 @@ refresh_blog_feed = "true"
 
 # AQ News by Email: staged for LIVE activation.
 [jobs.uk_aq_media_news_email]
-enabled = false
+enabled = true
 cron_expr = "*/5 * * * *"
 target_type = "worker_http"
 worker_http_url = "https://uk-aq-media-email.uk-aq-media.workers.dev/scheduler/run"
