@@ -3,6 +3,7 @@ import { assertHistoryPayload, historyResolution, type HistoryResolution } from 
 import { buildJsonResponse, errorEnvelope } from "./http";
 import type { WorkerEnv } from "./upstream";
 import { recordDashboardSupabaseResponse } from "./service_egress_metrics";
+import { billingConfigurationKey, billingConfigurationValid, billingPeriodError, billingTimestamp, fetchR2BillingPeriod, guardR2Usage } from "./r2_billing_period";
 
 type JsonObject = Record<string, unknown>;
 
@@ -129,14 +130,14 @@ const HIERARCHICAL_MONTH_STATE_KIND =
   "uk_aq_r2_history_backup_state_observations_month";
 
 const R2_OPS_GQL_QUERY = `
-query R2OpsMonth($accountTag: string!, $startDate: Time!, $endDate: Time!) {
+query R2OpsBillingPeriod($accountTag: string!, $startDate: Time!, $endDate: Time!) {
   viewer {
     accounts(filter: { accountTag: $accountTag }) {
       r2OperationsAdaptiveGroups(
         limit: 10000
         filter: {
           datetime_geq: $startDate
-          datetime_leq: $endDate
+          datetime_lt: $endDate
         }
       ) {
         sum {
@@ -180,6 +181,7 @@ let storageCoverageCache: CacheEntry<{
   dropbox_backup_aqilevels_latest_day: string | null;
 }> | null = null;
 let r2UsageCache: CacheEntry<{ usage: JsonObject | null; error: string | null }> | null = null;
+let r2UsageBillingKey = "";
 let r2HistoryDaysCache: CacheEntry<{ daySets: R2DaySets | null; window: JsonObject | null; bucket: string | null; error: string | null; readVersion: R2HistoryReadVersionResolution }> | null = null;
 let r2HistoryDaysCacheVersionKey: string | null = null;
 let storageCoverageCacheVersionKey: string | null = null;
@@ -866,12 +868,23 @@ function clampPercent(value: number): number {
 }
 
 async function fetchR2OperationsMetrics(
+  env: WorkerEnv,
   accountId: string,
   apiToken: string,
-  now: Date,
 ): Promise<{ metrics: JsonObject | null; error: string | null }> {
-  const windowEnd = new Date(now.getTime());
-  const windowStart = new Date(Date.UTC(windowEnd.getUTCFullYear(), windowEnd.getUTCMonth(), 1, 0, 0, 0, 0));
+  let period: JsonObject;
+  try { period = await fetchR2BillingPeriod(env, accountId, apiToken); }
+  catch (error) { return { metrics: null, error: (error as Error).message }; }
+  const periodProblem = billingPeriodError(period, env);
+  if (periodProblem) return { metrics: period, error: periodProblem }; // Keep start-only provenance, withhold operations.
+  const windowEnd = new Date();
+  const windowStart = new Date(billingTimestamp(period.billing_period_start_utc));
+  if (!(windowStart.getTime() <= windowEnd.getTime() && windowEnd.getTime() < billingTimestamp(period.billing_period_end_utc))) {
+    return { metrics: null, error: "R2 billing period changed before operations query; refresh required" };
+  }
+  if (windowEnd.getTime() - windowStart.getTime() > 31 * 86400_000) {
+    return { metrics: null, error: "R2 billing-period query exceeds Cloudflare's 31-day analytics range" };
+  }
   const headers = new Headers();
   headers.set("Authorization", `Bearer ${apiToken}`);
   headers.set("Content-Type", "application/json");
@@ -956,8 +969,12 @@ async function fetchR2OperationsMetrics(
     }
   }
 
+  if (billingPeriodError(period, env)) {
+    return { metrics: null, error: "R2 billing period changed during operations query; refresh required" };
+  }
   return {
     metrics: {
+      ...period,
       class_a_requests: classARequests,
       class_b_requests: classBRequests,
       unclassified_requests: unclassifiedRequests,
@@ -970,10 +987,11 @@ async function fetchR2OperationsMetrics(
 }
 
 async function fetchR2Usage(env: WorkerEnv, forceRefresh = false): Promise<{ usage: JsonObject | null; error: string | null }> {
+  const billingKey = billingConfigurationKey(env);
   if (!forceRefresh) {
     const cached = cacheGet(r2UsageCache);
-    if (cached) {
-      return cached;
+    if (cached && r2UsageBillingKey === billingKey) {
+      return { ...cached, usage: guardR2Usage(cached.usage, env) };
     }
   }
 
@@ -984,7 +1002,8 @@ async function fetchR2Usage(env: WorkerEnv, forceRefresh = false): Promise<{ usa
       usage: null,
       error: "Missing UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID/CLOUDFLARE_ACCOUNT_ID or UK_AQ_R2_CLOUDFLARE_API_TOKEN/CFLARE_API_READ_TOKEN",
     };
-    r2UsageCache = { value, expiresAt: Date.now() + R2_USAGE_TTL_MS };
+    r2UsageCache = { value, expiresAt: Date.now() + 60_000 };
+    r2UsageBillingKey = billingKey;
     return value;
   }
 
@@ -1020,7 +1039,7 @@ async function fetchR2Usage(env: WorkerEnv, forceRefresh = false): Promise<{ usa
     const freeBytes = freeTierGb * R2_BYTES_PER_GB;
     const classAFree = 1_000_000;
     const classBFree = 10_000_000;
-    const opsMetrics = await fetchR2OperationsMetrics(accountId, apiToken, now);
+    const opsMetrics = await fetchR2OperationsMetrics(env, accountId, apiToken);
     const usage: JsonObject = {
       standard_used_bytes: Math.max(0, Math.round(selected.used_bytes)),
       standard_used_gb: Math.max(0, selected.used_bytes) / R2_BYTES_PER_GB,
@@ -1038,11 +1057,18 @@ async function fetchR2Usage(env: WorkerEnv, forceRefresh = false): Promise<{ usa
       class_ops_window_start_utc: null,
       class_ops_window_end_utc: null,
       class_ops_error: opsMetrics.error,
+      billing_period_error: opsMetrics.error,
+      billing_period_status: "unavailable",
       storage_source: "cloudflare_r2_account_metrics",
       source: "cloudflare_r2_account_metrics",
       as_of_utc: now.toISOString(),
     };
     if (opsMetrics.metrics) {
+      for (const [key, value] of Object.entries(opsMetrics.metrics)) {
+        if (key.startsWith("billing_period_")) usage[key] = value;
+      }
+    }
+    if (opsMetrics.metrics && !opsMetrics.error) {
       const classAUsed = Math.max(0, Math.round(readNumber(opsMetrics.metrics.class_a_requests, 0)));
       const classBUsed = Math.max(0, Math.round(readNumber(opsMetrics.metrics.class_b_requests, 0)));
       usage.class_a_used_requests = classAUsed;
@@ -1056,12 +1082,16 @@ async function fetchR2Usage(env: WorkerEnv, forceRefresh = false): Promise<{ usa
       usage.class_ops_window_start_utc = String(opsMetrics.metrics.window_start_utc || "") || null;
       usage.class_ops_window_end_utc = String(opsMetrics.metrics.window_end_utc || "") || null;
     }
-    const value = { usage, error: null };
-    r2UsageCache = { value, expiresAt: Date.now() + R2_USAGE_TTL_MS };
+    const value = { usage: guardR2Usage(usage, env), error: null };
+    const freshUntil = billingTimestamp(usage.billing_period_fresh_until_utc);
+    const ttl = billingConfigurationValid(env) && billingPeriodError(usage, env) ? 60_000 : R2_USAGE_TTL_MS;
+    r2UsageCache = { value, expiresAt: Math.min(Date.now() + ttl, freshUntil > Date.now() ? freshUntil : Infinity) };
+    r2UsageBillingKey = billingKey;
     return value;
   } catch (err) {
     const value = { usage: null, error: err instanceof Error ? err.message : String(err) };
-    r2UsageCache = { value, expiresAt: Date.now() + R2_USAGE_TTL_MS };
+    r2UsageCache = { value, expiresAt: Date.now() + 60_000 };
+    r2UsageBillingKey = billingKey;
     return value;
   }
 }
@@ -2111,7 +2141,7 @@ function dashboardCacheKey(search: URLSearchParams, env: WorkerEnv): string {
   const includeMetric = asBoolFlag(search.get("include_metric_context"), true) ? "1" : "0";
   const includeIngest = asBoolFlag(search.get("include_ingest_context"), true) ? "1" : "0";
   const storageKey = includeStorage === "1" ? storageCoverageCacheKey(env) : "storage_coverage:disabled";
-  return `${r2HistoryReadVersionCacheKey(env)}|storage=${includeStorage}|metric=${includeMetric}|ingest=${includeIngest}|${storageKey}`;
+  return `${r2HistoryReadVersionCacheKey(env)}|${billingConfigurationKey(env)}|storage=${includeStorage}|metric=${includeMetric}|ingest=${includeIngest}|${storageKey}`;
 }
 
 export async function getDirectDashboardPayload(
@@ -2123,7 +2153,7 @@ export async function getDirectDashboardPayload(
   if (!forceRefresh) {
     const cached = dashboardCache.get(cacheKey);
     if (cached && Date.now() <= cached.expiresAt) {
-      return cached.value;
+      return { ...cached.value, r2_usage: guardR2Usage(cached.value.r2_usage, env) };
     }
   }
 
@@ -2138,7 +2168,9 @@ export async function getDirectDashboardPayload(
     payload.r2_domain_size_metrics = [];
     payload.r2_domain_size_metrics_error = "Historical domain byte metrics have no generation identity; unavailable for v3";
   }
-  dashboardCache.set(cacheKey, { value: payload, expiresAt: Date.now() + DASHBOARD_TTL_MS });
+  const freshUntil = billingTimestamp(payload.r2_usage?.billing_period_fresh_until_utc);
+  dashboardCache.set(cacheKey, { value: payload, expiresAt: Math.min(Date.now() + DASHBOARD_TTL_MS, Number.isFinite(freshUntil) ? freshUntil : Infinity) });
+  payload.r2_usage = guardR2Usage(payload.r2_usage, env);
   return payload;
 }
 
