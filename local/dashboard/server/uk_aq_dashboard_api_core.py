@@ -141,8 +141,6 @@ STORAGE_COVERAGE_CACHE_STATE: Dict[str, Any] = {
     "dropbox_state_info": None,
     "dropbox_backup_observations_earliest_day": None,
     "dropbox_backup_observations_latest_day": None,
-    "dropbox_backup_aqilevels_earliest_day": None,
-    "dropbox_backup_aqilevels_latest_day": None,
 }
 DROPBOX_HISTORY_MTIME_CACHE_STATE: Dict[str, Any] = {
     "payload": None,
@@ -295,8 +293,6 @@ def _invalidate_dashboard_cache(clear_storage_coverage: bool = False) -> None:
             STORAGE_COVERAGE_CACHE_STATE["dropbox_state_info"] = None
             STORAGE_COVERAGE_CACHE_STATE["dropbox_backup_observations_earliest_day"] = None
             STORAGE_COVERAGE_CACHE_STATE["dropbox_backup_observations_latest_day"] = None
-            STORAGE_COVERAGE_CACHE_STATE["dropbox_backup_aqilevels_earliest_day"] = None
-            STORAGE_COVERAGE_CACHE_STATE["dropbox_backup_aqilevels_latest_day"] = None
             R2_HISTORY_DAYS_CACHE_STATE["day_sets"] = None
             R2_HISTORY_DAYS_CACHE_STATE["window"] = None
             R2_HISTORY_DAYS_CACHE_STATE["bucket"] = None
@@ -1903,10 +1899,7 @@ def _fetch_daily_task_runs_dashboard_rows(
 
 
 def _empty_dropbox_backup_days() -> Dict[str, Set[date]]:
-    return {
-        "observations": set(),
-        "aqilevels": set(),
-    }
+    return {"observations": set()}
 
 
 def _normalize_dropbox_path(raw: str) -> str:
@@ -1935,12 +1928,9 @@ def _dropbox_day_bounds(days: Set[date]) -> Tuple[Optional[str], Optional[str]]:
 
 def _dropbox_backup_days_diagnostics(days: Dict[str, Set[date]]) -> Dict[str, Optional[str]]:
     obs_earliest, obs_latest = _dropbox_day_bounds(set(days.get("observations") or set()))
-    aqi_earliest, aqi_latest = _dropbox_day_bounds(set(days.get("aqilevels") or set()))
     return {
         "dropbox_backup_observations_earliest_day": obs_earliest,
         "dropbox_backup_observations_latest_day": obs_latest,
-        "dropbox_backup_aqilevels_earliest_day": aqi_earliest,
-        "dropbox_backup_aqilevels_latest_day": aqi_latest,
     }
 
 
@@ -1961,7 +1951,7 @@ def _filter_dropbox_backup_days_for_read_version(
 
     filtered = _empty_dropbox_backup_days()
     warnings: List[str] = []
-    for domain_name in ("observations", "aqilevels"):
+    for domain_name in ("observations",):
         r2_days = set(r2_history_days.get(domain_name) or set())
         raw_days = set(dropbox_days.get(domain_name) or set())
         filtered[domain_name] = raw_days & r2_days
@@ -2284,7 +2274,7 @@ def _latest_oldest_day_by_schema(
     latest_rows: Dict[str, Tuple[datetime, Optional[date]]] = {}
     for row in schema_size_metrics or []:
         schema_name = str((row or {}).get("schema_name") or "").strip().lower()
-        if schema_name not in {"uk_aq_observs", "uk_aq_aqilevels"}:
+        if schema_name != "uk_aq_observs":
             continue
         bucket_hour = _parse_timestamp((row or {}).get("bucket_hour"))
         recorded_at = _parse_timestamp((row or {}).get("recorded_at"))
@@ -2298,34 +2288,16 @@ def _latest_oldest_day_by_schema(
 
     return {
         "uk_aq_observs": latest_rows.get("uk_aq_observs", (UTC_DATETIME_MIN, None))[1],
-        "uk_aq_aqilevels": latest_rows.get("uk_aq_aqilevels", (UTC_DATETIME_MIN, None))[1],
     }
 
 
-def _latest_r2_domain_size_bytes(
-    r2_domain_size_metrics: Optional[List[Dict[str, Any]]],
-) -> Dict[str, int]:
-    latest_sizes: Dict[str, Tuple[datetime, int]] = {}
-    for row in r2_domain_size_metrics or []:
-        domain_name = str((row or {}).get("domain_name") or "").strip().lower()
-        if domain_name not in {"observations", "aqilevels"}:
-            continue
-        bucket_hour = _parse_timestamp((row or {}).get("bucket_hour"))
-        if bucket_hour is None:
-            continue
-        try:
-            size_bytes = int((row or {}).get("size_bytes"))
-        except (TypeError, ValueError):
-            continue
-        size_bytes = max(0, size_bytes)
-        current = latest_sizes.get(domain_name)
-        if current is None or bucket_hour >= current[0]:
-            latest_sizes[domain_name] = (bucket_hour, size_bytes)
-
-    return {
-        "observations": latest_sizes.get("observations", (UTC_DATETIME_MIN, 0))[1],
-        "aqilevels": latest_sizes.get("aqilevels", (UTC_DATETIME_MIN, 0))[1],
-    }
+def _storage_coverage_start_day(now: datetime, r2_history_days: Optional[Dict[str, Set[date]]]) -> date:
+    # Direct physical verification may constrain presence, never the API boundary.
+    days = (r2_history_days or {}).get("committed_observations", (r2_history_days or {}).get("observations"))
+    today_utc = now.astimezone(timezone.utc).date()
+    if not isinstance(days, set) or not days or any(type(day) is not date or day > today_utc for day in days):
+        raise RuntimeError("Storage calendar range unavailable: selected-generation R2 history has no valid committed observation days")
+    return min(days)
 
 
 def _build_live_storage_coverage_days(
@@ -2338,135 +2310,34 @@ def _build_live_storage_coverage_days(
     r2_history_days: Optional[Dict[str, Set[date]]],
     day_sets: Dict[str, Set[date]],
 ) -> List[Dict[str, Any]]:
-    now_utc = now.astimezone(timezone.utc)
-    today_utc = now_utc.date()
-    oldest_by_label = _latest_oldest_day_by_label(db_size_metrics)
-    oldest_by_schema = _latest_oldest_day_by_schema(schema_size_metrics)
+    today_utc = now.astimezone(timezone.utc).date()
+    ingest_days = day_sets.get("ingestdb")
+    observs_days = day_sets.get("obs_aqidb")
+    r2_days = (r2_history_days or {}).get("observations")
+    dropbox_days = (dropbox_backup_days or {}).get("observations")
 
-    ingest_days_raw = day_sets.get("ingestdb")
-    has_explicit_ingest_days = isinstance(ingest_days_raw, set)
-    ingest_days = set(ingest_days_raw or set()) if has_explicit_ingest_days else set()
-    observs_days_raw = day_sets.get("obs_aqidb")
-    has_explicit_observs_days = isinstance(observs_days_raw, set)
-    observs_days = set(observs_days_raw or set()) if has_explicit_observs_days else set()
-    aqilevels_days_raw = day_sets.get("obs_aqi_aqilevels")
-    has_explicit_aqilevels_days = isinstance(aqilevels_days_raw, set)
-    aqilevels_days = set(aqilevels_days_raw or set()) if has_explicit_aqilevels_days else set()
-
-    ingest_start = (
-        min(ingest_days)
-        if has_explicit_ingest_days and ingest_days
-        else (
-            None
-            if has_explicit_ingest_days
-            else oldest_by_label.get("ingestdb")
-        )
-    )
-    observs_start = (
-        min(observs_days)
-        if has_explicit_observs_days and observs_days
-        else (
-            None
-            if has_explicit_observs_days
-            else (
-                oldest_by_schema.get("uk_aq_observs")
-                or oldest_by_label.get("obs_aqidb")
-            )
-        )
-    )
-    aqilevels_start = (
-        min(aqilevels_days)
-        if has_explicit_aqilevels_days and aqilevels_days
-        else (
-            None
-            if has_explicit_aqilevels_days
-            else oldest_by_schema.get("uk_aq_aqilevels")
-        )
-    )
-    has_explicit_r2_days = isinstance(r2_history_days, dict)
-    r2_observs_days = set((r2_history_days or {}).get("observations") or set())
-    r2_aqilevels_days = set((r2_history_days or {}).get("aqilevels") or set())
-
-    if has_explicit_r2_days and r2_observs_days:
-        r2_start = min(r2_observs_days)
-        r2_end = max(r2_observs_days)
-    else:
-        # Per-day R2 presence is only valid from explicit history-days API results.
-        # Do not infer day presence from broad min/max windows.
-        r2_start = None
-        r2_end = None
-    dropbox_observs_days = set((dropbox_backup_days or {}).get("observations") or set())
-    dropbox_aqilevels_days = set((dropbox_backup_days or {}).get("aqilevels") or set())
-    dropbox_all_days = dropbox_observs_days | dropbox_aqilevels_days
-    dropbox_start = min(dropbox_all_days) if dropbox_all_days else None
-    dropbox_end = max(dropbox_all_days) if dropbox_all_days else None
-
-    lower_bounds = [day for day in [ingest_start, observs_start, aqilevels_start, r2_start, dropbox_start] if day]
-    if not lower_bounds:
-        return []
-    start_day = min(lower_bounds)
-    end_day = max(
-        day for day in [today_utc, r2_end, dropbox_end] if day is not None
-    )
+    # This boundary selects dates only; it never supplies database presence.
+    start_day = _storage_coverage_start_day(now, r2_history_days)
+    end_day = today_utc
 
     rows: List[Dict[str, Any]] = []
     cursor = start_day
     while cursor <= end_day:
-        ingest = bool(
-            cursor <= today_utc
-            and (
-                (cursor in ingest_days)
-                if has_explicit_ingest_days
-                else (ingest_start and ingest_start <= cursor <= today_utc)
-            )
-        )
-        observs = bool(
-            cursor <= today_utc
-            and (
-                (cursor in observs_days)
-                if has_explicit_observs_days
-                else (
-                    observs_start
-                    and observs_start <= cursor <= today_utc
-                )
-            )
-        )
-        obs_aqi_aqilevels = bool(
-            cursor <= today_utc
-            and (
-                (cursor in aqilevels_days)
-                if has_explicit_aqilevels_days
-                else (
-                    aqilevels_start
-                    and aqilevels_start <= cursor <= today_utc
-                )
-            )
-        )
-        r2_observs = bool(has_explicit_r2_days and cursor in r2_observs_days)
-        r2_aqilevels = bool(has_explicit_r2_days and cursor in r2_aqilevels_days)
-        if r2_observs:
-            # Top row is mutually exclusive: if archived in R2, do not show ingest red.
-            ingest = False
-        dropbox_observs = cursor in dropbox_observs_days
-        dropbox_aqilevels = cursor in dropbox_aqilevels_days
-
-        rows.append(
-            {
-                "date": cursor.isoformat(),
-                "ingest": ingest,
-                "observs": observs,
-                "r2": r2_observs,
-                "obs_aqi_observs": observs,
-                "obs_aqi_aqilevels": obs_aqi_aqilevels,
-                "r2_observs": r2_observs,
-                "r2_aqilevels": r2_aqilevels,
-                "dropbox_observs": dropbox_observs,
-                "dropbox_aqilevels": dropbox_aqilevels,
-                "isToday": cursor == today_utc,
-            }
-        )
+        ingest = (cursor in ingest_days and cursor <= today_utc) if isinstance(ingest_days, set) else None
+        observs = (cursor in observs_days and cursor <= today_utc) if isinstance(observs_days, set) else None
+        r2_observs = cursor in r2_days if isinstance(r2_days, set) else None
+        dropbox_observs = cursor in dropbox_days if isinstance(dropbox_days, set) else None
+        rows.append({
+            "date": cursor.isoformat(),
+            "ingest": ingest,
+            "observs": observs,
+            "r2": r2_observs,
+            "obs_aqi_observs": observs,
+            "r2_observs": r2_observs,
+            "dropbox_observs": dropbox_observs,
+            "isToday": cursor == today_utc,
+        })
         cursor += timedelta(days=1)
-
     return rows
 
 
@@ -2506,15 +2377,18 @@ def _get_storage_coverage_days_cached(
     dropbox_state_error: Optional[str] = None,
     dropbox_state_info: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
+    start_day = _storage_coverage_start_day(now, r2_history_days)
     cached_rows = _get_cached_storage_coverage_days(now)
-    if isinstance(cached_rows, list):
+    if (isinstance(cached_rows, list) and cached_rows
+            and cached_rows[0].get("date") == start_day.isoformat()
+            and cached_rows[-1].get("date") == now.astimezone(timezone.utc).date().isoformat()):
         return cached_rows
 
     now_utc = now.astimezone(timezone.utc)
     day_sets = _fetch_storage_day_sets(
         base_url=base_url,
         service_role_key=service_role_key,
-        db_size_metrics=db_size_metrics,
+        from_day=start_day,
         now=now_utc,
     )
     rows = _build_live_storage_coverage_days(
@@ -2522,7 +2396,7 @@ def _get_storage_coverage_days_cached(
         db_size_metrics=db_size_metrics,
         schema_size_metrics=schema_size_metrics,
         r2_domain_size_metrics=r2_domain_size_metrics,
-        dropbox_backup_days=dropbox_backup_days,
+        dropbox_backup_days=None if dropbox_state_error or not isinstance(r2_history_days, dict) else dropbox_backup_days,
         r2_backup_window=r2_backup_window,
         r2_history_days=r2_history_days,
         day_sets=day_sets,
@@ -2544,19 +2418,15 @@ def _get_storage_coverage_days_cached(
 def _fetch_ingest_observation_days(
     base_url: str,
     service_role_key: str,
-    db_size_metrics: Optional[List[Dict[str, Any]]],
+    from_day: date,
     now: datetime,
 ) -> Optional[Set[date]]:
     if not base_url or not service_role_key:
         return None
 
-    oldest_day = _latest_oldest_day_by_label(db_size_metrics).get("ingestdb")
-    if oldest_day is None:
-        return set()
-
     today_utc = now.astimezone(timezone.utc).date()
-    if oldest_day > today_utc:
-        return set()
+    if type(from_day) is not date or from_day > today_utc:
+        return None
 
     try:
         safe_base_url = _ensure_allowed_base_url(base_url)
@@ -2567,7 +2437,7 @@ def _fetch_ingest_observation_days(
     headers = _postgrest_headers(service_role_key, schema=PUBLIC_SCHEMA)
 
     days_with_rows: Set[date] = set()
-    cursor = oldest_day
+    cursor = from_day
     while cursor <= today_utc:
         next_day_utc = cursor + timedelta(days=1)
         try:
@@ -2604,34 +2474,31 @@ def _fetch_storage_day_sets(
     *,
     base_url: str,
     service_role_key: str,
-    db_size_metrics: Optional[List[Dict[str, Any]]],
+    from_day: date,
     now: datetime,
 ) -> Dict[str, Set[date]]:
     day_sets: Dict[str, Set[date]] = {}
     ingest_days = _fetch_ingest_observation_days(
         base_url=base_url,
         service_role_key=service_role_key,
-        db_size_metrics=db_size_metrics,
+        from_day=from_day,
         now=now,
     )
     if ingest_days is not None:
         day_sets["ingestdb"] = ingest_days
 
-    observs_days = _fetch_obs_aqi_observs_row_days()
+    observs_days = _fetch_obs_aqi_observs_row_days(from_day, now.astimezone(timezone.utc).date())
     if observs_days is not None:
         day_sets["obs_aqidb"] = observs_days
-    aqilevels_days = _fetch_obs_aqi_aqilevels_hourly_days()
-    if aqilevels_days is not None:
-        day_sets["obs_aqi_aqilevels"] = aqilevels_days
     return day_sets
 
 
-def _fetch_obs_aqidb_day_count_rows(dataset: str) -> Optional[List[Dict[str, Any]]]:
+def _fetch_obs_aqidb_day_count_rows(dataset: str, from_day: date, to_day: date) -> Optional[List[Dict[str, Any]]]:
     if not OBS_AQIDB_SUPABASE_URL or not OBS_AQIDB_SECRET_KEY:
         return None
 
     dataset_value = (dataset or "").strip().lower()
-    if dataset_value not in {"observs", "aqilevels"}:
+    if dataset_value != "observs":
         return None
 
     try:
@@ -2647,7 +2514,7 @@ def _fetch_obs_aqidb_day_count_rows(dataset: str) -> Optional[List[Dict[str, Any
     rows: List[Dict[str, Any]] = []
     limit = 200
     offset = 0
-    max_pages = 10
+    max_pages = (to_day - from_day).days // limit + 2
     for _ in range(max_pages):
         try:
             batch = _fetch_json(
@@ -2655,6 +2522,7 @@ def _fetch_obs_aqidb_day_count_rows(dataset: str) -> Optional[List[Dict[str, Any
                 headers,
                 {
                     "dataset": f"eq.{dataset_value}",
+                    "and": f"(day_utc.gte.{from_day.isoformat()},day_utc.lte.{to_day.isoformat()})",
                     "select": "day_utc,row_count",
                     "order": "day_utc.asc",
                     "limit": str(limit),
@@ -2668,17 +2536,28 @@ def _fetch_obs_aqidb_day_count_rows(dataset: str) -> Optional[List[Dict[str, Any
             return None
 
         for row in batch:
-            if isinstance(row, dict):
-                rows.append(row)
+            if (
+                not isinstance(row, dict)
+                or _parse_iso_day(row.get("day_utc")) is None
+                or not from_day <= _parse_iso_day(row.get("day_utc")) <= to_day
+                or isinstance(row.get("row_count"), bool)
+                or not str(row.get("row_count")).isdigit()
+            ):
+                return None
+            rows.append(row)
 
         if len(batch) < limit:
-            break
+            days = [_parse_iso_day(row["day_utc"]) for row in rows]
+            if len(days) != (to_day - from_day).days + 1 or len(set(days)) != len(days):
+                return None  # Incomplete summary: use the existing fingerprint fallback.
+            return rows
         offset += limit
 
-    return rows
+    # A bounded scan that reaches its cap is incomplete, never confirmed absent.
+    return None
 
 
-def _fetch_obs_aqi_observs_partition_days() -> Optional[Set[date]]:
+def _fetch_obs_aqi_observs_partition_days(from_day: date, to_day: date) -> Optional[Set[date]]:
     if not OBS_AQIDB_SUPABASE_URL or not OBS_AQIDB_SECRET_KEY:
         return None
 
@@ -2690,7 +2569,7 @@ def _fetch_obs_aqi_observs_partition_days() -> Optional[Set[date]]:
         return None
     url = f"{obs_aqidb_base_url}/rpc/uk_aq_rpc_observs_drop_candidates"
     headers = _postgrest_headers(OBS_AQIDB_SECRET_KEY, schema=PUBLIC_SCHEMA)
-    cutoff_utc = f"{(datetime.now(timezone.utc).date() + timedelta(days=1)).isoformat()}T00:00:00Z"
+    cutoff_utc = f"{(to_day + timedelta(days=1)).isoformat()}T00:00:00Z"
 
     days: Set[date] = set()
     limit = 1000
@@ -2703,6 +2582,7 @@ def _fetch_obs_aqi_observs_partition_days() -> Optional[Set[date]]:
                 headers,
                 {
                     "cutoff_utc": cutoff_utc,
+                    "and": f"(partition_day_utc.gte.{from_day.isoformat()},partition_day_utc.lte.{to_day.isoformat()})",
                     "select": "partition_day_utc",
                     "order": "partition_day_utc.asc",
                     "limit": str(limit),
@@ -2712,22 +2592,27 @@ def _fetch_obs_aqi_observs_partition_days() -> Optional[Set[date]]:
         except Exception:
             return None
 
+        if not isinstance(batch, list):
+            return None
         for row in batch:
             if not isinstance(row, dict):
-                continue
+                return None
             parsed_day = _parse_iso_day(row.get("partition_day_utc"))
-            if parsed_day is not None:
-                days.add(parsed_day)
+            if parsed_day is None:
+                return None
+            if not from_day <= parsed_day <= to_day:
+                return None
+            days.add(parsed_day)
 
         if len(batch) < limit:
-            break
+            return days
         offset += limit
 
-    return days
+    return None
 
 
-def _fetch_obs_aqi_observs_row_days() -> Optional[Set[date]]:
-    count_rows = _fetch_obs_aqidb_day_count_rows("observs")
+def _fetch_obs_aqi_observs_row_days(from_day: date, to_day: date) -> Optional[Set[date]]:
+    count_rows = _fetch_obs_aqidb_day_count_rows("observs", from_day, to_day)
     if count_rows is not None:
         days_with_rows: Set[date] = set()
         for row in count_rows:
@@ -2745,7 +2630,7 @@ def _fetch_obs_aqi_observs_row_days() -> Optional[Set[date]]:
     if not OBS_AQIDB_SUPABASE_URL or not OBS_AQIDB_SECRET_KEY:
         return None
 
-    partition_days = _fetch_obs_aqi_observs_partition_days()
+    partition_days = _fetch_obs_aqi_observs_partition_days(from_day, to_day)
     if partition_days is None:
         return None
     if not partition_days:
@@ -2779,88 +2664,21 @@ def _fetch_obs_aqi_observs_row_days() -> Optional[Set[date]]:
         except Exception:
             return None
 
+        if not isinstance(batch, list) or len(batch) > 1:
+            return None
         if not batch:
             continue
-        first_row = batch[0] if isinstance(batch[0], dict) else None
-        if not first_row:
-            continue
-        try:
-            observation_count = int(first_row.get("observation_count") or 0)
-        except (TypeError, ValueError):
-            observation_count = 0
+        first_row = batch[0]
+        if not isinstance(first_row, dict):
+            return None
+        raw_count = first_row.get("observation_count")
+        if isinstance(raw_count, bool) or not str(raw_count).isdigit():
+            return None
+        observation_count = int(raw_count)
         if observation_count > 0:
             days_with_rows.add(day_utc)
 
     return days_with_rows
-
-
-def _fetch_obs_aqi_aqilevels_hourly_days() -> Optional[Set[date]]:
-    count_rows = _fetch_obs_aqidb_day_count_rows("aqilevels")
-    if count_rows is not None:
-        days: Set[date] = set()
-        for row in count_rows:
-            try:
-                row_count = int(row.get("row_count") or 0)
-            except (TypeError, ValueError):
-                continue
-            if row_count <= 0:
-                continue
-            parsed_day = _parse_iso_day(row.get("day_utc"))
-            if parsed_day is not None:
-                days.add(parsed_day)
-        return days
-
-    if not OBS_AQIDB_SUPABASE_URL or not OBS_AQIDB_SECRET_KEY:
-        return None
-
-    try:
-        obs_aqidb_base_url = _ensure_allowed_base_url(
-            f"{OBS_AQIDB_SUPABASE_URL.rstrip('/')}/rest/v1"
-        )
-    except Exception:
-        return None
-    url = f"{obs_aqidb_base_url}/rpc/uk_aq_rpc_aqilevels_drop_candidates"
-    headers = _postgrest_headers(OBS_AQIDB_SECRET_KEY, schema=PUBLIC_SCHEMA)
-    cutoff_day_utc = (datetime.now(timezone.utc).date() + timedelta(days=1)).isoformat()
-
-    days: Set[date] = set()
-    limit = 1000
-    offset = 0
-    max_pages = 20
-    for _ in range(max_pages):
-        try:
-            batch = _fetch_json(
-                url,
-                headers,
-                {
-                    "p_cutoff_day_utc": cutoff_day_utc,
-                    "select": "day_utc,hourly_rows",
-                    "order": "day_utc.asc",
-                    "limit": str(limit),
-                    "offset": str(offset),
-                },
-            )
-        except Exception:
-            return None
-
-        for row in batch:
-            if not isinstance(row, dict):
-                continue
-            try:
-                hourly_rows = int(row.get("hourly_rows") or row.get("row_count") or 0)
-            except (TypeError, ValueError):
-                continue
-            if hourly_rows <= 0:
-                continue
-            parsed_day = _parse_iso_day(row.get("day_utc"))
-            if parsed_day is not None:
-                days.add(parsed_day)
-
-        if len(batch) < limit:
-            break
-        offset += limit
-
-    return days
 
 
 def _fetch_r2_history_days_from_external_api(
@@ -2914,6 +2732,9 @@ def _fetch_r2_history_days_from_external_api(
     raw_domains = payload.get("domains")
     if not isinstance(raw_domains, dict):
         return None, None, None, "R2 history-days API payload missing domains object"
+    raw_observations = raw_domains.get("observations")
+    if not isinstance(raw_observations, dict) or not isinstance(raw_observations.get("days"), list):
+        return None, None, None, "R2 history-days API missing authoritative observation-day array"
 
     day_sets: Dict[str, Set[date]] = {
         "observations": set(),
@@ -2928,6 +2749,12 @@ def _fetch_r2_history_days_from_external_api(
             continue
         for day_text in raw_days:
             parsed_day = _parse_iso_day(day_text)
+            if domain_name == "observations" and (
+                not isinstance(day_text, str) or parsed_day is None
+                or day_text != parsed_day.isoformat() or parsed_day in day_sets[domain_name]
+                or parsed_day > datetime.now(timezone.utc).date()
+            ):
+                return None, None, None, "R2 history-days API contains invalid or duplicate observation dates"
             if parsed_day is not None:
                 day_sets[domain_name].add(parsed_day)
 
@@ -4139,8 +3966,6 @@ def _empty_storage_coverage_context() -> Dict[str, Any]:
         "dropbox_state_info": _resolve_dropbox_state_path_info(),
         "dropbox_backup_observations_earliest_day": None,
         "dropbox_backup_observations_latest_day": None,
-        "dropbox_backup_aqilevels_earliest_day": None,
-        "dropbox_backup_aqilevels_latest_day": None,
     }
 
 
@@ -4385,8 +4210,6 @@ def _build_dashboard(
         "dropbox_backup_state_fallback_attempted": dropbox_state_info.get("fallback_attempted", False),
         "dropbox_backup_observations_earliest_day": coverage_context.get("dropbox_backup_observations_earliest_day"),
         "dropbox_backup_observations_latest_day": coverage_context.get("dropbox_backup_observations_latest_day"),
-        "dropbox_backup_aqilevels_earliest_day": coverage_context.get("dropbox_backup_aqilevels_earliest_day"),
-        "dropbox_backup_aqilevels_latest_day": coverage_context.get("dropbox_backup_aqilevels_latest_day"),
         "storage_coverage_source": "live_per_day_presence",
         "storage_coverage_days": storage_coverage_days,
         "r2_history_read_version": dropbox_state_info.get("read_version"),
@@ -4495,8 +4318,6 @@ def _build_storage_coverage_payload(
         dropbox_state_info = STORAGE_COVERAGE_CACHE_STATE.get("dropbox_state_info") or _resolve_dropbox_state_path_info()
         dropbox_backup_observations_earliest_day = STORAGE_COVERAGE_CACHE_STATE.get("dropbox_backup_observations_earliest_day")
         dropbox_backup_observations_latest_day = STORAGE_COVERAGE_CACHE_STATE.get("dropbox_backup_observations_latest_day")
-        dropbox_backup_aqilevels_earliest_day = STORAGE_COVERAGE_CACHE_STATE.get("dropbox_backup_aqilevels_earliest_day")
-        dropbox_backup_aqilevels_latest_day = STORAGE_COVERAGE_CACHE_STATE.get("dropbox_backup_aqilevels_latest_day")
 
     return {
         "generated_at": now.isoformat().replace("+00:00", "Z"),
@@ -4513,8 +4334,6 @@ def _build_storage_coverage_payload(
         "dropbox_backup_state_fallback_attempted": dropbox_state_info.get("fallback_attempted", False),
         "dropbox_backup_observations_earliest_day": dropbox_backup_observations_earliest_day,
         "dropbox_backup_observations_latest_day": dropbox_backup_observations_latest_day,
-        "dropbox_backup_aqilevels_earliest_day": dropbox_backup_aqilevels_earliest_day,
-        "dropbox_backup_aqilevels_latest_day": dropbox_backup_aqilevels_latest_day,
     }
 
 

@@ -152,7 +152,6 @@ def _get_direct_r2_days(
             return (
                 {
                     "observations": set(cached.get("observations") or set()),
-                    "aqilevels": set(cached.get("aqilevels") or set()),
                 },
                 _DIRECT_CACHE.get("error"),
                 root,
@@ -168,19 +167,8 @@ def _get_direct_r2_days(
         root,
         "observations",
     )
-    # Calculated AQI is retired; optional legacy diagnostic days come from metrics.
-    aqilevels, aqilevels_error = set(), None
-
-    errors = [
-        value
-        for value in (observations_error, aqilevels_error)
-        if isinstance(value, str) and value.strip()
-    ]
-    error = "; ".join(errors) if errors else None
-    day_sets = {
-        "observations": observations,
-        "aqilevels": aqilevels,
-    }
+    error = observations_error
+    day_sets = {"observations": observations}
 
     with _DIRECT_CACHE_LOCK:
         _DIRECT_CACHE.update(
@@ -218,9 +206,12 @@ def _get_r2_history_days_cached(
         force_refresh=force_refresh,
     )
 
-    if not isinstance(normal_days, dict):
+    if not isinstance(normal_days, dict) or normal_error:
         return None, r2_window, bucket, _merge_errors(normal_error, direct_error)
     committed = {name: set(normal_days.get(name) or set()) for name in ("observations", "aqilevels")}
+    # Retain the API's complete committed set solely for calendar/query bounds.
+    # A physical scan can remove a presence marker, but cannot move that boundary.
+    committed["committed_observations"] = set(committed["observations"])
     if isinstance(direct_days, dict) and not direct_error:
         committed["observations"].intersection_update(direct_days.get("observations") or set())
     return committed, r2_window, bucket, _merge_errors(normal_error, direct_error)

@@ -1,11 +1,19 @@
+import { validatePhaseBV3RunFinalizationResult } from '../shared/uk_aq_prune_batch_finalization_v3.mjs';
+import { preparePruneExactOnlyBatchCompletionV3 }
+  from '../shared/uk_aq_observation_history_exact_only_publication_v3.mjs';
 import {
   runOperationalPruneDailyObservationHistoryV3ConnectorPublication,
   runOperationalPruneDailyObservationHistoryV3RunFinalization,
+  createOperationalPruneDailyExactOnlyWriterV3,
 } from "../shared/uk_aq_observation_history_operational_writer_v3.mjs";
+import { OBSERVATION_HISTORY_EXACT_ONLY_PUBLICATION_ACTIVE_V3 }
+  from '../shared/uk_aq_observation_history_index_v3.mjs';
 import {
   createPruneDailyObservationHistoryV3RunLocalEvidenceCache,
 } from "../shared/uk_aq_observation_history_steady_state_writer_v3.mjs";
 import { admitPruneFrozenConnectorSnapshot, PruneCommittedHistoryGuardError } from "./committed_history_guard.mjs";
+import { exactLeafFormatV3 } from "../shared/uk_aq_observation_history_exact_leaf_format_v3.mjs";
+import { rejectExactOnlyOriginalHandoverV3 } from "../shared/uk_aq_observation_history_exact_only_consumer_v3.mjs";
 import { FIRST_DELETE_READY, FIRST_DELETE_CONSUMED, FIRST_DELETE_UNPROVEN } from "./deletion_attempt_state.mjs";
 import { getObservationHistoryGeneration, resolveObservationHistoryGeneration, assertObservationHistoryGenerationPrefixes, assertObservationHistoryGenerationKey } from "../shared/uk_aq_observation_history_generation.mjs";
 import fs from "node:fs";
@@ -13,11 +21,14 @@ import path from "node:path";
 import os from "node:os";
 import readline from "node:readline";
 import { randomUUID } from "node:crypto";
+import { originalOperationError, isOriginalOperationError }
+  from '../../scripts/operations/lib/uk_aq_prune_original_operation.mjs';
 import { uploadPrunePendingSource, uploadPruneEvidenceBundle, resolvePruneSignerConfig,
   PRUNE_SIGNED_UPLOAD_DEADLINE_MS, PRUNE_EVIDENCE_BUNDLE_UPLOAD_DEADLINE_MS,
   isPrunePendingSourceConnector } from "../../scripts/jsongen/prune-signed-upload.mjs";
 import { preparePrunePendingSource } from "../../scripts/jsongen/prune-pending-source.mjs";
-import { preparePruneOriginalFinalEvidence, attachPruneOriginalEvidenceBundleReference }
+import { preparePruneOriginalFinalEvidence, preparePruneOriginalFinalEvidenceWithExactOnlyCompletion,
+  attachPruneOriginalEvidenceBundleReference }
   from "../../scripts/jsongen/prune-final-evidence.mjs";
 import { describePruneGateOutboxEvidence, preparePrunePostCommitHandover } from "../../scripts/jsongen/prune-outbox.mjs";
 import { createPruneOriginalMetadataCapture, preparePruneOriginalMetadataSnapshot,
@@ -32,7 +43,6 @@ import { compressors } from "hyparquet-compressors";
 import {
   hasRequiredR2Config,
   normalizePrefix,
-  r2DeleteObjects,
   r2GetObject,
   r2HeadObject,
   r2ListAllObjects,
@@ -76,6 +86,7 @@ import {
   canonicalObservationConnectorManifestKey,
   connectorDayGateKey,
   isValidConnectorHistoryGateEvidence,
+  normalizeConnectorDayPair,
   setConnectorDayGateComplete,
   setConnectorDayGateIncomplete,
 } from "../shared/uk_aq_connector_day_gate.mjs";
@@ -192,8 +203,6 @@ const PHASE_B_V3_CANDIDATE_START_MIN_MS =
   PHASE_B_STAGE_MIN_MS.candidate_start
   - PHASE_B_STAGE_MIN_MS.observation_run_finalization
   + PHASE_B_V3_RUN_FINALIZATION_RESERVE_MS;
-const DEFAULT_STAGING_RETENTION_DAYS = 7;
-const DEFAULT_STAGING_PREFIX = "history/v1/_ops/observations/staging";
 const DEFAULT_RUNS_PREFIX_V2 = "history/v2/_ops/observations/runs";
 const DEFAULT_INGESTDB_RETENTION_DAYS = 5;
 const DEFAULT_OBSAQIDB_OBSERVS_RETENTION_DAYS = 14;
@@ -2373,7 +2382,9 @@ async function markCandidateAndConnectorGateComplete(client, {
   sourceIdentity,
   writerGitSha,
   outbox = null,
+  assertOriginalOperationHeld = null,
 }) {
+  await assertOriginalOperationHeld?.('gate_begin');
   await client.query("begin");
   let commitStarted = false;
   try {
@@ -2430,11 +2441,15 @@ async function markCandidateAndConnectorGateComplete(client, {
         outboxState = 'inserted';
       }
     }
+    await assertOriginalOperationHeld?.('gate_commit');
     commitStarted = true;
     const commit = await client.query("commit");
     // PostgreSQL can acknowledge an aborted transaction with ROLLBACK instead.
     // A lost/ambiguous response or any other command is not successful COMMIT.
     if (commit?.command !== 'COMMIT') throw new Error('Original Prune gate COMMIT not acknowledged');
+    // No successful completion reference on loss/uncertainty during COMMIT.
+    // This is the same coordinator capability, never a new acquisition.
+    await assertOriginalOperationHeld?.('gate_committed');
     let handover = { state: 'not_prepared', delivery_state: 'not_attempted',
       ready_for_independent_authentication: false,
       reason: outboxState === 'disabled' ? 'disabled' : outboxState };
@@ -2573,6 +2588,17 @@ where day_utc = $1::date
 
 function completedCandidateHistoryGeneration(candidate) {
   if (candidate?.status !== "complete") return null;
+  // Retired v1 is recognised only as exact candidate bookkeeping. It is not a
+  // selectable writer generation or valid connector-day deletion gate.
+  try {
+    const pair = normalizeConnectorDayPair(candidate.day_utc, candidate.connector_id);
+    if (candidate.manifest_key ===
+      `history/v1/observations/day_utc=${pair.day_utc}/connector_id=${pair.connector_id}/manifest.json`) {
+      return "v1";
+    }
+  } catch (_error) {
+    return null;
+  }
   for (const generation of ["v2", "v3"]) {
     try {
       if (candidate.manifest_key === canonicalObservationConnectorManifestKey(
@@ -3794,7 +3820,71 @@ async function publishFrozenV2Observations({ candidate, runtime, streamClient, r
   };
 }
 
+function createPhaseBPruneExactOnlyWriter({ runtime, client }) {
+  const admitR2 = (operation, key, count = 1) => assertBudget(runtime, operation, { key },
+    count * R2_REQUEST_WORST_CASE_DURATION_MS + R2_PUBLICATION_SAFETY_MARGIN_MS);
+  const getObject = async ({ key }) => {
+    admitR2('v3_exact_only_r2_read', key);
+    try { return { ...await r2GetObject({ r2: runtime.r2, key }), key, exists: true }; }
+    catch (error) {
+      if (error?.status === 404) return { key, exists: false };
+      throw error;
+    }
+  };
+  const recordPublished = object => optionalJsongenMetadataCapture(
+    runtime, runtime.prune_exact_only_connector_id ?? null)?.recordPublishedObject(object);
+  return createOperationalPruneDailyExactOnlyWriterV3({
+    env: { UK_AQ_R2_HISTORY_VERSION: runtime.history_write_version },
+    client, r2: runtime.r2, originalOperation: runtime.original_operation,
+    observationsPrefix: runtime.committed_prefix, targetWriterGitSha: runtime.writer_git_sha,
+    globalOperationLockContext: runtime.global_operation_lock_context,
+    runLocalReferenceEvidenceCache: runtime.v3_run_local_evidence_cache,
+    lockTimeoutMs: Math.min(15_000, Math.max(1, remainingBudgetMs(runtime) ?? 15_000)),
+    beforePublicationStage: ({ stage, ...fields }) => assertBudget(runtime,
+      `v3_${stage}_start`, fields, R2_REQUEST_WORST_CASE_DURATION_MS + R2_PUBLICATION_SAFETY_MARGIN_MS),
+    getObject,
+    headObject: async ({ key }) => {
+      admitR2('v3_exact_only_r2_head', key);
+      return r2HeadObject({ r2: runtime.r2, key });
+    },
+    putObject: async object => {
+      admitR2('v3_exact_only_r2_put', object?.key, 2);
+      runtime.v3_run_local_evidence_cache?.invalidateKey(object?.key);
+      const result = await r2PutObject({ ...object, r2: runtime.r2 });
+      if (result?.ok !== false) recordPublished(object);
+      return result;
+    },
+    putIfChanged: async object => {
+      admitR2('v3_exact_only_r2_put_if_changed', object?.key, 3);
+      runtime.v3_run_local_evidence_cache?.invalidateKey(object?.key);
+      const result = await r2PutObjectIfChanged({ ...object, r2: runtime.r2 });
+      if (result?.ok !== false) recordPublished(object);
+      return result;
+    },
+    putAndVerifyParquet: async ({ r2, intent }) => {
+      assertBudget(runtime, 'v3_exact_only_parquet_write', { key: intent?.key },
+        R2_CHECKSUM_PUT_HEAD_WORST_CASE_DURATION_MS);
+      return putAndVerifyR2ObjectWithSha256({ r2, intent });
+    },
+    listAllCommonPrefixes: async ({ r2, prefix, delimiter = '/', max_keys = 1000 }) => {
+      const prefixes = [];
+      let continuationToken = null;
+      for (;;) {
+        admitR2('v3_exact_only_r2_list', prefix);
+        const page = await r2ListObjectsV2({ r2: r2 || runtime.r2, prefix,
+          continuation_token: continuationToken, max_keys, delimiter });
+        prefixes.push(...(Array.isArray(page.common_prefixes) ? page.common_prefixes : []));
+        if (!page.next_token) return Array.from(new Set(prefixes)).sort((left, right) => left.localeCompare(right));
+        continuationToken = page.next_token;
+      }
+    },
+    admitConditionalWrite: artifact => admitR2('v3_exact_only_conditional_put', artifact?.key, 2),
+    onVerifiedArtifact: recordPublished,
+  });
+}
+
 async function publishFrozenV3Observations({ candidate, runtime, streamClient, rows, backedUpAtUtc }) {
+  await assertPruneOriginalOperation(runtime, 'publication');
   const metadataCapture = optionalJsongenMetadataCapture(runtime, candidate.connector_id);
   const byPollutant = new Map();
   for (const row of rows) {
@@ -3946,25 +4036,32 @@ async function publishFrozenV3Observations({ candidate, runtime, streamClient, r
   const publicationDiagnostics = [];
   let publication;
   try {
-    publication = await runOperationalPruneDailyObservationHistoryV3ConnectorPublication({
-      env: { UK_AQ_R2_HISTORY_VERSION: runtime.history_write_version },
-      client: streamClient, r2: runtime.r2,
-      observationsPrefix: runtime.committed_prefix,
-      targetWriterGitSha: runtime.writer_git_sha, backedUpAtUtc,
-      partitions: [...byPollutant.entries()].map(([code, partitionRows]) => ({
-        scope: { day_utc: candidate.day_utc, connector_id: candidate.connector_id, pollutant_code: code },
-        rows: partitionRows,
-      })),
-      lockTimeoutMs: Math.min(15_000, Math.max(1, remainingBudgetMs(runtime) ?? 15_000)),
-      putAndVerifyParquet,
-      withConnectorDayLock,
-      diagnostics: publicationDiagnostics,
-      getObject: publicationGetObject,
-      putIfChanged: publicationPutIfChanged,
-      diagnosticLog,
-      beforePublicationStage,
-      diagnosticEnvironment: runtime.environment,
-    });
+    const partitions = [...byPollutant.entries()].map(([code, partitionRows]) => ({
+      scope: { day_utc: candidate.day_utc, connector_id: candidate.connector_id, pollutant_code: code },
+      rows: partitionRows,
+    }));
+    publication = runtime.prune_exact_only_writer
+      ? await runtime.prune_exact_only_writer.publishConnector({
+        partitions: partitions.map(partition => ({ ...partition, backed_up_at_utc: backedUpAtUtc })),
+        sourceIdentity: runtime.prune_exact_only_source_identity,
+      })
+      : await runOperationalPruneDailyObservationHistoryV3ConnectorPublication({
+        env: { UK_AQ_R2_HISTORY_VERSION: runtime.history_write_version },
+        client: streamClient, r2: runtime.r2,
+        originalOperation: runtime.original_operation,
+        observationsPrefix: runtime.committed_prefix,
+        targetWriterGitSha: runtime.writer_git_sha, backedUpAtUtc,
+        partitions,
+        lockTimeoutMs: Math.min(15_000, Math.max(1, remainingBudgetMs(runtime) ?? 15_000)),
+        putAndVerifyParquet,
+        withConnectorDayLock,
+        diagnostics: publicationDiagnostics,
+        getObject: publicationGetObject,
+        putIfChanged: publicationPutIfChanged,
+        diagnosticLog,
+        beforePublicationStage,
+        diagnosticEnvironment: runtime.environment,
+      });
   } catch (error) {
     logPhaseB(runtime, "ERROR", "phase_b_history_v3_connector_publication_failed", {
       ...publicationFields,
@@ -3984,6 +4081,7 @@ async function publishFrozenV3Observations({ candidate, runtime, streamClient, r
     throw new Error("Side-by-side v3 connector publication is incomplete");
   }
   const result = publication.connector_results[0];
+  await assertPruneOriginalOperation(runtime, 'publication');
   const manifest = result.canonical.connector_manifest_payload;
   const files = result.partitions.flatMap((partition) => partition.pollutant_manifest.payload.files);
   return {
@@ -3992,6 +4090,8 @@ async function publishFrozenV3Observations({ candidate, runtime, streamClient, r
     total_bytes: BigInt(manifest.total_bytes), file_count: files.length,
     files, parquet_object_keys: files.map((file) => file.key),
     v3_connector_publication: publication.run_finalization_evidence,
+    ...(result.exact_only_prepared_scopes?.length
+      ? { exact_only_prepared_scopes: result.exact_only_prepared_scopes } : {}),
     ...(metadataCapture ? { jsongen_original_metadata_references: {
       canonical: [...result.canonical.pollutant_manifests,
         result.canonical.connector_manifest],
@@ -4015,26 +4115,6 @@ function validatePhaseBV2RunFinalizationResult({ result, expectedDays }) {
   return result;
 }
 
-function validatePhaseBV3RunFinalizationResult({
-  result,
-  expectedDays,
-  expectedConnectorPublicationCount,
-}) {
-  const aggregate = result?.canonical_aggregate_result;
-  const exactScopes = result?.v3_publication?.exact_scopes;
-  if (result?.ok !== true ||
-      !phaseBAffectedDaysMatch(result?.affected_days_utc, expectedDays) ||
-      aggregate?.canonical_aggregate_authority_verified !== true ||
-      aggregate?.parent_state_reread_under_lock !== true ||
-      !phaseBAffectedDaysMatch(aggregate?.affected_days_utc, expectedDays) ||
-      !Array.isArray(exactScopes) ||
-      exactScopes.length !== expectedConnectorPublicationCount ||
-      exactScopes.some((publication) => publication?.ok !== true) ||
-      result?.v3_publication?.latest_global?.ok !== true) {
-    throw new Error("Phase B v3 run finalization did not establish complete canonical/latest authority");
-  }
-  return result;
-}
 
 async function finalizeSelectedObservationRun({ client, runtime, publishedCandidates, diagnostics }) {
   if (runtime.history_write_version === "v2") {
@@ -4123,22 +4203,24 @@ async function finalizeSelectedObservationRun({ client, runtime, publishedCandid
     finalizationStage = stage;
     assertFinalizationRequestBudget(`v3_${stage}_start`, 1, fields);
   };
-  const result = await runOperationalPruneDailyObservationHistoryV3RunFinalization({
-    env: { UK_AQ_R2_HISTORY_VERSION: runtime.history_write_version },
-    client, r2: runtime.r2, observationsPrefix: runtime.committed_prefix,
-    targetWriterGitSha: runtime.writer_git_sha,
-    connectorPublications: publishedCandidates.map(({ exportResult }) => exportResult.v3_connector_publication),
-    diagnostics, diagnosticEnvironment: runtime.environment,
-    lockTimeoutMs: Math.min(15_000, Math.max(1, remainingBudgetMs(runtime) ?? 15_000)),
-    getObject: finalizationGetObject,
-    putIfChanged: finalizationPutIfChanged,
-    putObject: finalizationPutObject,
-    listAllCommonPrefixes: finalizationListAllCommonPrefixes,
-    diagnosticLog,
-    beforePublicationStage,
-    runLocalReferenceEvidenceCache: runtime.v3_run_local_evidence_cache,
-    globalOperationLockContext: runtime.global_operation_lock_context,
-  });
+  const result = runtime.prune_exact_only_writer
+    ? await runtime.prune_exact_only_writer.finalizeBatch()
+    : await runOperationalPruneDailyObservationHistoryV3RunFinalization({
+      env: { UK_AQ_R2_HISTORY_VERSION: runtime.history_write_version },
+      client, r2: runtime.r2, observationsPrefix: runtime.committed_prefix,
+      targetWriterGitSha: runtime.writer_git_sha,
+      connectorPublications: publishedCandidates.map(({ exportResult }) => exportResult.v3_connector_publication),
+      diagnostics, diagnosticEnvironment: runtime.environment,
+      lockTimeoutMs: Math.min(15_000, Math.max(1, remainingBudgetMs(runtime) ?? 15_000)),
+      getObject: finalizationGetObject,
+      putIfChanged: finalizationPutIfChanged,
+      putObject: finalizationPutObject,
+      listAllCommonPrefixes: finalizationListAllCommonPrefixes,
+      diagnosticLog,
+      beforePublicationStage,
+      runLocalReferenceEvidenceCache: runtime.v3_run_local_evidence_cache,
+      globalOperationLockContext: runtime.global_operation_lock_context,
+    });
   return validatePhaseBV3RunFinalizationResult({
     result,
     expectedDays: affectedDays,
@@ -4201,6 +4283,17 @@ async function writeFrozenCandidateObservationsToV2({
         dayUtc: candidate.day_utc,
         connectorId: candidate.connector_id,
         rows,
+        headObject: r2HeadObject,
+        assertOperationHeld: async () => {
+          if (runtime.original_operation) {
+            await assertPruneOriginalOperation(runtime, 'publication');
+            return;
+          }
+          // The existing outer supervisor owns this original session and kills
+          // its child on loss. The run-local cache binds its lifetime and nonce.
+          const current = observationsGlobalOperationLockContext({ expectedOwner: 'prune_daily', expectedRunId: runtime.run_id });
+          if (!runtime.v3_run_local_evidence_cache?.matches(current)) throw new Error('original supervised Prune operation unavailable');
+        },
         ...(jsongenOriginalAuthority ? {
           getObject: async args => {
             const object = await readAdmissionObject(args);
@@ -4362,7 +4455,18 @@ async function writeFrozenCandidateObservationsToV2({
       day_utc: candidate.day_utc, connector_id: candidate.connector_id,
       replayed_row_count: rows.length,
     }, PHASE_B_STAGE_MIN_MS.observation_connector_publication);
-    const result = await connectorPublisher({ candidate, runtime, streamClient, rows, backedUpAtUtc });
+    if (runtime.prune_exact_only_writer) {
+      runtime.prune_exact_only_source_identity = frozen.sourceIdentity;
+      runtime.prune_exact_only_connector_id = candidate.connector_id;
+    }
+    let result;
+    try { result = await connectorPublisher({ candidate, runtime, streamClient, rows, backedUpAtUtc }); }
+    finally {
+      if (runtime.prune_exact_only_writer) {
+        runtime.prune_exact_only_connector_id = null;
+        runtime.prune_exact_only_source_identity = null;
+      }
+    }
     if (emitV3Diagnostics) {
       logPhaseB(runtime, "INFO", "phase_b_history_v3_candidate_write_complete", {
         day_utc: candidate.day_utc,
@@ -4560,6 +4664,7 @@ async function finalizePublishedPhaseBConnectors({
   const expectedDays = uniqueSorted(publishedCandidates.map(({ candidate }) => candidate.day_utc));
   let result;
   try {
+    await assertPruneOriginalOperation(runtime, 'batch_finalization');
     result = await runFinalizer({ client, runtime, publishedCandidates, diagnostics: lockDiagnostics });
     if (runtime.history_write_version === "v2") {
       validatePhaseBV2RunFinalizationResult({ result, expectedDays });
@@ -4572,6 +4677,7 @@ async function finalizePublishedPhaseBConnectors({
     } else {
       throw new Error(`Unsupported Phase B history write version: ${String(runtime.history_write_version || "")}`);
     }
+    await assertPruneOriginalOperation(runtime, 'batch_finalization');
   } catch (error) {
     for (const { candidate, exportResult } of publishedCandidates) {
       if (runtime.history_write_version !== 'v3' || runtime.jsongen_pending_source?.enabled !== true
@@ -4600,6 +4706,29 @@ async function finalizePublishedPhaseBConnectors({
         && isPrunePendingSourceConnector(candidate.connector_id)) {
         if (exportResult.jsongen_pending_source?.state === 'put_acknowledged_unverified') {
           try {
+            await assertPruneOriginalOperation(runtime, 'preparation');
+            // Future schema-2 producer supplies the original operation-local
+            // preparations, never serialized flags. Operational rejection and
+            // the hard publisher-inactive constant remain unchanged.
+            let exactOnlyCompletion = null;
+            if (exportResult.exact_only_prepared_scopes?.length) {
+              await assertPruneOriginalOperation(runtime, 'preparation', true);
+              const owned = result.exact_only_completions?.find(entry =>
+                entry.day_utc === candidate.day_utc && entry.connector_id === candidate.connector_id);
+              if (runtime.prune_exact_only_writer && !owned) {
+                throw new Error('Missing original exact-only checked-batch completion');
+              }
+              exactOnlyCompletion = owned?.completion || await preparePruneExactOnlyBatchCompletionV3({
+                preparedScopes: exportResult.exact_only_prepared_scopes,
+                finalization: result, runId, originalOperation: runtime.original_operation,
+                expectedDays, expectedConnectorPublicationCount: publishedCandidates.length,
+                getObject: async ({ key }) => {
+                  assertBudget(runtime, 'jsongen_original_batch_identity', { key },
+                    R2_REQUEST_WORST_CASE_DURATION_MS + R2_PUBLICATION_SAFETY_MARGIN_MS);
+                  return { ...await r2GetObject({ r2: runtime.r2, key }), key };
+                },
+              });
+            }
             const dayReferences = (result.affected_days_utc || []).map(dayUtc =>
               (result.day_results || []).find(entry => entry.day_utc === dayUtc)?.day_manifest);
             const originalMetadataSnapshot = preparePruneOriginalMetadataSnapshot({
@@ -4613,7 +4742,7 @@ async function finalizePublishedPhaseBConnectors({
               aggregateReferences: result.canonical_aggregate_result?.aggregate_manifests,
               latestReferences: result.v3_publication?.latest_global?.objects,
             });
-            published.jsongen_final_evidence_preparation = prepareJsonGenFinalEvidence({
+            const preparationArgs = {
               pending: exportResult.jsongen_pending_source,
               connector: connectorGateEvidence.jsongen_connector_snapshot,
               finalization: result, runId, dayUtc: candidate.day_utc,
@@ -4622,7 +4751,11 @@ async function finalizePublishedPhaseBConnectors({
               originalMetadataSnapshot,
               originalAuthorityCapture: exportResult.jsongen_original_authority,
               evidenceMode: 'r2_bundle',
-            });
+              ...(exactOnlyCompletion ? { exactOnlyCompletion } : {}),
+            };
+            published.jsongen_final_evidence_preparation = exactOnlyCompletion
+              ? await preparePruneOriginalFinalEvidenceWithExactOnlyCompletion(preparationArgs)
+              : prepareJsonGenFinalEvidence(preparationArgs);
             const finalPreparation = published.jsongen_final_evidence_preparation;
             if (!hasBudgetFor(runtime, PRUNE_EVIDENCE_BUNDLE_UPLOAD_DEADLINE_MS)
               || Date.now() >= evidenceBundleDeadlineAtMs) {
@@ -4668,6 +4801,7 @@ async function finalizePublishedPhaseBConnectors({
               independent_consumer_authentication: 'outstanding',
             });
           } catch (error) {
+            if (isOriginalOperationError(error)) throw error;
             logJsongenPhaseB(runtime, 'WARNING', 'phase_b_jsongen_original_final_evidence_unavailable', {
               day_utc: candidate.day_utc, connector_id: candidate.connector_id,
               reason: error?.original_authority_code || (error?.message === 'JSONgen final preparation exceeds bounded metadata size'
@@ -4703,6 +4837,9 @@ async function finalizePublishedPhaseBConnectors({
         sourceIdentity: exportResult.source_identity,
         writerGitSha: runtime.writer_git_sha,
         outbox,
+        ...(runtime.original_operation ? {
+          assertOriginalOperationHeld: stage => assertPruneOriginalOperation(runtime, stage),
+        } : {}),
       });
       published.jsongen_outbox = gateOutcome || {
         gate_state: 'unconfirmed',
@@ -4769,6 +4906,7 @@ async function finalizePublishedPhaseBConnectors({
           ready_for_independent_authentication: false, reason: 'original_gate_not_confirmed',
         });
       }
+      if (isOriginalOperationError(error)) throw error;
       gateFailures.push({ published, error });
     }
   }
@@ -5585,6 +5723,10 @@ export async function verifyObservationConnectorHistory({
       if (object.body.byteLength !== evidence.byte_size || sha256Hex(object.body) !== evidence.sha256) {
         throw new Error(`V3 scoped publication identity changed: ${evidence.key}`);
       }
+      // Connector verification precedes completed-root finalisation. Current
+      // receipt authority cannot retain schema-2 direct-verifier completion;
+      // do not mint READY evidence from a connector-stage or copied report.
+      if (exactLeafFormatV3(JSON.parse(object.body.toString('utf8'))).schema_version === 2) rejectExactOnlyOriginalHandoverV3();
     }
     return {
       observation_index_generation: "v3", connector_manifest: connectorManifest,
@@ -6860,59 +7002,6 @@ async function finalizeDayGateIfReady({ client, runtime, dayUtc }) {
   });
 }
 
-async function cleanupStaging({ runtime, logStructured }) {
-  const thresholdMs = (Date.now() - (runtime.staging_retention_days * DAY_MS));
-  const entries = await r2ListAllObjects({
-    r2: runtime.r2,
-    prefix: `${runtime.staging_prefix_base}/`,
-    max_keys: 1000,
-  });
-
-  const staleKeys = entries
-    .filter((entry) => {
-      if (!entry.last_modified) {
-        return false;
-      }
-      const lastModifiedMs = Date.parse(entry.last_modified);
-      if (Number.isNaN(lastModifiedMs)) {
-        return false;
-      }
-      return lastModifiedMs < thresholdMs;
-    })
-    .map((entry) => entry.key);
-
-  if (!staleKeys.length) {
-    return {
-      scanned_count: entries.length,
-      deleted_count: 0,
-      error_count: 0,
-    };
-  }
-
-  let deletedCount = 0;
-  let errorCount = 0;
-  for (let i = 0; i < staleKeys.length; i += 1000) {
-    const batch = staleKeys.slice(i, i + 1000);
-    const result = await r2DeleteObjects({ r2: runtime.r2, keys: batch });
-    deletedCount += result.deleted_count;
-    errorCount += result.errors.length;
-    if (result.errors.length > 0) {
-      logStructured("WARNING", "phase_b_history_staging_cleanup_batch_errors", {
-        run_id: runtime.run_id,
-        batch_size: batch.length,
-        error_count: result.errors.length,
-        errors_sample: result.errors.slice(0, 10),
-      });
-    }
-  }
-
-  return {
-    scanned_count: entries.length,
-    deleted_count: deletedCount,
-    error_count: errorCount,
-  };
-}
-
 async function writeRunManifest({ runtime, runSummary }) {
   const key = buildRunManifestKey(runtime.runs_prefix, runtime.run_id);
   const payloadWithoutHash = {
@@ -6980,9 +7069,6 @@ function resolveR2Bucket(env) {
 }
 
 export function resolvePhaseBRuntimeConfig(env = process.env) {
-  const stagingBasePrefix = normalizePrefix(
-    env.UK_AQ_R2_HISTORY_STAGING_PREFIX || DEFAULT_STAGING_PREFIX,
-  );
   const writePrefixes = resolvePhaseBHistoryWritePrefixes(env);
   const committedPrefixV2 = writePrefixes.observations_prefix_v2;
   const activeCommittedPrefix = writePrefixes.observations_prefix;
@@ -7139,13 +7225,6 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
       0,
       3_600,
     ),
-    staging_retention_days: parsePositiveInt(
-      env.UK_AQ_R2_HISTORY_STAGING_RETENTION_DAYS,
-      DEFAULT_STAGING_RETENTION_DAYS,
-      1,
-      90,
-    ),
-    staging_prefix_base: stagingBasePrefix,
     committed_prefix: activeCommittedPrefix,
     aqilevels_prefix: aqilevelsPrefix,
     history_write_version: historyWriteVersion,
@@ -7205,6 +7284,18 @@ export function createPhaseBRunLocalV3EvidenceContextForTest(args) {
   return createPhaseBRunLocalV3EvidenceContext(args);
 }
 
+async function assertPruneOriginalOperation(runtime, stage, required = false) {
+  const operation = runtime.original_operation;
+  if (!operation) {
+    if (required) throw originalOperationError('original coordinator capability required');
+    return; // Preserve schema-1 callers without the private supervisor channel.
+  }
+  if (operation.run_id !== runtime.run_id || typeof operation.assertHeld !== 'function') {
+    throw originalOperationError('original invocation differs');
+  }
+  await operation.assertHeld(stage);
+}
+
 export async function runPhaseBBackup({
   dryRun,
   phaseB,
@@ -7214,12 +7305,12 @@ export async function runPhaseBBackup({
   nowUtc = nowIso(),
   nowMs = Date.now,
   createPgClient = (config) => new Client(config),
+  originalOperation = null,
 }) {
   const runtime = {
     ...phaseB,
     run_id: runId,
     now_utc: nowUtc,
-    staging_prefix: `${phaseB.staging_prefix_base}/run_id=${runId}`,
     logStructured,
     run_budget: createPhaseBRunBudgetForTest({
       nowMs,
@@ -7228,6 +7319,7 @@ export async function runPhaseBBackup({
     }),
     global_operation_lock_context: null,
     v3_run_local_evidence_cache: null,
+    original_operation: originalOperation,
   };
 
   if (!runtime.enabled) {
@@ -7343,6 +7435,7 @@ export async function runPhaseBBackup({
   const controlPgTimeouts = derivePhaseBPgTimeoutsForTest(runtime);
   try {
     await withPgClient(runtime.supabase_db_url, async (controlClient) => {
+    if (!dryRun) await assertPruneOriginalOperation(runtime, 'publication');
     if (!hasBudgetFor(runtime, PHASE_B_STAGE_MIN_MS.candidate_start)) {
       stopPhaseBForBudget(summary, runtime, { operation: "candidate_discovery" });
       return;
@@ -7443,6 +7536,12 @@ export async function runPhaseBBackup({
     });
     runtime.global_operation_lock_context = evidenceContext.lock_context;
     runtime.v3_run_local_evidence_cache = evidenceContext.evidence_cache;
+    if (OBSERVATION_HISTORY_EXACT_ONLY_PUBLICATION_ACTIVE_V3) {
+      await assertPruneOriginalOperation(runtime, 'publication', true);
+      runtime.prune_exact_only_writer = createPhaseBPruneExactOnlyWriter({
+        runtime, client: controlClient,
+      });
+    }
 
     const finalizeAccumulatedBatch = async ({ trigger }) => {
       const batch = [...publishedCandidates];
@@ -7468,6 +7567,11 @@ export async function runPhaseBBackup({
         batchTrigger: trigger,
       });
       publishedCandidates.splice(0, batch.length);
+      if (runtime.prune_exact_only_writer && outcome.can_continue === true) {
+        runtime.prune_exact_only_writer = createPhaseBPruneExactOnlyWriter({
+          runtime, client: controlClient,
+        });
+      }
       totalWrittenRows += outcome.completed_written_rows;
       totalWrittenBytes += outcome.completed_written_bytes;
       return outcome;
@@ -7770,11 +7874,6 @@ export async function runPhaseBBackup({
   summary.blocked_preview = dayStates.filter((state) => state.history_done !== true).slice(0, 25);
   summary.aggregate_day_failures = summary.aggregate_day_failures.slice(0, 25);
   summary.failures = summary.failures.slice(0, 25);
-
-  const cleanupSummary = summary.status === "stopped_budget"
-    ? { skipped: true, reason: "reserved_for_final_reporting" }
-    : await cleanupStaging({ runtime, logStructured });
-  summary.staging_cleanup = cleanupSummary;
 
   if (summary.status === "stopped_budget") {
     summary.run_manifest_key = null;

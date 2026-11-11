@@ -11,6 +11,8 @@ import {
 import { connectorDayGateKey } from "../shared/uk_aq_connector_day_gate.mjs";
 import { groupFingerprintRechecksByHour } from "./fingerprint_recheck.mjs";
 import { deletePruneBucketsWithSourceIdentity } from "./source_identity_deletion.mjs";
+import { openLateArrivalProgress } from "./late_arrival_progress.mjs";
+import { createLateArrivalReader, discoverAndProcessLateArrivals } from "./late_arrival_discovery.mjs";
 import { withDailyTaskRun } from "../shared/daily_task_health.mjs";
 
 const HOUR_MS = 60 * 60 * 1000;
@@ -29,6 +31,8 @@ const DEFAULT_MAX_DELETE_BATCHES_PER_HOUR = 10;
 const DEFAULT_REPAIR_ONE_MISMATCH_BUCKET = true;
 const DEFAULT_MAX_HOURS_PER_BATCH = 24;
 const DEFAULT_OBSAQIDB_OBSERVS_RETENTION_DAYS = 14;
+// Keep this aligned with uk_aq_rpc_observs_observations_upsert's observed_at bounds.
+const OBSAQIDB_RPC_PRECEDING_UTC_DAYS = 3;
 const DEFAULT_FINGERPRINT_RPC_RETRIES = 1;
 const DEFAULT_FINGERPRINT_RPC_RETRY_BASE_MS = 1_000;
 const DEFAULT_OBSERVS_UPSERT_RPC_RETRIES = 3;
@@ -38,9 +42,6 @@ const DEFAULT_OBSERVS_UPSERT_TIMEOUT_SPLIT_MAX_DEPTH = 4;
 const DEFAULT_REPAIR_FETCH_PAGE_SIZE = 1_000;
 const MAX_REPAIR_FETCH_PAGES = 500;
 const PREVIEW_LIMIT = 25;
-const LATE_ARRIVAL_DISCOVERY_PAGE_SIZE = 1000;
-const MAX_LATE_ARRIVAL_DISCOVERY_PAGES = 100;
-const MAX_LATE_ARRIVAL_WINDOWS_PER_RUN = 14;
 const RPC_SCHEMA = "uk_aq_public";
 const REPAIR_RECEIPT_SEMANTICS = "sync_attempt_audit_not_applied_row_evidence";
 const REPAIR_OPERATOR_RECOVERY_MESSAGE =
@@ -152,6 +153,10 @@ function compactPruneHealthSummary(summary = {}) {
     deleted_rows: pickCount(summary, ["total_deleted_rows", "total_deleted_after_repair_rows"]),
     mismatch_count: summary.mismatch_count,
     mismatch_after_repair_count: summary.mismatch_after_repair_count,
+    obs_aqidb_comparison_required_hour_count: summary.obs_aqidb_comparison_required_hour_count,
+    obs_aqidb_comparison_exempt_expired_hour_count: summary.obs_aqidb_comparison_exempt_expired_hour_count,
+    obs_aqidb_comparison_blocked_uncertain_hour_count: summary.obs_aqidb_comparison_blocked_uncertain_hour_count,
+    obs_aqidb_final_unresolved_required_mismatch_count: summary.obs_aqidb_final_unresolved_required_mismatch_count,
     connector_history_gate_blocked_bucket_count:
       Number(summary.connector_history_gate_blocked_bucket_count || 0)
       + Number(summary.connector_history_gate_blocked_after_repair_bucket_count || 0),
@@ -207,6 +212,21 @@ function compactPruneHealthSummary(summary = {}) {
     late_arrival: summary.late_arrival
       ? {
         enabled: summary.late_arrival.enabled,
+        status: summary.late_arrival.status,
+        attention_required: summary.late_arrival.attention_required,
+        stop_reason: summary.late_arrival.stop_reason,
+        next_day_utc: summary.late_arrival.next_day_utc,
+        cutoff_window_start: summary.late_arrival.cutoff_window_start,
+        deferred_day_count: summary.late_arrival.deferred_day_count,
+        remaining_calendar_day_count: summary.late_arrival.remaining_calendar_day_count,
+        blocked_day_count: summary.late_arrival.blocked_day_count,
+        failed_day_count: summary.late_arrival.failed_day_count,
+        examined_day_count: summary.late_arrival.examined_day_count,
+        absent_day_count: summary.late_arrival.absent_day_count,
+        discovery_request_count: summary.late_arrival.discovery_request_count,
+        scanned_page_count: summary.late_arrival.scanned_page_count,
+        wraparound: summary.late_arrival.wraparound,
+        progress_persisted: summary.late_arrival.progress_persisted,
         skipped: summary.late_arrival.skipped,
         discovered_day_count: summary.late_arrival.discovered_day_count,
         target_day_count: summary.late_arrival.target_day_count,
@@ -672,6 +692,12 @@ function aggregateBatchSummary(config, overallWindow, batches, batchSummaries, p
     ),
     total_deletable_rows: sumBigIntField(batchSummaries, "total_deletable_rows").toString(),
     mismatch_count: sumIntField(batchSummaries, "mismatch_count"),
+    obs_aqidb_comparison_required_hour_count: sumIntField(batchSummaries, "obs_aqidb_comparison_required_hour_count"),
+    obs_aqidb_comparison_exempt_expired_hour_count: sumIntField(batchSummaries, "obs_aqidb_comparison_exempt_expired_hour_count"),
+    obs_aqidb_comparison_blocked_uncertain_hour_count: sumIntField(batchSummaries, "obs_aqidb_comparison_blocked_uncertain_hour_count"),
+    obs_aqidb_unresolved_required_mismatch_count: sumIntField(batchSummaries, "obs_aqidb_unresolved_required_mismatch_count"),
+    obs_aqidb_comparison_exempt_expired_preview: mergePreviewField(batchSummaries, "obs_aqidb_comparison_exempt_expired_preview"),
+    obs_aqidb_comparison_blocked_uncertain_preview: mergePreviewField(batchSummaries, "obs_aqidb_comparison_blocked_uncertain_preview"),
     observs_count_exceeds_ingest_count: sumIntField(batchSummaries, "observs_count_exceeds_ingest_count"),
     observs_extra_bucket_count: sumIntField(batchSummaries, "observs_extra_bucket_count"),
     connector_history_gate_enabled: Boolean(config.phaseB?.enabled),
@@ -728,6 +754,12 @@ function aggregateBatchSummary(config, overallWindow, batches, batchSummaries, p
     repair_receipts_upserted_total: sumBigIntField(batchSummaries, "repair_receipts_upserted_total").toString(),
     repair_receipt_semantics: REPAIR_RECEIPT_SEMANTICS,
     mismatch_after_repair_count: sumIntField(batchSummaries, "mismatch_after_repair_count"),
+    obs_aqidb_final_comparison_required_hour_count: sumIntField(batchSummaries, "obs_aqidb_final_comparison_required_hour_count"),
+    obs_aqidb_final_comparison_exempt_expired_hour_count: sumIntField(batchSummaries, "obs_aqidb_final_comparison_exempt_expired_hour_count"),
+    obs_aqidb_final_comparison_blocked_uncertain_hour_count: sumIntField(batchSummaries, "obs_aqidb_final_comparison_blocked_uncertain_hour_count"),
+    obs_aqidb_final_unresolved_required_mismatch_count: sumIntField(batchSummaries, "obs_aqidb_final_unresolved_required_mismatch_count"),
+    obs_aqidb_final_comparison_exempt_expired_preview: mergePreviewField(batchSummaries, "obs_aqidb_final_comparison_exempt_expired_preview"),
+    obs_aqidb_final_comparison_blocked_uncertain_preview: mergePreviewField(batchSummaries, "obs_aqidb_final_comparison_blocked_uncertain_preview"),
     repair_mismatch_remaining_after_attempt_count: sumIntField(
       batchSummaries,
       "repair_mismatch_remaining_after_attempt_count",
@@ -837,6 +869,10 @@ function aggregatePhaseARecentSummary(overallWindow, batches, batchSummaries, pa
     repair_receipts_upserted_total: sumBigIntField(batchSummaries, "repair_receipts_upserted_total").toString(),
     repair_receipt_semantics: REPAIR_RECEIPT_SEMANTICS,
     mismatch_after_repair_count: sumIntField(batchSummaries, "mismatch_after_repair_count"),
+    obs_aqidb_final_comparison_required_hour_count: sumIntField(batchSummaries, "obs_aqidb_final_comparison_required_hour_count"),
+    obs_aqidb_final_comparison_exempt_expired_hour_count: sumIntField(batchSummaries, "obs_aqidb_final_comparison_exempt_expired_hour_count"),
+    obs_aqidb_final_comparison_blocked_uncertain_hour_count: sumIntField(batchSummaries, "obs_aqidb_final_comparison_blocked_uncertain_hour_count"),
+    obs_aqidb_final_unresolved_required_mismatch_count: sumIntField(batchSummaries, "obs_aqidb_final_unresolved_required_mismatch_count"),
     repair_mismatch_remaining_after_attempt_count: sumIntField(
       batchSummaries,
       "repair_mismatch_remaining_after_attempt_count",
@@ -941,15 +977,115 @@ async function fetchHourlyFingerprints(client, windowStart, windowEnd, sourceNam
   }
 }
 
-function compareBuckets(ingestBuckets, observsBuckets) {
+function utcTimestampMs(value) {
+  if (typeof value !== "string" || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(value)) return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) && new Date(parsed).toISOString() === value ? parsed : null;
+}
+
+export function classifyObsAqidbRpcWriteWindow(bucket, now = new Date()) {
+  const currentMs = now instanceof Date ? now.getTime() : utcTimestampMs(now);
+  const hourMs = utcTimestampMs(bucket?.hour_start);
+  const minMs = utcTimestampMs(bucket?.min_observed_at);
+  const maxMs = utcTimestampMs(bucket?.max_observed_at);
+  if (!Number.isFinite(currentMs) || hourMs === null || minMs === null || maxMs === null
+      || hourMs % HOUR_MS !== 0 || minMs < hourMs || maxMs >= hourMs + HOUR_MS || minMs > maxMs) {
+    return "blocked_uncertain";
+  }
+  const utcMidnightMs = Date.UTC(
+    new Date(currentMs).getUTCFullYear(),
+    new Date(currentMs).getUTCMonth(),
+    new Date(currentMs).getUTCDate(),
+  );
+  if (!Number.isFinite(utcMidnightMs)) return "blocked_uncertain";
+  const lowerMs = utcMidnightMs - OBSAQIDB_RPC_PRECEDING_UTC_DAYS * DAY_MS;
+  const upperMs = utcMidnightMs + DAY_MS;
+  if (maxMs < lowerMs) return "comparison_exempt_expired";
+  if (minMs >= lowerMs && maxMs < upperMs) return "comparison_required";
+  return "blocked_uncertain";
+}
+
+function requiredObsAqidbHourWindows(buckets, now) {
+  const requiredHours = [...new Set(buckets
+    .filter((bucket) => classifyObsAqidbRpcWriteWindow(bucket, now) === "comparison_required")
+    .map((bucket) => bucket.hour_start))].sort();
+  const windows = [];
+  for (const hour of requiredHours) {
+    const prior = windows.at(-1);
+    // Do not span UTC dates: a midnight boundary can expire only the older date.
+    if (prior?.window_end === hour && prior.window_start.slice(0, 10) === hour.slice(0, 10)) {
+      prior.window_end = new Date(Date.parse(hour) + HOUR_MS).toISOString();
+    } else {
+      windows.push({ window_start: hour, window_end: new Date(Date.parse(hour) + HOUR_MS).toISOString() });
+    }
+  }
+  return windows;
+}
+
+export async function fetchRequiredObsAqidbFingerprints(
+  observsClient, ingestBuckets, sourceName, pollutantCodes = null, currentTime = () => new Date(),
+) {
+  const plannedWindows = requiredObsAqidbHourWindows(ingestBuckets, currentTime());
+  const observsRows = [];
+  for (const planned of plannedWindows) {
+    const currentBuckets = ingestBuckets.filter((bucket) => (
+      bucket.hour_start >= planned.window_start && bucket.hour_start < planned.window_end
+    ));
+    for (const window of requiredObsAqidbHourWindows(currentBuckets, currentTime())) {
+      try {
+        observsRows.push(...await fetchHourlyFingerprints(
+          observsClient, window.window_start, window.window_end, sourceName, pollutantCodes,
+        ));
+      } catch (error) {
+        if (requiredObsAqidbHourWindows(currentBuckets, currentTime()).length === 0) continue;
+        throw error;
+      }
+    }
+  }
+  return observsRows;
+}
+
+export async function fetchPruneFingerprintWindow(
+  ingestClient, observsClient, windowStart, windowEnd, pollutantCodes = null,
+  currentTime = () => new Date(),
+) {
+  const ingestBuckets = await fetchHourlyFingerprints(
+    ingestClient, windowStart, windowEnd, "ingest", pollutantCodes,
+  );
+  const observsBuckets = await fetchRequiredObsAqidbFingerprints(
+    observsClient, ingestBuckets, "observs", pollutantCodes, currentTime,
+  );
+  return { ingestBuckets, observsBuckets };
+}
+
+export function compareBuckets(ingestBuckets, observsBuckets, now = new Date()) {
   const ingestByKey = new Map(ingestBuckets.map((row) => [row.key, row]));
   const observsByKey = new Map(observsBuckets.map((row) => [row.key, row]));
 
   const deletableBuckets = [];
   const mismatches = [];
   const observsExtraBuckets = [];
+  const comparisonExemptBuckets = [];
+  const blockedUncertainBuckets = [];
+  let comparisonRequiredCount = 0;
 
   for (const ingest of ingestBuckets) {
+    const comparisonStatus = classifyObsAqidbRpcWriteWindow(ingest, now);
+    if (comparisonStatus === "blocked_uncertain") {
+      const blocked = { connector_id: ingest.connector_id, hour_start: ingest.hour_start,
+        reason: "obs_aqidb_write_window_uncertain" };
+      blockedUncertainBuckets.push(blocked);
+      mismatches.push(blocked);
+      continue;
+    }
+    if (comparisonStatus === "comparison_exempt_expired") {
+      comparisonExemptBuckets.push({ connector_id: ingest.connector_id, hour_start: ingest.hour_start });
+      deletableBuckets.push({ connector_id: ingest.connector_id, hour_start: ingest.hour_start,
+        observation_count: ingest.observation_count, min_observed_at: ingest.min_observed_at,
+        max_observed_at: ingest.max_observed_at, comparison_status: comparisonStatus });
+      continue;
+    }
+    comparisonRequiredCount += 1;
     const observs = observsByKey.get(ingest.key);
     if (!observs) {
       mismatches.push({
@@ -990,6 +1126,7 @@ function compareBuckets(ingestBuckets, observsBuckets) {
       observation_count: ingest.observation_count,
       min_observed_at: ingest.min_observed_at,
       max_observed_at: ingest.max_observed_at,
+      comparison_status: comparisonStatus,
     });
   }
 
@@ -1007,6 +1144,9 @@ function compareBuckets(ingestBuckets, observsBuckets) {
     deletableBuckets,
     mismatches,
     observsExtraBuckets,
+    comparisonRequiredCount,
+    comparisonExemptBuckets,
+    blockedUncertainBuckets,
   };
 }
 
@@ -1085,6 +1225,14 @@ function classifyRepairMismatches(mismatches) {
     repairableMismatches,
     observsCountGreaterThanIngest,
   };
+}
+
+export function repairableWithinObsAqidbWriteWindow(mismatches, ingestBuckets, now = new Date()) {
+  const ingestByKey = new Map(ingestBuckets.map((bucket) => [bucket.key ?? buildBucketKey(bucket.connector_id, bucket.hour_start), bucket]));
+  return mismatches.filter((mismatch) => {
+    const bucket = ingestByKey.get(buildBucketKey(mismatch.connector_id, mismatch.hour_start));
+    return bucket && classifyObsAqidbRpcWriteWindow(bucket, now) === "comparison_required";
+  });
 }
 
 function toIntField(value, fieldName) {
@@ -1204,7 +1352,14 @@ function buildReceiptRows(observsRows) {
   return Array.from(deduped.values());
 }
 
-async function upsertObservsRowsChunk(observsClient, rows) {
+export async function upsertObservsRowsChunk(observsClient, rows, now = new Date()) {
+  if (rows.some((row) => classifyObsAqidbRpcWriteWindow({
+    hour_start: new Date(Math.floor(Date.parse(row.observed_at) / HOUR_MS) * HOUR_MS).toISOString(),
+    min_observed_at: row.observed_at,
+    max_observed_at: row.observed_at,
+  }, now) !== "comparison_required")) {
+    throw new Error("ObsAQIDB RPC write window expired or uncertain before repair upsert");
+  }
   const upsertResult = await observsClient.schema(RPC_SCHEMA).rpc(RPC_OBSERVS_UPSERT, {
     rows,
   });
@@ -1352,20 +1507,29 @@ async function replayObservationsForRepairBucket(mainClient, observsClient, mism
 
 async function recheckSingleBucket(ingestClient, observsClient, mismatch, pollutantCodes = null) {
   const bucketWindow = buildBucketWindow(mismatch.hour_start);
-  const [ingestRows, observsRows] = await Promise.all([
-    fetchHourlyFingerprints(ingestClient, bucketWindow.window_start, bucketWindow.window_end, "ingest_recheck", pollutantCodes),
-    fetchHourlyFingerprints(observsClient, bucketWindow.window_start, bucketWindow.window_end, "observs_recheck", pollutantCodes),
-  ]);
+  const ingestRows = await fetchHourlyFingerprints(
+    ingestClient, bucketWindow.window_start, bucketWindow.window_end, "ingest_recheck", pollutantCodes,
+  );
+  const observsRows = await fetchRequiredObsAqidbFingerprints(
+    observsClient, ingestRows, "observs_recheck", pollutantCodes,
+  );
 
   const ingestMap = new Map(ingestRows.map((row) => [row.key, row]));
   const observsMap = new Map(observsRows.map((row) => [row.key, row]));
   const key = buildBucketKey(mismatch.connector_id, mismatch.hour_start);
-  const bucketMismatch = determineBucketMismatch(ingestMap.get(key), observsMap.get(key));
+  const ingestBucket = ingestMap.get(key);
+  const comparisonStatus = classifyObsAqidbRpcWriteWindow(ingestBucket);
+  const bucketMismatch = comparisonStatus === "comparison_required"
+    ? determineBucketMismatch(ingestBucket, observsMap.get(key))
+    : comparisonStatus === "blocked_uncertain"
+      ? { connector_id: mismatch.connector_id, hour_start: mismatch.hour_start, reason: "obs_aqidb_write_window_uncertain" }
+      : null;
 
   return {
     connector_id: mismatch.connector_id,
     hour_start: mismatch.hour_start,
-    verified: bucketMismatch === null,
+    verified: comparisonStatus === "comparison_required" && bucketMismatch === null,
+    comparison_status: comparisonStatus,
     mismatch: bucketMismatch,
     ingest_bucket_found: ingestMap.has(key),
     observs_bucket_found: observsMap.has(key),
@@ -1397,22 +1561,12 @@ async function recheckMismatchBuckets(
     let ingestRows;
     let observsRows;
     try {
-      [ingestRows, observsRows] = await Promise.all([
-        fetchHourlyFingerprints(
-          ingestClient,
-          group.window_start,
-          group.window_end,
-          "ingest_recheck",
-          pollutantCodes,
-        ),
-        fetchHourlyFingerprints(
-          observsClient,
-          group.window_start,
-          group.window_end,
-          "observs_recheck",
-          pollutantCodes,
-        ),
-      ]);
+      ingestRows = await fetchHourlyFingerprints(
+        ingestClient, group.window_start, group.window_end, "ingest_recheck", pollutantCodes,
+      );
+      observsRows = await fetchRequiredObsAqidbFingerprints(
+        observsClient, ingestRows, "observs_recheck", pollutantCodes,
+      );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       throw new Error(
@@ -1435,7 +1589,11 @@ async function recheckMismatchBuckets(
       const key = buildBucketKey(mismatch.connector_id, mismatch.hour_start);
       const ingestBucket = ingestMap.get(key);
       const observsBucket = observsMap.get(key);
-      const nextMismatch = determineBucketMismatch(ingestBucket, observsBucket);
+      const comparisonStatus = classifyObsAqidbRpcWriteWindow(ingestBucket);
+      if (comparisonStatus === "comparison_exempt_expired") continue;
+      const nextMismatch = comparisonStatus === "blocked_uncertain"
+        ? { connector_id: mismatch.connector_id, hour_start: mismatch.hour_start, reason: "obs_aqidb_write_window_uncertain" }
+        : determineBucketMismatch(ingestBucket, observsBucket);
 
       if (nextMismatch) {
         stillMismatched.push(nextMismatch);
@@ -1501,11 +1659,12 @@ export function claimConnectorDaysForParentRun(buckets, processedConnectorDays =
   };
 }
 
-async function recheckCompleteConnectorDays(
+export async function recheckCompleteConnectorDays(
   ingestClient,
   observsClient,
   initialIngestBuckets,
   pollutantCodes = null,
+  currentTime = () => new Date(),
 ) {
   const connectorIdsByDay = new Map();
   for (const bucket of initialIngestBuckets) {
@@ -1519,30 +1678,21 @@ async function recheckCompleteConnectorDays(
   for (const [dayUtc, connectorIds] of Array.from(connectorIdsByDay.entries()).sort()) {
     const windowStart = `${dayUtc}T00:00:00.000Z`;
     const windowEnd = new Date(Date.parse(windowStart) + DAY_MS).toISOString();
-    const [ingestRows, observsRows] = await Promise.all([
-      fetchHourlyFingerprints(
-        ingestClient,
-        windowStart,
-        windowEnd,
-        "ingest_final_connector_day_recheck",
-        pollutantCodes,
-      ),
-      fetchHourlyFingerprints(
-        observsClient,
-        windowStart,
-        windowEnd,
-        "observs_final_connector_day_recheck",
-        pollutantCodes,
-      ),
-    ]);
-    finalIngestBuckets.push(...ingestRows.filter((row) => connectorIds.has(Number(row.connector_id))));
+    const ingestRows = await fetchHourlyFingerprints(
+      ingestClient, windowStart, windowEnd, "ingest_final_connector_day_recheck", pollutantCodes,
+    );
+    const scopedIngestRows = ingestRows.filter((row) => connectorIds.has(Number(row.connector_id)));
+    const observsRows = await fetchRequiredObsAqidbFingerprints(
+      observsClient, scopedIngestRows, "observs_final_connector_day_recheck", pollutantCodes, currentTime,
+    );
+    finalIngestBuckets.push(...scopedIngestRows);
     finalObservsBuckets.push(...observsRows.filter((row) => connectorIds.has(Number(row.connector_id))));
   }
 
   return {
     finalIngestBuckets,
     finalObservsBuckets,
-    ...compareBuckets(finalIngestBuckets, finalObservsBuckets),
+    ...compareBuckets(finalIngestBuckets, finalObservsBuckets, currentTime()),
   };
 }
 
@@ -1699,12 +1849,6 @@ export function buildRunConfig(url) {
     1,
     50_000,
   );
-  phaseB.staging_retention_days = parsePositiveInt(
-    params.get("historyStagingRetentionDays") ?? phaseB.staging_retention_days,
-    phaseB.staging_retention_days,
-    1,
-    90,
-  );
   const historyDbUrlOverride = (params.get("historyDbUrl") || "").trim();
   if (historyDbUrlOverride) {
     phaseB.supabase_db_url = historyDbUrlOverride;
@@ -1746,6 +1890,7 @@ function toBucketOutput(bucket) {
     connector_id: bucket.connector_id,
     hour_start: bucket.hour_start,
     observation_count: bucket.observation_count.toString(),
+    comparison_status: bucket.comparison_status ?? null,
   };
 }
 
@@ -1944,10 +2089,9 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     phase: repairOnlyMode ? "phase_a_recent" : "prune",
   });
 
-  let [ingestBuckets, observsBuckets] = await Promise.all([
-    fetchHourlyFingerprints(ingestClient, windowStart, windowEnd, "ingest", deleteEligiblePollutantCodes),
-    fetchHourlyFingerprints(observsClient, windowStart, windowEnd, "observs", deleteEligiblePollutantCodes),
-  ]);
+  let { ingestBuckets, observsBuckets } = await fetchPruneFingerprintWindow(
+    ingestClient, observsClient, windowStart, windowEnd, deleteEligiblePollutantCodes,
+  );
 
   let duplicateConnectorDaysSkipped = [];
   if (!repairOnlyMode && !dryRunMode) {
@@ -1973,7 +2117,8 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     }
   }
 
-  const { deletableBuckets, mismatches, observsExtraBuckets } = compareBuckets(ingestBuckets, observsBuckets);
+  const initialComparison = compareBuckets(ingestBuckets, observsBuckets);
+  const { deletableBuckets, mismatches, observsExtraBuckets } = initialComparison;
   const preRepairBackupGate = historyGateEnabled
     ? await applyConnectorHistoryGateFilter(
       config,
@@ -1989,7 +2134,7 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
   const gatedDeletableBuckets = preRepairBackupGate.allowedBuckets;
   const historyGateBlockedBuckets = preRepairBackupGate.blockedBuckets;
   const { repairableMismatches, observsCountGreaterThanIngest } = classifyRepairMismatches(mismatches);
-  const repairCandidate = repairableMismatches[0] ?? null;
+  const repairCandidate = repairableWithinObsAqidbWriteWindow(repairableMismatches, ingestBuckets)[0] ?? null;
 
   for (const mismatch of mismatches) {
     logStructured("ERROR", "hour_bucket_mismatch", { run_id: runId, ...mismatch });
@@ -2035,6 +2180,13 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     deletable_bucket_count_before_history_gate: deletableBuckets.length,
     total_deletable_rows: totalDeletableRows.toString(),
     mismatch_count: mismatches.length,
+    obs_aqidb_comparison_required_hour_count: initialComparison.comparisonRequiredCount,
+    obs_aqidb_comparison_exempt_expired_hour_count: initialComparison.comparisonExemptBuckets.length,
+    obs_aqidb_comparison_blocked_uncertain_hour_count: initialComparison.blockedUncertainBuckets.length,
+    obs_aqidb_unresolved_required_mismatch_count:
+      mismatches.length - initialComparison.blockedUncertainBuckets.length,
+    obs_aqidb_comparison_exempt_expired_preview: sampleRows(initialComparison.comparisonExemptBuckets),
+    obs_aqidb_comparison_blocked_uncertain_preview: sampleRows(initialComparison.blockedUncertainBuckets),
     observs_count_exceeds_ingest_count: observsCountGreaterThanIngest.length,
     observs_extra_bucket_count: observsExtraBuckets.length,
     connector_history_gate_enabled: historyGateEnabled,
@@ -2060,6 +2212,8 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
           run_id: runId,
           ...repairPilot,
         });
+      } else if (!repairableWithinObsAqidbWriteWindow([repairCandidate], ingestBuckets).length) {
+        repairPilot = { attempted: false, reason: "obs_aqidb_write_window_expired_or_uncertain" };
       } else {
         try {
           const replayResult = await replayObservationsForRepairBucket(
@@ -2112,6 +2266,7 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
         connector_id: bucket.connector_id,
         hour_start: bucket.hour_start,
         observation_count: bucket.observation_count.toString(),
+        comparison_status: bucket.comparison_status,
       });
     }
     logStructured("INFO", "ingestdb_prune_dry_run_summary", {
@@ -2135,6 +2290,7 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
 
   if (repairableMismatches.length > 0) {
     for (const mismatch of repairableMismatches) {
+      if (!repairableWithinObsAqidbWriteWindow([mismatch], ingestBuckets).length) continue;
       try {
         const replayResult = await replayObservationsForRepairBucket(
           ingestClient,
@@ -2182,11 +2338,12 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
   let finalCurrentBuckets = [];
   let finalEligibleBuckets = [];
   let finalObservsBucketCount = 0;
+  let finalObservsBuckets = [];
   if (repairOnlyMode && repairableMismatches.length > 0) {
     const recheckResult = await recheckMismatchBuckets(
       ingestClient,
       observsClient,
-      mismatches,
+      repairableWithinObsAqidbWriteWindow(mismatches, ingestBuckets),
       deleteEligiblePollutantCodes,
     );
     repairedNowDeletableBuckets = recheckResult.nowDeletableBuckets;
@@ -2200,12 +2357,14 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     );
     finalCurrentBuckets = finalRecheck.finalIngestBuckets;
     finalEligibleBuckets = finalRecheck.deletableBuckets;
+    finalObservsBuckets = finalRecheck.finalObservsBuckets;
     finalObservsBucketCount = finalRecheck.finalObservsBuckets.length;
     mismatchesAfterRepair = finalRecheck.mismatches;
     const initiallyMismatchedKeys = new Set(
       mismatches.map((bucket) => buildBucketKey(bucket.connector_id, bucket.hour_start)),
     );
     repairedNowDeletableBuckets = finalEligibleBuckets.filter((bucket) => (
+      bucket.comparison_status === "comparison_required" &&
       initiallyMismatchedKeys.has(buildBucketKey(bucket.connector_id, bucket.hour_start))
     ));
   }
@@ -2222,8 +2381,18 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
       blockedBuckets: [],
       connectorGateMap: new Map(),
     };
-  const gatedFinalEligibleBuckets = postRepairBackupGate.allowedBuckets;
+  let gatedFinalEligibleBuckets = postRepairBackupGate.allowedBuckets;
   const historyGateBlockedAfterRepairBuckets = postRepairBackupGate.blockedBuckets;
+  let finalComparison = null;
+  if (!repairOnlyMode) {
+    // Refresh after the asynchronous gate lookup; UTC midnight may have passed.
+    finalComparison = compareBuckets(finalCurrentBuckets, finalObservsBuckets);
+    mismatchesAfterRepair = finalComparison.mismatches;
+    const allowedKeys = new Set(gatedFinalEligibleBuckets.map((bucket) => buildBucketKey(bucket.connector_id, bucket.hour_start)));
+    gatedFinalEligibleBuckets = finalComparison.deletableBuckets.filter((bucket) => (
+      allowedKeys.has(buildBucketKey(bucket.connector_id, bucket.hour_start))
+    ));
+  }
   const atomicDeletionPlan = repairOnlyMode
     ? { plannedBuckets: [], blockedBuckets: [], connectorDays: [] }
     : buildAtomicConnectorDayDeletionPlan({
@@ -2338,6 +2507,13 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     repair_receipts_upserted_total: totalReceiptsUpsertedForRepair.toString(),
     repair_receipt_semantics: REPAIR_RECEIPT_SEMANTICS,
     mismatch_after_repair_count: finalMismatchCount,
+    obs_aqidb_final_comparison_required_hour_count: finalComparison?.comparisonRequiredCount ?? 0,
+    obs_aqidb_final_comparison_exempt_expired_hour_count: finalComparison?.comparisonExemptBuckets.length ?? 0,
+    obs_aqidb_final_comparison_blocked_uncertain_hour_count: finalComparison?.blockedUncertainBuckets.length ?? 0,
+    obs_aqidb_final_unresolved_required_mismatch_count:
+      finalComparison ? finalComparison.mismatches.length - finalComparison.blockedUncertainBuckets.length : 0,
+    obs_aqidb_final_comparison_exempt_expired_preview: sampleRows(finalComparison?.comparisonExemptBuckets ?? []),
+    obs_aqidb_final_comparison_blocked_uncertain_preview: sampleRows(finalComparison?.blockedUncertainBuckets ?? []),
     repair_mismatch_remaining_after_attempt_count:
       repairOutcomeCounts.mismatch_remaining_after_attempt_count,
     repaired_now_deletable_bucket_count: repairedNowDeletableBuckets.length,
@@ -2462,56 +2638,6 @@ async function runPhaseARecent(config) {
   return aggregateSummary;
 }
 
-async function discoverLateArrivalDays(ingestClient, overallWindow) {
-  const cutoffWindowStart = toIso(overallWindow.window_start, "late_arrival.window_start");
-  const distinctDaySet = new Set();
-  let scannedRowCount = 0;
-  let scannedPageCount = 0;
-  let truncatedByPageLimit = false;
-
-  for (let page = 0; page < MAX_LATE_ARRIVAL_DISCOVERY_PAGES; page += 1) {
-    const start = page * LATE_ARRIVAL_DISCOVERY_PAGE_SIZE;
-    const end = start + LATE_ARRIVAL_DISCOVERY_PAGE_SIZE - 1;
-    const { data, error } = await ingestClient
-      .schema(RPC_SCHEMA)
-      .from("observations")
-      .select("observed_at")
-      .lt("observed_at", cutoffWindowStart)
-      .order("observed_at", { ascending: true })
-      .range(start, end);
-
-    if (error) {
-      throw new Error(`late-arrival discovery query failed: ${error.message}`);
-    }
-
-    const rows = Array.isArray(data) ? data : [];
-    scannedPageCount += 1;
-    scannedRowCount += rows.length;
-    for (const row of rows) {
-      const observedAtIso = toIso(row.observed_at, "late_arrival.observed_at");
-      distinctDaySet.add(toObservedDay(observedAtIso));
-    }
-
-    if (rows.length < LATE_ARRIVAL_DISCOVERY_PAGE_SIZE) {
-      break;
-    }
-    if (page + 1 === MAX_LATE_ARRIVAL_DISCOVERY_PAGES) {
-      truncatedByPageLimit = true;
-    }
-  }
-
-  const discoveredDays = Array.from(distinctDaySet).sort();
-  return {
-    cutoff_window_start: cutoffWindowStart,
-    discovered_day_count: discoveredDays.length,
-    discovered_day_preview: sampleRows(discoveredDays),
-    discovered_days: discoveredDays,
-    scanned_row_count: scannedRowCount,
-    scanned_page_count: scannedPageCount,
-    truncated_by_page_limit: truncatedByPageLimit,
-  };
-}
-
 async function runLateArrivalDirectDeleteDay(
   config,
   ingestClient,
@@ -2597,9 +2723,20 @@ async function runLateArrivalDirectDeleteDay(
     ingestBuckets,
     "late_arrival_direct_delete",
   );
+  // The direct-delete route is separately gated by physical retention, but an
+  // uncertain or future timestamp can never use that route as a bypass.
+  const directWindowNow = new Date();
+  const directClassifiedBuckets = ingestBuckets.map((bucket) => ({
+    ...bucket, comparison_status: classifyObsAqidbRpcWriteWindow(bucket, directWindowNow),
+  }));
+  const directExpiredBuckets = directClassifiedBuckets.filter((bucket) => bucket.comparison_status === "comparison_exempt_expired");
+  const directRequiredBuckets = directClassifiedBuckets.filter((bucket) => bucket.comparison_status === "comparison_required");
+  const directBlockedBuckets = directClassifiedBuckets.filter((bucket) => bucket.comparison_status !== "comparison_exempt_expired");
+  const directExpiredKeys = new Set(directExpiredBuckets.map((bucket) => bucket.key));
   const atomicDeletionPlan = buildAtomicConnectorDayDeletionPlan({
     currentBuckets: ingestBuckets,
-    eligibleBuckets: directDeleteGate.allowedBuckets,
+    eligibleBuckets: directDeleteGate.allowedBuckets.filter((bucket) => directExpiredKeys.has(bucket.key)),
+    unresolvedBuckets: directBlockedBuckets,
     gateBlockedBuckets: directDeleteGate.blockedBuckets,
     pollutantCodes: deleteEligiblePollutantCodes,
   });
@@ -2632,6 +2769,11 @@ async function runLateArrivalDirectDeleteDay(
     window_start: dayWindow.window_start,
     window_end: dayWindow.window_end,
     ingest_bucket_count: ingestBuckets.length,
+    obs_aqidb_final_comparison_required_hour_count: directRequiredBuckets.length,
+    obs_aqidb_final_comparison_exempt_expired_hour_count: directExpiredBuckets.length,
+    obs_aqidb_final_comparison_blocked_uncertain_hour_count: directBlockedBuckets.length - directRequiredBuckets.length,
+    obs_aqidb_final_comparison_exempt_expired_preview: sampleRows(directExpiredBuckets.map(toBucketOutput)),
+    obs_aqidb_final_comparison_blocked_uncertain_preview: sampleRows(directBlockedBuckets.map(toBucketOutput)),
     duplicate_connector_day_skipped_count: claimed.duplicateConnectorDays.length,
     duplicate_connector_day_skipped_preview: sampleRows(claimed.duplicateConnectorDays),
     delete_filter_mode: deleteEligiblePollutantCodes ? "pollutant_allow_list" : "all_observations",
@@ -2680,147 +2822,52 @@ async function runLateArrivalDirectDeleteDay(
   return summary;
 }
 
-async function runLateArrivalCleanup(config, overallWindow, runContext = {}) {
+export async function runLateArrivalCleanup(config, overallWindow, runContext = {}, adapters = {}) {
   const runId = randomUUID();
-  const ingestClient = createClient(config.supabaseUrl, config.ingestSecretKey, {
-    auth: { persistSession: false, autoRefreshToken: false },
-    db: { schema: RPC_SCHEMA },
+  const ingestClient = adapters.ingestClient || createClient(config.supabaseUrl, config.ingestSecretKey, {
+    auth: { persistSession: false, autoRefreshToken: false }, db: { schema: RPC_SCHEMA },
   });
-  const discovery = await discoverLateArrivalDays(ingestClient, overallWindow);
-  const { discovered_days: discoveredDays, ...discoverySummary } = discovery;
   const obsAqidbCutoffDayUtc = buildRetentionCutoffDayUtc(config.obsAqidbObservsRetentionDays);
-  const directDeleteDayWindows = [];
-  const repairEligibleDayWindows = [];
-  for (const dayUtc of discoveredDays) {
-    const dayWindow = buildUtcDayWindow(dayUtc);
-    if (dayWindow.day_utc < obsAqidbCutoffDayUtc) {
-      directDeleteDayWindows.push(dayWindow);
-      continue;
-    }
-    repairEligibleDayWindows.push(dayWindow);
-  }
-  const repairDayWindows = repairEligibleDayWindows.slice(0, MAX_LATE_ARRIVAL_WINDOWS_PER_RUN);
-  const droppedDayCount = Math.max(0, repairEligibleDayWindows.length - repairDayWindows.length);
-  const dayWindows = [...directDeleteDayWindows, ...repairDayWindows];
-  logStructured("INFO", "ingestdb_late_arrival_discovery_summary", {
-    run_id: runId,
-    mode: config.dryRun ? "dry-run" : "delete",
-    ...discoverySummary,
-  });
-
-  if (discoveredDays.length === 0) {
-    return {
-      enabled: true,
-      skipped: true,
-      reason: "no_late_arrival_days_detected",
-      run_id: runId,
-      ...discoverySummary,
-      obs_aqidb_retention_days: config.obsAqidbObservsRetentionDays,
-      obs_aqidb_cutoff_day_utc: obsAqidbCutoffDayUtc,
-      target_day_count: 0,
-      direct_delete_day_count: 0,
-      repair_day_count: 0,
-      dropped_day_count: 0,
-      processed_day_count: 0,
-      delete_error_count: 0,
-      mismatch_after_repair_count: 0,
-      connector_history_gate_blocked_bucket_count: 0,
-      connector_history_gate_blocked_after_repair_bucket_count: 0,
-      total_deleted_rows: "0",
-      total_deleted_after_repair_rows: "0",
-      alert_condition_count: 0,
-      duplicate_connector_day_skipped_count: 0,
-      duplicate_connector_day_skipped_preview: [],
-      connector_day_atomic_delete_planned_count: 0,
-      connector_day_atomic_delete_committed_count: 0,
-      connector_day_atomic_delete_rolled_back_count: 0,
-      connector_day_atomic_delete_blocked_bucket_count: 0,
-      connector_day_atomic_delete_plan_preview: [],
-      connector_day_atomic_delete_result_preview: [],
-      batch_summaries_preview: [],
-    };
-  }
-
-  logStructured("INFO", "ingestdb_late_arrival_cleanup_plan", {
-    run_id: runId,
-    mode: config.dryRun ? "dry-run" : "delete",
-    target_day_count: dayWindows.length,
-    obs_aqidb_retention_days: config.obsAqidbObservsRetentionDays,
-    obs_aqidb_cutoff_day_utc: obsAqidbCutoffDayUtc,
-    direct_delete_day_count: directDeleteDayWindows.length,
-    repair_day_count: repairDayWindows.length,
-    dropped_day_count: droppedDayCount,
-    target_day_preview: sampleRows(dayWindows.map((entry) => entry.day_utc)),
-    direct_delete_day_preview: sampleRows(directDeleteDayWindows.map((entry) => entry.day_utc)),
-    repair_day_preview: sampleRows(repairDayWindows.map((entry) => entry.day_utc)),
-  });
-
-  const batchSummaries = [];
   const processedConnectorDays = runContext.processed_connector_days instanceof Set
-    ? runContext.processed_connector_days
-    : new Set();
-  for (const dayWindow of directDeleteDayWindows) {
-    try {
-      const summary = await runLateArrivalDirectDeleteDay(
-        config,
-        ingestClient,
-        dayWindow,
-        runId,
-        batchSummaries.length + 1,
-        dayWindows.length,
-        processedConnectorDays,
-      );
-      batchSummaries.push(summary);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      logStructured("ERROR", "ingestdb_late_arrival_direct_delete_day_error", {
-        run_id: runId,
-        day_utc: dayWindow.day_utc,
-        error: message,
-      });
-      batchSummaries.push({
-        day_utc: dayWindow.day_utc,
-        run_id: null,
-        mode: config.dryRun ? "dry-run" : "delete",
-        phase: "late_arrival_direct_delete",
-        window_start: dayWindow.window_start,
-        window_end: dayWindow.window_end,
-        delete_error_count: 1,
-        alert_condition_count: 1,
-        error: message,
-      });
+    ? runContext.processed_connector_days : new Set();
+  let progress;
+  let result;
+  try {
+    progress = await (adapters.openProgress || openLateArrivalProgress)({
+      databaseUrl: config.phaseB?.supabase_db_url, dryRun: config.dryRun,
+    });
+    result = await discoverAndProcessLateArrivals({
+      cutoff: toIso(overallWindow.window_start, "late_arrival.window_start"),
+      dryRun: config.dryRun, progress, runId,
+      reader: adapters.reader || createLateArrivalReader(ingestClient),
+      classifyDay: (dayUtc) => dayUtc < obsAqidbCutoffDayUtc ? "direct_delete" : "repair",
+      processDay: async (dayUtc, route, index) => {
+        const dayWindow = buildUtcDayWindow(dayUtc);
+        if (route === "direct_delete") {
+          return (adapters.directDeleteDay || runLateArrivalDirectDeleteDay)(
+            config, ingestClient, dayWindow, runId, index, 1, processedConnectorDays,
+          );
+        }
+        return (adapters.pruneSingleWindow || runPruneSingleWindow)(config, dayWindow, {
+          parent_run_id: runId, batch_index: index,
+          processed_connector_days: processedConnectorDays,
+        });
+      },
+    });
+  } catch (error) {
+    result = { report: { enabled: true, run_id: runId, status: "failed", attention_required: true,
+      error_count: 1, error: String(error.message || error).slice(0, 1000), stop_reason: "progress_failure" }, batchSummaries: [] };
+  } finally {
+    if (progress) {
+      try { await progress.close(); } catch (error) {
+        result.report.status = "failed";
+        result.report.attention_required = true;
+        result.report.error_count = (result.report.error_count || 0) + 1;
+        result.report.close_error = String(error.message || error).slice(0, 1000);
+      }
     }
   }
-
-  for (const dayWindow of repairDayWindows) {
-    try {
-      const summary = await runPruneSingleWindow(config, dayWindow, {
-        parent_run_id: runId,
-        batch_index: batchSummaries.length + 1,
-        batch_count: dayWindows.length,
-        processed_connector_days: processedConnectorDays,
-      });
-      batchSummaries.push(summary);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      logStructured("ERROR", "ingestdb_late_arrival_cleanup_day_error", {
-        run_id: runId,
-        day_utc: dayWindow.day_utc,
-        error: message,
-      });
-      batchSummaries.push({
-        day_utc: dayWindow.day_utc,
-        run_id: null,
-        mode: config.dryRun ? "dry-run" : "delete",
-        window_start: dayWindow.window_start,
-        window_end: dayWindow.window_end,
-        delete_error_count: 1,
-        alert_condition_count: 1,
-        error: message,
-      });
-    }
-  }
-
+  const { report: discoverySummary, batchSummaries } = result;
   const summary = {
     enabled: true,
     skipped: false,
@@ -2828,11 +2875,6 @@ async function runLateArrivalCleanup(config, overallWindow, runContext = {}) {
     ...discoverySummary,
     obs_aqidb_retention_days: config.obsAqidbObservsRetentionDays,
     obs_aqidb_cutoff_day_utc: obsAqidbCutoffDayUtc,
-    target_day_count: dayWindows.length,
-    direct_delete_day_count: directDeleteDayWindows.length,
-    repair_day_count: repairDayWindows.length,
-    processed_day_count: dayWindows.length,
-    dropped_day_count: droppedDayCount,
     delete_error_count:
       sumIntField(batchSummaries, "delete_error_count") +
       sumIntField(batchSummaries, "delete_after_repair_error_count"),
@@ -2846,7 +2888,8 @@ async function runLateArrivalCleanup(config, overallWindow, runContext = {}) {
     ),
     total_deleted_rows: sumBigIntField(batchSummaries, "total_deleted_rows").toString(),
     total_deleted_after_repair_rows: sumBigIntField(batchSummaries, "total_deleted_after_repair_rows").toString(),
-    alert_condition_count: sumIntField(batchSummaries, "alert_condition_count"),
+    alert_condition_count: sumIntField(batchSummaries, "alert_condition_count")
+      + Number(discoverySummary.error_count || 0) + (discoverySummary.status === "deferred" ? 1 : 0),
     duplicate_connector_day_skipped_count: sumIntField(
       batchSummaries,
       "duplicate_connector_day_skipped_count",
@@ -2877,6 +2920,7 @@ async function runPrune(config, adapters = {}) {
     ingestRetentionDays: config.ingestDbRetentionDays,
     logStructured,
     runId: phaseBRunId,
+    ...(adapters.originalOperation ? { originalOperation: adapters.originalOperation } : {}),
   });
   // Budget exhaustion never erases failures recorded earlier in Phase B.
   const phaseBFailed = Number(phaseBHistorySummary?.failed_candidates || 0) > 0
@@ -3011,6 +3055,9 @@ async function runPrune(config, adapters = {}) {
     lateArrivalSummary = {
       enabled: true,
       skipped: false,
+      status: "failed",
+      attention_required: true,
+      error_count: 1,
       error: message,
     };
     logStructured("WARNING", "ingestdb_late_arrival_cleanup_failed", {
@@ -3047,6 +3094,12 @@ async function runPrune(config, adapters = {}) {
     combinedSummary.alert_condition_count = toSafeInt(combinedSummary.alert_condition_count)
       + phaseBHistorySummary.blocked_scope_count;
   }
+  if (lateArrivalSummary.attention_required || lateArrivalSummary.error) {
+    combinedSummary.status = "partial_attention_required";
+    combinedSummary.attention_required = true;
+    combinedSummary.alert_condition_count = toSafeInt(combinedSummary.alert_condition_count)
+      + Math.max(1, toSafeInt(lateArrivalSummary.alert_condition_count));
+  }
   if (batches.length > 1) {
     logStructured(
       "INFO",
@@ -3062,7 +3115,7 @@ async function runPrune(config, adapters = {}) {
       normal_deletion_attempted: Boolean(pruneWindowSummary.deletion_attempted),
       late_arrival_enabled: lateArrivalSummary.enabled === true,
     });
-    const error = new Error(`Prune Daily partially completed: ${combinedSummary.blocked_scope_count} historical connector/day scopes require attention`);
+    const error = new Error(`Prune Daily partially completed: ${Number(combinedSummary.blocked_scope_count || 0)} historical connector/day scopes; late-arrival ${lateArrivalSummary.status || "complete"} requires attention`);
     error.code = "UK_AQ_PRUNE_PARTIAL_ATTENTION_REQUIRED";
     error.prune_summary = combinedSummary;
     throw error;

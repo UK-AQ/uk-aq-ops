@@ -1,6 +1,8 @@
 import { resolveHistoryEnvironment, historyResolution } from "../lib/history_generation";
+import { CoverageRequestBudget } from "../lib/coverage_request_budget";
+import { handleDropboxCoverage } from "../lib/storage_coverage_dropbox";
 import { errorEnvelope } from "../lib/http";
-import { handleDirectCompatRoute } from "../lib/direct";
+import { applyStorageIngestCoverage, handleDirectCompatRoute } from "../lib/direct";
 import {
   enrichStorageCoverageFromMetrics,
   proxyR2ConnectorCounts,
@@ -82,6 +84,12 @@ export async function handleCompatRoute(
       url.searchParams.set("__history_generation", historyResolution(env).version);
       request = new Request(url, request);
     }
+    if (pathname === "/api/storage_coverage") {
+      env = { ...env, coverageRequestBudget: new CoverageRequestBudget() };
+      const source = new URL(request.url).searchParams.get("source");
+      if (source === "dropbox") return handleDropboxCoverage(request, env);
+      if (source) return errorEnvelope("BAD_REQUEST", "Unknown storage coverage source", 400);
+    }
     if (!useUpstream && pathname === "/api/r2_connector_counts") {
       const serviceResponse = await proxyR2ConnectorCounts(request, env);
       if (serviceResponse) return withHistoryDiagnostics(serviceResponse, env);
@@ -136,7 +144,26 @@ export async function handleCompatRoute(
       if (useUpstream) {
         response = await enrichStorageCoverageResponse(response, request, env);
       }
-      response = await enrichStorageCoverageFromMetrics(response, request, env);
+      // The calendar's direct sources are authoritative. Do not add metrics,
+      // duplicate history lookups or any Dropbox work to its database invocation.
+      if (pathname !== "/api/storage_coverage") {
+        response = await enrichStorageCoverageFromMetrics(response, request, env);
+      }
+      // Upstream payloads may be old or use legacy inference. Apply the same
+      // authoritative source once, after all transport-specific enrichment.
+      if (useUpstream && response.ok) {
+        const payload = await response.clone().json() as Record<string, unknown>;
+        if (Array.isArray(payload.storage_coverage_days)) {
+          const enriched = await applyStorageIngestCoverage(
+            env, { ...payload, storage_coverage_days: payload.storage_coverage_days },
+            ["force", "refresh", "nocache", "cache_bust", "cacheBust"].some(key =>
+              ["1", "true", "yes"].includes(String(new URL(request.url).searchParams.get(key) || "").toLowerCase())),
+          );
+          const headers = new Headers(response.headers);
+          headers.delete("content-length");
+          response = new Response(JSON.stringify(enriched), { status: response.status, headers });
+        }
+      }
     }
     return historyRoute ? withHistoryDiagnostics(response, env) : response;
   }
