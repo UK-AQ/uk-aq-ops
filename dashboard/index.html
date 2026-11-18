@@ -3965,7 +3965,9 @@
           const obsAqi = point.obs_aqidb === null ? 0 : Number(point.obs_aqidb);
           return Math.max(max, ingest, obsAqi);
         }, 0);
-        const yAxisMaxMb = computeAxisMax(maxObservedMb * 1.05);
+        const yAxisMaxMb = maxObservedMb > 500
+          ? computeAxisMax(maxObservedMb * 1.05)
+          : 500;
 
         let chartMarkup = `<div class="db-size-empty">No DB size samples in the selected period.</div>`;
         if (points.length > 0) {
@@ -4214,6 +4216,7 @@
           emptyLabel: "No schema size samples in the selected period.",
           seriesDefs: [...schemaSeriesDefs, { key: "other_system", label: "Other/system", color: COLOR_OBSAQI_OTHER }],
           stackOrderKeys: ["uk_aq_aqilevels", "uk_aq_observs", "uk_aq_raw", "uk_aq_core", "uk_aq_ops", "public", "other_system"],
+          yMaxOverride: yAxisMaxMb,
         });
 
         const r2DomainPoints = buildStackedMetricPoints(
@@ -4729,19 +4732,30 @@
             || payload.read_version !== latestR2HistoryReadVersion.version
             || payload.from_day_utc !== request.fromDay || payload.to_day_utc !== request.toDay
             || payload.grain !== "day" || !Array.isArray(payload.connectors)
+            || payload.connector_evidence_complete !== true
+            || !Array.isArray(payload.connector_ids_requested)
+            || payload.connector_ids_requested.length !== 0
+            || !Number.isSafeInteger(payload.bucket_count) || payload.bucket_count <= 0
             || payload.domains?.observations?.connector_row_counts_found !== true
-            || (Array.isArray(payload.warnings) && payload.warnings.length > 0)) {
+            || !Array.isArray(payload.warnings) || payload.warnings.length > 0) {
           return new Set();
         }
         const perDay = new Map();
+        const seenConnectors = new Set();
         for (const connector of payload.connectors) {
           const connectorId = Number(connector?.connector_id);
-          if (!Number.isSafeInteger(connectorId) || connectorId <= 0 || !Array.isArray(connector.buckets)) {
+          if (!Number.isSafeInteger(connectorId) || connectorId <= 0
+              || seenConnectors.has(connectorId) || !Array.isArray(connector.buckets)
+              || connector.buckets.length !== payload.bucket_count) {
             return new Set();
           }
+          seenConnectors.add(connectorId);
+          const seenDays = new Set();
           for (const bucket of connector.buckets) {
             const day = String(bucket?.bucket_key || "");
-            if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || day < request.fromDay || day > request.toDay) continue;
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || day < request.fromDay
+                || day > request.toDay || seenDays.has(day)) return new Set();
+            seenDays.add(day);
             const rows = bucket.observations_rows;
             if (!Number.isSafeInteger(rows) || rows < 0) return new Set();
             if (rows === 0) continue;
