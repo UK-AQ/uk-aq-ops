@@ -5,7 +5,7 @@ logs/
 .env
 .env.test
 .env.live
-.env.gcp_billing
+.env*
 *.numbers
 env-vars-master.csv
 /tmp
