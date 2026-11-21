@@ -169,7 +169,6 @@ notes = "Refresh UK AQ Blog from Substack and deploy Pages"
 [jobs.uk_aq_blog_refresh.github_inputs]
 refresh_blog_feed = "true"
 
-
 # AQ News by Email: staged for LIVE activation.
 [jobs.uk_aq_media_news_email]
 enabled = true
@@ -179,3 +178,13 @@ worker_http_url = "https://uk-aq-media-email.uk-aq-media.workers.dev/scheduler/r
 worker_http_secret_binding = "UK_AQ_MEDIA_EMAIL_WORKER_HTTP_SECRET"
 dry_run = false
 notes = "AQ NEWS Daily/recovery; separate credential; Media owns due selection and bounded Queue work"
+
+[jobs.uk_aq_ukair_bc_daily]
+enabled = false
+cron_expr = "0 8 * * *"
+target_type = "github_workflow"
+github_repo = "UK-AQ/uk-aq-ops"
+github_workflow_file = "uk_aq_ukair_bc_daily.yml"
+github_ref = "main"
+dry_run = false
+notes = "08:00 UTC BC/UV370 14-day R2 reconciliation followed by 2024-onwards diurnal publication"
