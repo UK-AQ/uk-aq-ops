@@ -180,7 +180,7 @@ dry_run = false
 notes = "AQ NEWS Daily/recovery; separate credential; Media owns due selection and bounded Queue work"
 
 [jobs.uk_aq_ukair_bc_daily]
-enabled = false
+enabled = true
 cron_expr = "0 8 * * *"
 target_type = "github_workflow"
 github_repo = "UK-AQ/uk-aq-ops"
